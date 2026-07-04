@@ -1,0 +1,22 @@
+tools:
+  - class_name: "verl.experimental.opd_mm.tools.OPDFilterTool"
+    config:
+      type: native
+  - class_name: "verl.experimental.opd_mm.tools.OPDSortTool"
+    config:
+      type: native
+  - class_name: "verl.experimental.opd_mm.tools.OPDTopKTool"
+    config:
+      type: native
+  - class_name: "verl.experimental.opd_mm.tools.OPDRetrieveTool"
+    config:
+      type: native
+  - class_name: "verl.experimental.opd_mm.tools.OPDReadTool"
+    config:
+      type: native
+  - class_name: "verl.experimental.opd_mm.tools.OPDInspectRawTool"
+    config:
+      type: native
+  - class_name: "verl.experimental.opd_mm.tools.OPDStopTool"
+    config:
+      type: native
