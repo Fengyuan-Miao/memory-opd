@@ -11,9 +11,6 @@ tools:
   - class_name: "verl.experimental.opd_mm.tools.OPDRetrieveTool"
     config:
       type: native
-  - class_name: "verl.experimental.opd_mm.tools.OPDReadTool"
-    config:
-      type: native
   - class_name: "verl.experimental.opd_mm.tools.OPDInspectRawTool"
     config:
       type: native

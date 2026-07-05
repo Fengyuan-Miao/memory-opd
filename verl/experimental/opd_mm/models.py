@@ -104,7 +104,7 @@ class PoolItem:
 class EvidenceItem:
     memory_id: str
     fields: Dict[str, Any] = field(default_factory=dict)
-    source: str = "READ"
+    source: str = "FINAL_POOL"
 
     def to_dict(self) -> Dict[str, Any]:
         return {

@@ -812,6 +812,7 @@ class AgentLoopWorker:
             ),
         )
         await self._compute_score([output], kwargs=kwargs)
+        await self._collect_opd_mm_online_step_corrections(output, validate=validate, sample_kwargs=kwargs)
         await self._compute_teacher_logprobs(
             output,
             prompt_ids=output.prompt_ids,
@@ -997,6 +998,28 @@ class AgentLoopWorker:
                 final_output.extra_fields["reward_extra_info"] = result["reward_extra_info"]
             final_output.metrics.compute_score = timing["compute_score"]
 
+    async def _collect_opd_mm_online_step_corrections(
+        self,
+        output: AgentLoopOutput,
+        validate: bool,
+        sample_kwargs: Optional[dict[str, Any]] = None,
+    ) -> None:
+        """Collect opt-in OPD-MM online step corrections for one rollout."""
+        if validate or sample_kwargs is None:
+            return
+        try:
+            from verl.experimental.opd_mm.online_self_distill import maybe_collect_online_step_corrections
+
+            corrections = maybe_collect_online_step_corrections(
+                sample_kwargs=sample_kwargs,
+                output_extra_fields=output.extra_fields,
+            )
+        except Exception as e:
+            logger.warning("Failed to collect OPD-MM online step corrections: %s", e)
+            return
+        if corrections:
+            output.extra_fields["opd_mm_step_corrections"] = corrections
+
     async def _compute_teacher_logprobs(
         self,
         output: AgentLoopOutput,
@@ -1013,12 +1036,43 @@ class AgentLoopWorker:
                 if routing_value is not None:
                     # Non-tensor batch values arrive as 0-d numpy objects / arrays; normalize to Python.
                     routing_key = routing_value.item() if hasattr(routing_value, "item") else routing_value
+            sequence_ids = prompt_ids + response_ids
+            teacher_prompt_length = None
+            if sample_kwargs is not None:
+                try:
+                    from verl.experimental.opd_mm.teacher_privilege import (
+                        align_teacher_outputs_to_student_sequence,
+                        build_teacher_privileged_prompt,
+                        should_use_teacher_privilege,
+                    )
+
+                    if should_use_teacher_privilege(sample_kwargs):
+                        teacher_prompt = build_teacher_privileged_prompt(sample_kwargs, output.extra_fields)
+                        teacher_prompt_ids = normalize_token_ids(
+                            self.tokenizer(
+                                teacher_prompt,
+                                add_special_tokens=False,
+                            )["input_ids"]
+                        )
+                        sequence_ids = teacher_prompt_ids + response_ids
+                        teacher_prompt_length = len(teacher_prompt_ids)
+                except Exception as e:
+                    logger.warning("Failed to build OPD-MM teacher privileged prompt; fallback to shared prompt: %s", e)
             teacher_ids, teacher_logprobs = await self.teacher_server_manager.compute_teacher_logprobs_single(
-                sequence_ids=prompt_ids + response_ids,
+                sequence_ids=sequence_ids,
                 multi_modal_data=output.multi_modal_data,
                 mm_processor_kwargs=output.mm_processor_kwargs,
                 routing_key=routing_key,
             )
+            if teacher_prompt_length is not None:
+                teacher_ids, teacher_logprobs = align_teacher_outputs_to_student_sequence(
+                    teacher_ids,
+                    teacher_logprobs,
+                    teacher_prompt_length=teacher_prompt_length,
+                    student_prompt_length=len(prompt_ids),
+                    response_length=len(response_ids),
+                    pad_token_id=self.tokenizer.pad_token_id or 0,
+                )
             output.extra_fields["teacher_ids"] = teacher_ids
             output.extra_fields["teacher_logprobs"] = teacher_logprobs
 

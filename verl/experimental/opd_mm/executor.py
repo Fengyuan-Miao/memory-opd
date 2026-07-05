@@ -29,6 +29,18 @@ from .models import (
 from .retrieval import HiddenMemoryStore, HybridRetriever
 from .schema import TrajectoryValidator
 
+PUBLIC_EVIDENCE_FIELDS = (
+    "summary",
+    "content",
+    "timestamp",
+    "session_date",
+    "turn_id",
+    "author",
+    "modality",
+    "source_type",
+    "raw_pointer",
+)
+
 
 class RawInspector(Protocol):
     def inspect(
@@ -89,8 +101,6 @@ class ToolExecutor:
                         top_k=action.arguments.get("top_k", 5),
                         question_image=question_image,
                     )
-                elif action.tool == "READ":
-                    evidence.extend(self._read(pool, action.arguments["fields"]))
                 elif action.tool == "INSPECT_RAW":
                     remaining = max(0, self.max_raw_inspections - raw_calls)
                     inspected = self._inspect_raw(
@@ -118,6 +128,8 @@ class ToolExecutor:
             )
             if stopped or step_error:
                 break
+        if not evidence:
+            evidence = self._pool_evidence(pool, source="FINAL_POOL")
 
         return ExecutionResult(
             evidence=evidence,
@@ -192,7 +204,11 @@ class ToolExecutor:
         )
 
     @staticmethod
-    def _read(pool: List[PoolItem], fields: List[str]) -> List[EvidenceItem]:
+    def _pool_evidence(
+        pool: List[PoolItem],
+        fields: tuple[str, ...] = PUBLIC_EVIDENCE_FIELDS,
+        source: str = "FINAL_POOL",
+    ) -> List[EvidenceItem]:
         evidence = []
         for item in pool:
             values = {
@@ -209,7 +225,7 @@ class ToolExecutor:
                 EvidenceItem(
                     memory_id=item.memory.memory_id,
                     fields=values,
-                    source="READ",
+                    source=source,
                 )
             )
         return evidence

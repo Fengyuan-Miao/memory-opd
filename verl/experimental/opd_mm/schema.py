@@ -28,7 +28,6 @@ ALLOWED_TOOLS = {
     "SORT",
     "TOPK",
     "RETRIEVE",
-    "READ",
     "INSPECT_RAW",
     "STOP",
 }
@@ -37,17 +36,6 @@ FILTER_OPS = {"eq", "neq", "before", "after", "contains"}
 SORT_FIELDS = {"timestamp", "turn_id", "score"}
 SORT_ORDERS = {"asc", "desc"}
 RETRIEVAL_METHODS = {"bm25", "dense", "vision", "hybrid"}
-READ_FIELDS = {
-    "summary",
-    "content",
-    "timestamp",
-    "session_date",
-    "turn_id",
-    "author",
-    "modality",
-    "source_type",
-    "raw_pointer",
-}
 INSPECT_TARGETS = {"current_pool"}
 INSPECT_INSTRUCTIONS = {"answer_query_related_visual_details"}
 FORBIDDEN_ARGUMENT_KEYS = {
@@ -66,7 +54,6 @@ FILTER(field=modality|author|source_type|timestamp|status,
 SORT(field=timestamp|turn_id|score, order=asc|desc)
 TOPK(k=positive integer)
 RETRIEVE(method=bm25|dense|vision|hybrid, top_k=positive integer)
-READ(fields=[summary|content|timestamp|session_date|turn_id|author|modality|source_type|raw_pointer])
 STOP()
 
 Return only a JSON array of tool calls. Do not emit memory IDs. RETRIEVE always
@@ -190,17 +177,6 @@ class TrajectoryValidator:
         if args.get("method", "hybrid") not in RETRIEVAL_METHODS:
             raise TrajectoryValidationError(f"action {index}: invalid RETRIEVE method")
         self._validate_k(args.get("top_k", 5), index, "top_k")
-
-    def _validate_read(self, args: Dict[str, Any], index: int) -> None:
-        self._require_exact_keys(args, {"fields"}, set(), index)
-        fields = args["fields"]
-        if not isinstance(fields, list) or not fields:
-            raise TrajectoryValidationError(f"action {index}: READ fields must be a list")
-        unknown = set(fields) - READ_FIELDS
-        if unknown:
-            raise TrajectoryValidationError(
-                f"action {index}: invalid READ fields {sorted(unknown)}"
-            )
 
     def _validate_inspect_raw(self, args: Dict[str, Any], index: int) -> None:
         self._require_exact_keys(args, set(), {"target", "instruction"}, index)

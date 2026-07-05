@@ -82,6 +82,17 @@ class VisionEncoder(Protocol):
         ...
 
 
+class HybridEncoder(Protocol):
+    def encode_text(self, text: str) -> List[float]:
+        ...
+
+    def encode_image(self, image: Any, text: Optional[str] = None) -> List[float]:
+        ...
+
+    def encode_text_image(self, text: str, image: Any) -> List[float]:
+        ...
+
+
 class HiddenMemoryStore:
     """Memory collection visible only to the executor."""
 
@@ -90,14 +101,18 @@ class HiddenMemoryStore:
         records: Iterable[MemoryRecord],
         dense_encoder: Optional[DenseEncoder] = None,
         vision_encoder: Optional[VisionEncoder] = None,
+        hybrid_encoder: Optional[HybridEncoder] = None,
     ):
         self._records = list(records)
         self._dense_encoder = dense_encoder
         self._vision_encoder = vision_encoder
+        self._hybrid_encoder = hybrid_encoder
         self._dense_cache: Dict[str, np.ndarray] = {}
         self._dense_prepared = False
         self._vision_cache: Dict[str, np.ndarray] = {}
         self._vision_prepared = False
+        self._hybrid_cache: Dict[str, np.ndarray] = {}
+        self._hybrid_prepared = False
 
     def initial_pool(self) -> List[PoolItem]:
         return [PoolItem(memory=record) for record in self._records]
@@ -311,6 +326,63 @@ class HiddenMemoryStore:
         norm = float(np.linalg.norm(vector))
         return vector / norm if norm > 0 else vector
 
+    def hybrid_vector(self, record: MemoryRecord) -> Optional[np.ndarray]:
+        if self._hybrid_encoder is None:
+            return None
+        self._prepare_hybrid_cache()
+        return self._hybrid_cache.get(record.memory_id)
+
+    def _prepare_hybrid_cache(self) -> None:
+        if self._hybrid_prepared or self._hybrid_encoder is None:
+            return
+        for record in self._records:
+            text = record.searchable_text()
+            if record.raw_pointer:
+                if hasattr(self._hybrid_encoder, "encode_text_image") and text:
+                    values = self._hybrid_encoder.encode_text_image(
+                        text,
+                        record.raw_pointer,
+                    )
+                else:
+                    values = self._hybrid_encoder.encode_image(
+                        record.raw_pointer,
+                        text or None,
+                    )
+            elif text:
+                values = self._hybrid_encoder.encode_text(text)
+            else:
+                continue
+            vector = np.asarray(values, dtype="float32")
+            norm = float(np.linalg.norm(vector))
+            self._hybrid_cache[record.memory_id] = (
+                vector / norm if norm > 0 else vector
+            )
+        self._hybrid_prepared = True
+
+    def hybrid_query_vector(
+        self,
+        query: str,
+        question_image: Optional[str] = None,
+    ) -> Optional[np.ndarray]:
+        if self._hybrid_encoder is None:
+            return None
+        if question_image:
+            if hasattr(self._hybrid_encoder, "encode_text_image") and query:
+                values = self._hybrid_encoder.encode_text_image(
+                    query,
+                    question_image,
+                )
+            else:
+                values = self._hybrid_encoder.encode_image(
+                    question_image,
+                    query or None,
+                )
+        else:
+            values = self._hybrid_encoder.encode_text(query)
+        vector = np.asarray(values, dtype="float32")
+        norm = float(np.linalg.norm(vector))
+        return vector / norm if norm > 0 else vector
+
 
 class HybridRetriever:
     """BM25, dense, or normalized hybrid ranking over the current pool."""
@@ -329,40 +401,25 @@ class HybridRetriever:
     ) -> List[PoolItem]:
         if not pool or top_k <= 0:
             return []
-        bm25 = self._bm25_scores(pool, query)
-        dense = self._dense_scores(pool, query, store)
-        vision = self._vision_scores(pool, query, store, question_image)
         if method == "bm25":
-            scores = bm25
+            scores = self._bm25_scores(pool, query)
         elif method == "dense":
-            scores = dense
+            scores = self._dense_scores(pool, query, store)
         elif method == "vision":
-            scores = vision
+            scores = self._vision_scores(pool, query, store, question_image)
         else:
-            sparse_norm = normalize_scores(bm25)
-            dense_norm = normalize_scores(dense)
-            vision_norm = normalize_scores(vision)
-            has_vision = any(value != 0.0 for value in vision.values())
-            if has_vision and question_image:
-                vision_weight = 0.5
-            elif has_vision:
-                vision_weight = 0.2
-            else:
-                vision_weight = 0.0
-            text_weight = 1.0 - vision_weight
-            scores = {
-                item.memory.memory_id: (
-                    text_weight
-                    * self.hybrid_alpha
-                    * dense_norm.get(item.memory.memory_id, 0.0)
-                    + text_weight
-                    * (1.0 - self.hybrid_alpha)
-                    * sparse_norm.get(item.memory.memory_id, 0.0)
-                    + vision_weight
-                    * vision_norm.get(item.memory.memory_id, 0.0)
+            scores = self._hybrid_scores(pool, query, store, question_image)
+            if not any(value != 0.0 for value in scores.values()):
+                bm25 = self._bm25_scores(pool, query)
+                dense = self._dense_scores(pool, query, store)
+                vision = self._vision_scores(pool, query, store, question_image)
+                scores = self._weighted_legacy_hybrid_scores(
+                    pool,
+                    bm25,
+                    dense,
+                    vision,
+                    question_image,
                 )
-                for item in pool
-            }
         ranked = [
             PoolItem(item.memory, float(scores.get(item.memory.memory_id, 0.0)))
             for item in pool
@@ -458,6 +515,64 @@ class HybridRetriever:
                 )
         return scores
 
+    @staticmethod
+    def _hybrid_scores(
+        pool: List[PoolItem],
+        query: str,
+        store: HiddenMemoryStore,
+        question_image: Optional[str],
+    ) -> Dict[str, float]:
+        query_fn = getattr(store, "hybrid_query_vector", None)
+        vector_fn = getattr(store, "hybrid_vector", None)
+        if query_fn is None or vector_fn is None:
+            return {item.memory.memory_id: 0.0 for item in pool}
+        query_vector = query_fn(query, question_image)
+        if query_vector is None or query_vector.size == 0:
+            return {item.memory.memory_id: 0.0 for item in pool}
+        scores = {}
+        for item in pool:
+            vector = vector_fn(item.memory)
+            if vector is None or vector.size != query_vector.size:
+                scores[item.memory.memory_id] = 0.0
+            else:
+                scores[item.memory.memory_id] = float(
+                    np.dot(query_vector, vector)
+                )
+        return scores
+
+    def _weighted_legacy_hybrid_scores(
+        self,
+        pool: List[PoolItem],
+        bm25: Dict[str, float],
+        dense: Dict[str, float],
+        vision: Dict[str, float],
+        question_image: Optional[str],
+    ) -> Dict[str, float]:
+        sparse_norm = normalize_scores(bm25)
+        dense_norm = normalize_scores(dense)
+        vision_norm = normalize_scores(vision)
+        has_vision = any(value != 0.0 for value in vision.values())
+        if has_vision and question_image:
+            vision_weight = 0.5
+        elif has_vision:
+            vision_weight = 0.2
+        else:
+            vision_weight = 0.0
+        text_weight = 1.0 - vision_weight
+        return {
+            item.memory.memory_id: (
+                text_weight
+                * self.hybrid_alpha
+                * dense_norm.get(item.memory.memory_id, 0.0)
+                + text_weight
+                * (1.0 - self.hybrid_alpha)
+                * sparse_norm.get(item.memory.memory_id, 0.0)
+                + vision_weight
+                * vision_norm.get(item.memory.memory_id, 0.0)
+            )
+            for item in pool
+        }
+
 
 class TurnAwareHybridRetriever(HybridRetriever):
     """Rank dialogue turns, then return all text/image records in each turn."""
@@ -483,14 +598,6 @@ class TurnAwareHybridRetriever(HybridRetriever):
     ) -> List[PoolItem]:
         if not pool or top_k <= 0:
             return []
-        bm25_record = self._bm25_scores(pool, query)
-        dense_record = self._dense_scores(pool, query, store)
-        vision_record = self._vision_scores(
-            pool,
-            query,
-            store,
-            question_image,
-        )
         groups: Dict[str, List[PoolItem]] = defaultdict(list)
         for item in pool:
             groups[item.memory.turn_id].append(item)
@@ -504,42 +611,50 @@ class TurnAwareHybridRetriever(HybridRetriever):
                 for turn_id, items in groups.items()
             }
 
-        bm25 = aggregate(bm25_record)
-        dense = aggregate(dense_record)
-        vision = aggregate(vision_record)
         if method == "bm25":
-            scores = bm25
+            scores = aggregate(self._bm25_scores(pool, query))
         elif method == "dense":
-            scores = dense
+            scores = aggregate(self._dense_scores(pool, query, store))
         elif method == "vision":
-            scores = vision
-        else:
-            sparse_norm = normalize_scores(bm25)
-            dense_norm = normalize_scores(dense)
-            vision_norm = normalize_scores(vision)
-            has_vision = any(value != 0.0 for value in vision.values())
-            if has_vision and question_image:
-                vision_weight = 0.5
-            elif has_vision:
-                vision_weight = 0.2
-            else:
-                vision_weight = 0.0
-            text_weight = 1.0 - vision_weight
-            weights = (
-                text_weight * (1.0 - self.hybrid_alpha),
-                text_weight * self.hybrid_alpha,
-                vision_weight,
+            scores = aggregate(
+                self._vision_scores(pool, query, store, question_image)
             )
-            scores = {
-                turn_id: (
-                    weights[0] * sparse_norm.get(turn_id, 0.0)
-                    + weights[1] * dense_norm.get(turn_id, 0.0)
-                    + weights[2] * vision_norm.get(turn_id, 0.0)
-                )
-                for turn_id in groups
-            }
+        else:
+            hybrid_record = self._hybrid_scores(
+                pool,
+                query,
+                store,
+                question_image,
+            )
+            scores = aggregate(hybrid_record)
+            if any(value != 0.0 for value in scores.values()):
+                scores = self._propagate_local_context(groups, scores)
+                return self._rank_grouped_pool(groups, scores, top_k)
+            bm25_record = self._bm25_scores(pool, query)
+            dense_record = self._dense_scores(pool, query, store)
+            vision_record = self._vision_scores(
+                pool,
+                query,
+                store,
+                question_image,
+            )
+            legacy_scores = self._weighted_legacy_hybrid_scores(
+                pool,
+                bm25_record,
+                dense_record,
+                vision_record,
+                question_image,
+            )
+            scores = aggregate(legacy_scores)
         scores = self._propagate_local_context(groups, scores)
+        return self._rank_grouped_pool(groups, scores, top_k)
 
+    @staticmethod
+    def _rank_grouped_pool(
+        groups: Dict[str, List[PoolItem]],
+        scores: Dict[str, float],
+        top_k: int,
+    ) -> List[PoolItem]:
         ranked_turns = sorted(
             groups,
             key=lambda turn_id: (

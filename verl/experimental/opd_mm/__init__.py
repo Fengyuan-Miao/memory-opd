@@ -15,6 +15,7 @@
 """Experimental OPD-MM memory-retrieval environment for verl agent loops."""
 
 from verl.experimental.opd_mm.executor import ToolExecutor
+from verl.experimental.opd_mm.dataset import OPD_MM_SYSTEM_PROMPT, opd_messages_for_query, opd_sample_to_rlhf_record
 from verl.experimental.opd_mm.models import (
     EvidenceItem,
     ExecutionResult,
@@ -27,11 +28,21 @@ from verl.experimental.opd_mm.models import (
     SFTExample,
     ToolAction,
 )
+from verl.experimental.opd_mm.online_self_distill import maybe_collect_online_step_corrections
+from verl.experimental.opd_mm.on_policy_distiller import OnPolicyDistiller
 from verl.experimental.opd_mm.retrieval import HiddenMemoryStore, HybridRetriever, TurnAwareHybridRetriever
 from verl.experimental.opd_mm.schema import TrajectoryValidationError, TrajectoryValidator
+from verl.experimental.opd_mm.step_correction import StepCorrection, StepCorrectionCollector
+from verl.experimental.opd_mm.vector_index import (
+    DiskIndexedHiddenMemoryStore,
+    DiskVectorIndex,
+    load_indexed_memory_store,
+)
 
 __all__ = [
     "EvidenceItem",
+    "DiskIndexedHiddenMemoryStore",
+    "DiskVectorIndex",
     "ExecutionResult",
     "ExecutionStep",
     "HiddenMemoryStore",
@@ -39,12 +50,20 @@ __all__ = [
     "MemoryRecord",
     "OPDRollout",
     "OPDSample",
+    "OnPolicyDistiller",
+    "OPD_MM_SYSTEM_PROMPT",
     "PolicyOutput",
     "PoolItem",
     "SFTExample",
+    "StepCorrection",
+    "StepCorrectionCollector",
     "ToolAction",
     "ToolExecutor",
     "TrajectoryValidationError",
     "TrajectoryValidator",
     "TurnAwareHybridRetriever",
+    "maybe_collect_online_step_corrections",
+    "load_indexed_memory_store",
+    "opd_messages_for_query",
+    "opd_sample_to_rlhf_record",
 ]

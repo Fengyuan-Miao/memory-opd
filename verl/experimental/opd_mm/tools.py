@@ -15,7 +15,7 @@
 """verl-native tool adapters for the OPD-MM hidden-memory executor.
 
 These tools keep per-trajectory state through the agent_data object supplied by
-ToolAgentLoop. That lets FILTER, SORT, TOPK, RETRIEVE, READ, INSPECT_RAW, and
+ToolAgentLoop. That lets FILTER, SORT, TOPK, RETRIEVE, INSPECT_RAW, and
 STOP behave like the original OPD-MM sequential action space while still
 exposing OpenAI function schemas to verl.
 """
@@ -34,7 +34,6 @@ from verl.experimental.opd_mm.schema import (
     FILTER_OPS,
     INSPECT_INSTRUCTIONS,
     INSPECT_TARGETS,
-    READ_FIELDS,
     RETRIEVAL_METHODS,
     SORT_FIELDS,
     SORT_ORDERS,
@@ -127,6 +126,28 @@ def _sanitize_evidence(items: list[EvidenceItem]) -> list[dict[str, Any]]:
     return sanitized
 
 
+def _sanitize_pool_preview(items: list[PoolItem], max_items: int = 5) -> list[dict[str, Any]]:
+    """Return an ID-free preview of the current hidden pool for tool observations."""
+    preview = []
+    for item in items[:max_items]:
+        memory = item.memory
+        entry = {
+            "summary": memory.summary,
+            "content": memory.content[:360] if memory.content else None,
+            "timestamp": memory.timestamp,
+            "turn_id": memory.turn_id,
+            "author": memory.author,
+            "modality": memory.modality,
+            "source_type": memory.source_type,
+            "raw_pointer": memory.raw_pointer,
+            "session_date": memory.metadata.get("session_date"),
+        }
+        if item.score:
+            entry["retrieval_score"] = item.score
+        preview.append({key: value for key, value in entry.items() if value is not None})
+    return preview
+
+
 @dataclass
 class OPDToolSession:
     """Per-trajectory state shared by OPD-MM tools."""
@@ -173,8 +194,6 @@ class OPDToolSession:
                     top_k=action.arguments.get("top_k", 5),
                     question_image=self.question_image,
                 )
-            elif action.tool == "READ":
-                self.evidence.extend(self.executor._read(self.pool, action.arguments["fields"]))
             elif action.tool == "INSPECT_RAW":
                 remaining = max(0, self.executor.max_raw_inspections - self.raw_calls)
                 inspected = self.executor._inspect_raw(
@@ -210,6 +229,7 @@ class OPDToolSession:
             "tool": action.tool,
             "pool_count": len(self.pool),
             "evidence_count": len(self.evidence),
+            "pool_preview": _sanitize_pool_preview(self.pool),
             "new_evidence": _sanitize_evidence(new_evidence),
             "stopped": self.stopped,
             "error": error,
@@ -220,6 +240,7 @@ class OPDToolSession:
         return {
             "pool_count": len(self.pool),
             "evidence_count": len(self.evidence),
+            "pool_preview": _sanitize_pool_preview(self.pool),
             "evidence": _sanitize_evidence(self.evidence),
             "trace": [action.to_dict() for action in self.trace],
             "stopped": self.stopped,
@@ -342,15 +363,6 @@ class OPDRetrieveTool(OPDBaseTool):
     required: list[str] = []
 
 
-class OPDReadTool(OPDBaseTool):
-    tool_name = "read"
-    description = "Read selected public fields from the current hidden memory pool."
-    properties = {
-        "fields": _property("array", "Fields to expose as evidence.", sorted(READ_FIELDS)),
-    }
-    required = ["fields"]
-
-
 class OPDInspectRawTool(OPDBaseTool):
     tool_name = "inspect_raw"
     description = "Opt-in raw visual inspection for images in the current hidden pool."
@@ -373,7 +385,6 @@ OPD_TOOL_CLASSES = [
     OPDSortTool,
     OPDTopKTool,
     OPDRetrieveTool,
-    OPDReadTool,
     OPDInspectRawTool,
     OPDStopTool,
 ]
@@ -398,7 +409,6 @@ __all__ = [
     "OPDBaseTool",
     "OPDFilterTool",
     "OPDInspectRawTool",
-    "OPDReadTool",
     "OPDRetrieveTool",
     "OPDStopTool",
     "OPDToolSession",
