@@ -98,6 +98,7 @@ class PolicyOutput:
 class PoolItem:
     memory: MemoryRecord
     score: float = 0.0
+    retrieved: bool = False
 
 
 @dataclass

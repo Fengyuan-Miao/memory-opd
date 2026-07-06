@@ -40,6 +40,12 @@ PUBLIC_EVIDENCE_FIELDS = (
     "source_type",
     "raw_pointer",
 )
+TIMESTAMP_DATE_PATTERN = re.compile(
+    r"(?P<year>\d{4})[-/](?P<month>\d{1,2})[-/](?P<day>\d{1,2})"
+)
+DATE_ONLY_PATTERN = re.compile(
+    r"^\s*(?P<year>\d{4})[-/](?P<month>\d{1,2})[-/](?P<day>\d{1,2})\s*$"
+)
 
 
 class RawInspector(Protocol):
@@ -75,6 +81,7 @@ class ToolExecutor:
     ) -> ExecutionResult:
         actions = self.validator.validate(trace)
         pool = memory_store.initial_pool()
+        pool_has_candidates = False
         evidence: List[EvidenceItem] = []
         steps: List[ExecutionStep] = []
         stopped = False
@@ -87,20 +94,40 @@ class ToolExecutor:
             step_error = ""
             try:
                 if action.tool == "FILTER":
-                    pool = self._filter(pool, **action.arguments)
+                    source_pool = self._filter_source_pool(
+                        pool,
+                        memory_store,
+                        action.arguments.get("scope", "current_pool"),
+                    )
+                    filtered = self._filter(
+                        source_pool,
+                        field=action.arguments["field"],
+                        op=action.arguments["op"],
+                        value=action.arguments["value"],
+                    )
+                    if pool_has_candidates and action.arguments.get("scope") == "full_memory":
+                        pool = self._merge_pools(pool, filtered)
+                    else:
+                        pool = filtered
+                    pool_has_candidates = True
+                    self._append_pool_evidence(evidence, filtered, source="FILTER")
                 elif action.tool == "SORT":
                     pool = self._sort(pool, **action.arguments)
                 elif action.tool == "TOPK":
                     pool = self._topk_turns(pool, action.arguments["k"])
                 elif action.tool == "RETRIEVE":
-                    pool = self.retriever.retrieve(
+                    retrieve_query = action.arguments.get("query") or query
+                    retrieved = self.retriever.retrieve(
                         pool,
-                        query=query,
+                        query=retrieve_query,
                         store=memory_store,
                         method=action.arguments.get("method", "hybrid"),
                         top_k=action.arguments.get("top_k", 5),
                         question_image=question_image,
                     )
+                    pool = self._merge_pools(pool, retrieved) if pool_has_candidates else retrieved
+                    pool_has_candidates = True
+                    self._append_pool_evidence(evidence, retrieved, source="RETRIEVE")
                 elif action.tool == "INSPECT_RAW":
                     remaining = max(0, self.max_raw_inspections - raw_calls)
                     inspected = self._inspect_raw(
@@ -142,6 +169,31 @@ class ToolExecutor:
         )
 
     @staticmethod
+    def _merge_pools(existing: List[PoolItem], incoming: List[PoolItem]) -> List[PoolItem]:
+        """Merge candidate pools by hidden memory id while preserving stable order.
+
+        If an incoming item already exists, keep its position but refresh score
+        and retrieved status so later INSPECT_RAW can inspect records that were
+        first introduced by FILTER and then selected by RETRIEVE.
+        """
+        merged = list(existing)
+        positions = {item.memory.memory_id: index for index, item in enumerate(merged)}
+        for item in incoming:
+            memory_id = item.memory.memory_id
+            if memory_id in positions:
+                index = positions[memory_id]
+                previous = merged[index]
+                merged[index] = PoolItem(
+                    memory=item.memory,
+                    score=item.score or previous.score,
+                    retrieved=previous.retrieved or item.retrieved,
+                )
+                continue
+            positions[memory_id] = len(merged)
+            merged.append(item)
+        return merged
+
+    @staticmethod
     def _topk_turns(pool: List[PoolItem], k: int) -> List[PoolItem]:
         selected_turns = []
         selected = []
@@ -155,6 +207,16 @@ class ToolExecutor:
         return selected
 
     @staticmethod
+    def _filter_source_pool(
+        pool: List[PoolItem],
+        memory_store: HiddenMemoryStore,
+        scope: str = "current_pool",
+    ) -> List[PoolItem]:
+        if scope == "full_memory":
+            return memory_store.initial_pool()
+        return pool
+
+    @staticmethod
     def _filter(
         pool: List[PoolItem],
         field: str,
@@ -165,6 +227,8 @@ class ToolExecutor:
 
         def keep(item: PoolItem) -> bool:
             current_value = item.memory.field_value(field)
+            if field == "timestamp":
+                return ToolExecutor._match_timestamp_filter(current_value, op, value)
             current = str(current_value or "").lower()
             if op == "eq":
                 return current == target
@@ -179,6 +243,72 @@ class ToolExecutor:
             return False
 
         return [item for item in pool if keep(item)]
+
+    @classmethod
+    def _match_timestamp_filter(cls, current_value: Any, op: str, target_value: Any) -> bool:
+        """Match timestamp filters with date-only model outputs.
+
+        Mem-Gallery records store timestamps as values like ``2024-06-17T0004``
+        while models naturally emit date-only filters such as ``2024-06-17``.
+        For timestamp fields, date-only equality/contains therefore matches the
+        record date prefix. before/after compare dates when the target omits a
+        time/turn suffix, and fall back to normalized timestamp comparison when
+        a more specific target is provided.
+        """
+        current = str(current_value or "")
+        target = str(target_value or "")
+        current_lower = current.lower()
+        target_lower = target.lower()
+        current_date = cls._canonical_date(current)
+        target_date = cls._canonical_date(target)
+        target_is_date_only = cls._is_date_only(target)
+
+        if op == "eq":
+            if current_date and target_date:
+                if target_is_date_only:
+                    return current_date == target_date
+                return cls._normalized_timestamp(current) == cls._normalized_timestamp(target)
+            return current_lower == target_lower
+        if op == "neq":
+            return not cls._match_timestamp_filter(current_value, "eq", target_value)
+        if op == "contains":
+            if target_lower in current_lower:
+                return True
+            return bool(current_date and target_date and current_date == target_date)
+        if op in {"before", "after"}:
+            current_key = current_date if target_is_date_only else cls._normalized_timestamp(current)
+            target_key = target_date if target_is_date_only else cls._normalized_timestamp(target)
+            if not current_key or not target_key:
+                current_key = current_lower
+                target_key = target_lower
+            return current_key < target_key if op == "before" else current_key > target_key
+        return False
+
+    @staticmethod
+    def _canonical_date(value: Any) -> str:
+        match = TIMESTAMP_DATE_PATTERN.search(str(value or ""))
+        if not match:
+            return ""
+        return (
+            f"{int(match.group('year')):04d}-"
+            f"{int(match.group('month')):02d}-"
+            f"{int(match.group('day')):02d}"
+        )
+
+    @staticmethod
+    def _is_date_only(value: Any) -> bool:
+        return DATE_ONLY_PATTERN.match(str(value or "")) is not None
+
+    @classmethod
+    def _normalized_timestamp(cls, value: Any) -> str:
+        text = str(value or "").strip().lower()
+        match = TIMESTAMP_DATE_PATTERN.search(text)
+        if not match:
+            return text
+        suffix = text[match.end() :].strip()
+        if suffix and suffix[0].isdigit():
+            suffix = f"t{suffix}"
+        return f"{cls._canonical_date(text)}{suffix}"
 
     @classmethod
     def _sort(
@@ -230,6 +360,24 @@ class ToolExecutor:
             )
         return evidence
 
+    @classmethod
+    def _append_pool_evidence(
+        cls,
+        evidence: List[EvidenceItem],
+        pool: List[PoolItem],
+        source: str,
+    ) -> List[EvidenceItem]:
+        """Append public pool records as evidence without duplicating memories."""
+        existing = {item.memory_id for item in evidence}
+        added = []
+        for item in cls._pool_evidence(pool, source=source):
+            if item.memory_id in existing:
+                continue
+            evidence.append(item)
+            added.append(item)
+            existing.add(item.memory_id)
+        return added
+
     def _inspect_raw(
         self,
         pool: List[PoolItem],
@@ -239,9 +387,12 @@ class ToolExecutor:
     ) -> List[EvidenceItem]:
         if self.raw_inspector is None:
             return []
+        inspect_pool = [item for item in pool if item.retrieved]
+        if not inspect_pool:
+            return []
         evidence = []
-        text_by_turn = self._text_context_by_turn(pool)
-        for item in pool:
+        text_by_turn = self._text_context_by_turn(inspect_pool)
+        for item in inspect_pool:
             if len(evidence) >= limit:
                 break
             pointer = item.memory.raw_pointer

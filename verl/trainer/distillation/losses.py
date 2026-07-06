@@ -106,14 +106,82 @@ def get_distillation_loss_settings(loss_name: str) -> DistillationLossSettings:
     return DISTILLATION_SETTINGS_REGISTRY[loss_name]
 
 
+def _distillation_mask(data: TensorDict) -> torch.Tensor:
+    """Return the token mask used specifically for distillation loss."""
+    return data.get("distillation_mask", data["response_mask"])
+
+
+def _mask_to_bool(mask: torch.Tensor) -> torch.Tensor:
+    if mask.is_nested:
+        return mask.bool().to_padded_tensor(False)
+    return mask.bool()
+
+
+def _mask_token_count(mask: torch.Tensor) -> torch.Tensor:
+    if mask.is_nested:
+        return mask.values().sum()
+    return mask.sum()
+
+
+def _unwrap_non_tensor(value: Any) -> Any:
+    return getattr(value, "data", value)
+
+
+def _truthy_value(value: Any) -> bool:
+    value = _unwrap_non_tensor(value)
+    if isinstance(value, torch.Tensor):
+        return bool(value.any().item())
+    if hasattr(value, "tolist"):
+        value = value.tolist()
+    if isinstance(value, (list, tuple)):
+        return any(_truthy_value(item) for item in value)
+    return bool(value)
+
+
+def _is_opd_mm_sft_batch(data: TensorDict) -> bool:
+    if "opd_mm_sft_loss_mask" in data.keys():
+        return True
+    return _truthy_value(data.get("opd_mm_sft_batch", False))
+
+
+def _is_opd_mm_batch(data: TensorDict) -> bool:
+    keys = set(data.keys())
+    if any(str(key).startswith("opd_mm") for key in keys):
+        return True
+    data_source = _unwrap_non_tensor(data.get("data_source", None))
+    if hasattr(data_source, "tolist"):
+        data_source = data_source.tolist()
+    if isinstance(data_source, (list, tuple)):
+        return any(str(item) == "opd_mm" for item in data_source)
+    return str(data_source) == "opd_mm"
+
+
+def _zero_opd_mm_distillation_loss(model_output: dict, data: TensorDict) -> tuple[torch.Tensor, dict[str, Metric]]:
+    log_prob = no_padding_2_padding(model_output["log_probs"], data)
+    zero = log_prob.sum() * 0.0
+    one = zero.detach() + 1.0
+    metrics = {
+        "distillation/masked_tokens": Metric(AggregationType.SUM, zero.detach()),
+        "distillation/opd_mm_no_supervision_batches": Metric(AggregationType.SUM, one),
+        "distillation/opd_mm_sft_tokens": Metric(AggregationType.SUM, zero.detach()),
+        "distillation/opd_mm_sft_loss": Metric(AggregationType.SUM, zero.detach()),
+        "distillation/loss": Metric(value=zero.detach(), aggregation=AggregationType.SUM),
+    }
+    return zero, metrics
+
+
 def compute_distillation_loss_range(
     distillation_losses: torch.Tensor, response_mask: torch.Tensor
 ) -> dict[str, Metric]:
     """Compute min and max distillation loss over valid response tokens."""
-    if response_mask.is_nested:
-        distillation_losses_response = distillation_losses[response_mask.bool().to_padded_tensor(False)]
-    else:
-        distillation_losses_response = distillation_losses[response_mask.bool()]
+    response_mask_bool = _mask_to_bool(response_mask)
+    distillation_losses_response = distillation_losses[response_mask_bool]
+    if distillation_losses_response.numel() == 0:
+        zero = distillation_losses.new_tensor(0.0)
+        return {
+            "distillation/loss_min": Metric(AggregationType.MIN, zero),
+            "distillation/loss_max": Metric(AggregationType.MAX, zero),
+        }
     return {
         "distillation/loss_min": Metric(AggregationType.MIN, distillation_losses_response.min()),
         "distillation/loss_max": Metric(AggregationType.MAX, distillation_losses_response.max()),
@@ -204,6 +272,14 @@ def distillation_ppo_loss(
     if student_logits is not None:
         return compute_topk_loss(config, distillation_config, data, student_logits, data_format)
 
+    if data is not None and _is_opd_mm_sft_batch(data):
+        sft_loss, sft_metrics = opd_mm_xml_sft_loss(config=config, model_output=model_output, data=data)
+        sft_metrics["distillation/loss"] = Metric(value=sft_loss, aggregation=AggregationType.SUM)
+        return sft_loss, sft_metrics
+
+    if data is not None and _is_opd_mm_batch(data) and "teacher_logprobs" not in data.keys():
+        return _zero_opd_mm_distillation_loss(model_output=model_output, data=data)
+
     # Called as final policy loss
     distillation_loss_config = distillation_config.distillation_loss
     distill_loss, distill_metrics = distillation_loss(config, distillation_config, model_output, data)
@@ -225,6 +301,56 @@ def distillation_ppo_loss(
     policy_metrics["distillation/loss"] = Metric(value=distill_loss, aggregation=AggregationType.SUM)
 
     return policy_loss, policy_metrics
+
+
+def opd_mm_xml_sft_loss(
+    config: ActorConfig,
+    model_output: dict,
+    data: TensorDict,
+) -> tuple[torch.Tensor, dict[str, Any]]:
+    """SFT loss for OPD-MM online XML corrections.
+
+    ``response_mask``/``opd_mm_sft_loss_mask`` marks only the canonical teacher
+    ``<tool_call>...</tool_call>`` target. The state prompt and any teacher
+    preamble/suffix are therefore never supervised.
+    """
+    log_prob = no_padding_2_padding(model_output["log_probs"], data)
+    loss_mask = data.get("opd_mm_sft_loss_mask", data["response_mask"])
+    if loss_mask.is_nested:
+        loss_mask = loss_mask.to_padded_tensor(False)
+    loss_mask = loss_mask.to(device=log_prob.device, dtype=log_prob.dtype)
+    masked_tokens = loss_mask.sum()
+
+    config.global_batch_info["dp_size"] = data["dp_size"]
+    config.global_batch_info["batch_num_tokens"] = data["batch_num_tokens"]
+    config.global_batch_info["global_batch_size"] = data["global_batch_size"]
+    config.global_batch_info["loss_scale_factor"] = config.loss_scale_factor
+
+    metrics: dict[str, Any] = {
+        "distillation/masked_tokens": Metric(AggregationType.SUM, masked_tokens.detach()),
+        "distillation/opd_mm_sft_tokens": Metric(AggregationType.SUM, masked_tokens.detach()),
+    }
+    if masked_tokens.item() == 0:
+        zero = log_prob.sum() * 0.0
+        metrics["distillation/opd_mm_sft_loss"] = Metric(AggregationType.SUM, zero.detach())
+        return zero, metrics
+
+    token_losses = -log_prob
+    loss = agg_loss(
+        loss_mat=token_losses,
+        loss_mask=loss_mask,
+        loss_agg_mode=config.loss_agg_mode,
+        **config.global_batch_info,
+    )
+    valid_losses = token_losses[loss_mask.bool()]
+    metrics.update(
+        {
+            "distillation/opd_mm_sft_loss": Metric(AggregationType.SUM, loss.detach()),
+            "distillation/loss_min": Metric(AggregationType.MIN, valid_losses.min().detach()),
+            "distillation/loss_max": Metric(AggregationType.MAX, valid_losses.max().detach()),
+        }
+    )
+    return loss, metrics
 
 
 def distillation_loss(
@@ -249,12 +375,19 @@ def distillation_loss(
         model_output=model_output,
         data=data,
     )
-    response_mask = data["response_mask"]
+    response_mask = _distillation_mask(data)
     loss_agg_mode = config.loss_agg_mode
 
     distillation_metrics.update(
         compute_distillation_loss_range(distillation_losses=distillation_losses, response_mask=response_mask)
     )
+    distillation_metrics["distillation/masked_tokens"] = Metric(
+        AggregationType.SUM,
+        _mask_token_count(response_mask).to(distillation_losses.device, dtype=distillation_losses.dtype),
+    )
+    if _mask_token_count(response_mask).item() == 0:
+        return distillation_losses.sum() * 0.0, distillation_metrics
+
     if loss_config.loss_max_clamp is not None:
         # clamping min is for k1 loss which can be negative
         distillation_losses = distillation_losses.clamp(min=-loss_config.loss_max_clamp, max=loss_config.loss_max_clamp)
@@ -318,10 +451,7 @@ def compute_forward_kl_topk(
     if overlap_count is not None and overlap_token_advantage is not None:
         overlap_count = no_padding_2_padding(overlap_count, data)
         overlap_token_advantage = no_padding_2_padding(overlap_token_advantage, data)
-    if data["response_mask"].is_nested:
-        response_mask_bool = data["response_mask"].bool().to_padded_tensor(False)
-    else:
-        response_mask_bool = data["response_mask"].bool()
+    response_mask_bool = _mask_to_bool(_distillation_mask(data))
     assert distillation_losses.shape == student_mass.shape == teacher_mass.shape == response_mask_bool.shape
 
     overlap_metrics = {}
@@ -333,7 +463,9 @@ def compute_forward_kl_topk(
         # Diagnostics for tracking teacher/student top-k overlap in OPD, following
         # "Rethinking On-Policy Distillation of Large Language Models" (arXiv:2604.13016):
         # overlap ratio and average teacher-token KL contribution on overlapped tokens.
-        overlap_metrics["distillation/overlap_ratio"] = (valid_overlap_count.float().mean() / k).item()
+        overlap_metrics["distillation/overlap_ratio"] = (
+            (valid_overlap_count.float().mean() / k).item() if valid_overlap_count.numel() else 0.0
+        )
         overlap_position_mask = response_mask_bool & (overlap_count > 0)
         if overlap_position_mask.any():
             overlap_metrics["distillation/overlap_token_advantage"] = (
@@ -345,6 +477,18 @@ def compute_forward_kl_topk(
     # Log amount of mass in the top-k log probabilities for both student and teacher.
     student_mass = student_mass[response_mask_bool]
     teacher_mass = teacher_mass[response_mask_bool]
+    if student_mass.numel() == 0 or teacher_mass.numel() == 0:
+        zero = distillation_losses.new_tensor(0.0)
+        distillation_metrics = {
+            "distillation/student_mass": 0.0,
+            "distillation/student_mass_min": Metric(AggregationType.MIN, zero),
+            "distillation/student_mass_max": Metric(AggregationType.MAX, zero),
+            "distillation/teacher_mass": 0.0,
+            "distillation/teacher_mass_min": Metric(AggregationType.MIN, zero),
+            "distillation/teacher_mass_max": Metric(AggregationType.MAX, zero),
+            **overlap_metrics,
+        }
+        return distillation_losses * 0.0, distillation_metrics
     distillation_metrics = {
         "distillation/student_mass": student_mass.mean().item(),
         "distillation/student_mass_min": Metric(AggregationType.MIN, student_mass.min()),
@@ -382,10 +526,7 @@ def compute_distillation_loss_reverse_kl_estimator(
     """
     student_log_probs = no_padding_2_padding(model_output["log_probs"], data)
     teacher_log_probs = no_padding_2_padding(data["teacher_logprobs"], data).squeeze(-1)
-    if data["response_mask"].is_nested:
-        response_mask_bool = data["response_mask"].bool().to_padded_tensor(False)
-    else:
-        response_mask_bool = data["response_mask"].bool()
+    response_mask_bool = _mask_to_bool(_distillation_mask(data))
     assert teacher_log_probs.shape == student_log_probs.shape == response_mask_bool.shape
 
     loss_config: DistillationLossConfig = distillation_config.distillation_loss
@@ -393,7 +534,11 @@ def compute_distillation_loss_reverse_kl_estimator(
         logprob=student_log_probs, ref_logprob=teacher_log_probs, kl_penalty=loss_config.loss_mode
     )
     # Since k1 can be negative, log the mean absolute loss.
+    valid_losses = distillation_losses[response_mask_bool]
     metrics = {
-        "distillation/abs_loss": Metric(AggregationType.MEAN, distillation_losses[response_mask_bool].abs().mean()),
+        "distillation/abs_loss": Metric(
+            AggregationType.MEAN,
+            valid_losses.abs().mean() if valid_losses.numel() else distillation_losses.new_tensor(0.0),
+        ),
     }
     return distillation_losses, metrics

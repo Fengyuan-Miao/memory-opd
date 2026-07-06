@@ -30,6 +30,7 @@ from verl.experimental.agent_loop.agent_loop import (
     _InternalAgentLoopOutput,
 )
 from verl.experimental.agent_loop.single_turn_agent_loop import SingleTurnAgentLoop
+from verl.experimental.agent_loop.tool_agent_loop import build_tool_call_xml_span_mask
 from verl.utils.dataset.rl_dataset import RLHFDataset
 from verl.workers.rollout.replica import TokenOutput
 
@@ -120,6 +121,31 @@ class _FakeTokenizer:
         return "<decoded>"
 
 
+class _CharTokenizer:
+    def encode(self, text: str, add_special_tokens: bool = False) -> list[int]:
+        del add_special_tokens
+        return [ord(char) for char in text]
+
+    def decode(self, ids: list[int] | torch.Tensor, skip_special_tokens: bool = False) -> str:
+        del skip_special_tokens
+        if isinstance(ids, torch.Tensor):
+            ids = ids.tolist()
+        return "".join(chr(int(token)) for token in ids)
+
+    def __call__(
+        self,
+        text: str,
+        *,
+        add_special_tokens: bool = False,
+        return_offsets_mapping: bool = False,
+    ) -> dict[str, Any]:
+        del add_special_tokens
+        output = {"input_ids": self.encode(text)}
+        if return_offsets_mapping:
+            output["offset_mapping"] = [(index, index + 1) for index in range(len(text))]
+        return output
+
+
 def _pad_1d(ids: list[int], *, length: int, pad_id: int = 0) -> list[int]:
     if len(ids) > length:
         return ids[:length]
@@ -131,6 +157,7 @@ def _to_internal(
     output_prompt_ids: list[int],
     output_response_ids: list[int],
     output_response_mask: list[int],
+    output_distillation_mask: Optional[list[int]] = None,
     metrics: AgentLoopMetrics,
     extra_fields: dict[str, Any],
     num_turns: int,
@@ -140,6 +167,11 @@ def _to_internal(
     prompt_ids = _pad_1d(output_prompt_ids, length=prompt_len, pad_id=0)
     response_ids = _pad_1d(output_response_ids, length=response_len, pad_id=0)
     response_mask = _pad_1d(output_response_mask, length=response_len, pad_id=0)
+    distillation_mask = (
+        _pad_1d(output_distillation_mask, length=response_len, pad_id=0)
+        if output_distillation_mask is not None
+        else None
+    )
 
     seq_len = prompt_len + response_len
     attention_mask = _pad_1d([1] * len(output_prompt_ids), length=prompt_len, pad_id=0) + _pad_1d(
@@ -157,6 +189,7 @@ def _to_internal(
         prompt_ids=t(prompt_ids),
         response_ids=t(response_ids),
         response_mask=t(response_mask),
+        distillation_mask=t(distillation_mask) if distillation_mask is not None else None,
         attention_mask=t(attention_mask),
         input_ids=t(input_ids),
         position_ids=t(position_ids),
@@ -169,6 +202,56 @@ def _to_internal(
         metrics=metrics,
         extra_fields=extra_fields,
     )
+
+
+def test_tool_call_xml_span_mask_masks_preamble_and_suffix_on_cpu():
+    tokenizer = _CharTokenizer()
+    text = "preamble <tool_call><function=retrieve></function></tool_call> suffix"
+    mask = build_tool_call_xml_span_mask(tokenizer, tokenizer.encode(text))
+
+    start = text.index("<tool_call>")
+    end = text.index("</tool_call>") + len("</tool_call>")
+    assert mask[:start] == [0] * start
+    assert mask[start:end] == [1] * (end - start)
+    assert mask[end:] == [0] * (len(text) - end)
+
+
+def test_tool_call_xml_span_mask_keeps_truncated_tool_call_on_cpu():
+    tokenizer = _CharTokenizer()
+    text = "note <tool_call><function=retrieve>"
+    mask = build_tool_call_xml_span_mask(tokenizer, tokenizer.encode(text))
+
+    start = text.index("<tool_call>")
+    assert mask[:start] == [0] * start
+    assert mask[start:] == [1] * (len(text) - start)
+
+
+def test_agent_loop_postprocess_carries_distillation_mask_on_cpu():
+    dummy_worker = type(
+        "_DummyWorker",
+        (),
+        {
+            "reward_loop_worker_handles": None,
+            "distillation_enabled": False,
+            "_default_extra_field_value": staticmethod(AgentLoopWorker._default_extra_field_value),
+        },
+    )()
+    internal = _to_internal(
+        output_prompt_ids=[1, 2],
+        output_response_ids=[3, 4, 5, 6],
+        output_response_mask=[1, 1, 1, 1],
+        output_distillation_mask=[0, 1, 1, 0],
+        metrics=AgentLoopMetrics(),
+        extra_fields={"turn_scores": [], "tool_rewards": []},
+        num_turns=1,
+        prompt_len=2,
+        response_len=4,
+    )
+
+    merged = AgentLoopWorker._postprocess(dummy_worker, inputs=[internal])
+
+    assert "distillation_mask" in merged.batch
+    assert merged.batch["distillation_mask"].tolist() == [[0, 1, 1, 0]]
 
 
 @pytest.mark.asyncio
@@ -228,7 +311,11 @@ async def test_agent_loop_extra_fields_schema_stable_for_training_concat_on_cpu(
     dummy_worker = type(
         "_DummyWorker",
         (),
-        {"reward_loop_worker_handles": None, "distillation_enabled": False},
+        {
+            "reward_loop_worker_handles": None,
+            "distillation_enabled": False,
+            "_default_extra_field_value": staticmethod(AgentLoopWorker._default_extra_field_value),
+        },
     )()
     merged = AgentLoopWorker._postprocess(
         dummy_worker,
@@ -246,6 +333,8 @@ async def test_agent_loop_extra_fields_schema_stable_for_training_concat_on_cpu(
         "min_global_steps",
         "max_global_steps",
         "extras",
+        "opd_mm",
+        "opd_mm_step_corrections",
     )
     for key in stable_keys:
         assert key in merged.non_tensor_batch, f"missing key in merged batch: {key}"
@@ -256,6 +345,62 @@ async def test_agent_loop_extra_fields_schema_stable_for_training_concat_on_cpu(
     # And the list-typed fields are actually lists (not missing / scalar).
     assert merged.non_tensor_batch["turn_scores"][0] == []
     assert merged.non_tensor_batch["tool_rewards"][0] == []
+    assert merged.non_tensor_batch["opd_mm"][0] is None
+    assert merged.non_tensor_batch["opd_mm_step_corrections"][0] is None
+
+
+def test_agent_loop_postprocess_keeps_opd_mm_schema_stable_for_concat_on_cpu():
+    dummy_worker = type(
+        "_DummyWorker",
+        (),
+        {
+            "reward_loop_worker_handles": None,
+            "distillation_enabled": False,
+            "_default_extra_field_value": staticmethod(AgentLoopWorker._default_extra_field_value),
+        },
+    )()
+
+    internal_with_opd = _to_internal(
+        output_prompt_ids=[1, 2],
+        output_response_ids=[3],
+        output_response_mask=[1],
+        metrics=AgentLoopMetrics(),
+        extra_fields={"opd_mm": {"pool_count": 1, "evidence_count": 0}},
+        num_turns=2,
+        prompt_len=2,
+        response_len=2,
+    )
+    internal_without_opd = _to_internal(
+        output_prompt_ids=[4, 5],
+        output_response_ids=[6],
+        output_response_mask=[1],
+        metrics=AgentLoopMetrics(),
+        extra_fields={},
+        num_turns=1,
+        prompt_len=2,
+        response_len=2,
+    )
+
+    chunk_with_opd = AgentLoopWorker._postprocess(
+        dummy_worker,
+        inputs=[internal_with_opd],
+        input_non_tensor_batch={"index": np.array([0], dtype=object)},
+    )
+    chunk_without_opd = AgentLoopWorker._postprocess(
+        dummy_worker,
+        inputs=[internal_without_opd],
+        input_non_tensor_batch={"index": np.array([1], dtype=object)},
+    )
+
+    merged = type(chunk_with_opd).concat([chunk_with_opd, chunk_without_opd])
+
+    assert len(merged) == 2
+    assert merged.non_tensor_batch["opd_mm"].shape == (2,)
+    assert merged.non_tensor_batch["opd_mm"][0] == {"pool_count": 1, "evidence_count": 0}
+    assert merged.non_tensor_batch["opd_mm"][1] is None
+    assert merged.non_tensor_batch["opd_mm_step_corrections"].shape == (2,)
+    assert merged.non_tensor_batch["opd_mm_step_corrections"][0] is None
+    assert merged.non_tensor_batch["opd_mm_step_corrections"][1] is None
 
 
 @pytest.mark.asyncio
@@ -275,6 +420,9 @@ async def test_agent_loop_postprocess_accepts_read_only_routed_experts_on_cpu():
             self.processor = None
             self.mm_processor_kwargs = {}
             self.reward_loop_worker_handles = None
+
+        async def _collect_opd_mm_online_step_corrections(self, output, validate, sample_kwargs=None):
+            del output, validate, sample_kwargs
 
     routed_experts = np.arange(8, dtype=np.int64).reshape(4, 2, 1)
     routed_experts.setflags(write=False)

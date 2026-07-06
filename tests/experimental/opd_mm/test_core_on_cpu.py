@@ -21,11 +21,18 @@ from typing import Any
 import numpy as np
 import pytest
 import torch
+from tensordict import TensorDict
 
 from verl import DataProto
 from verl.experimental.opd_mm import MemoryRecord, OPDSample, OnPolicyDistiller, PolicyOutput, ToolAction, ToolExecutor
 from verl.experimental.opd_mm.dataset import OPD_MM_SYSTEM_PROMPT, opd_messages_for_query, opd_sample_to_rlhf_record
-from verl.experimental.opd_mm.online_self_distill import maybe_collect_online_step_corrections
+from verl.experimental.opd_mm.online_self_distill import (
+    build_online_step_correction_requests,
+    dump_online_step_correction,
+    extract_canonical_tool_call_xml,
+    finalize_online_step_correction,
+    maybe_collect_online_step_corrections,
+)
 from verl.experimental.opd_mm.retrieval import HiddenMemoryStore, TurnAwareHybridRetriever
 from verl.experimental.opd_mm.reward_manager import OPDMMRewardManager
 from verl.experimental.opd_mm.schema import TrajectoryValidationError, TrajectoryValidator
@@ -35,8 +42,17 @@ from verl.experimental.opd_mm.teacher_privilege import (
     align_teacher_outputs_to_student_sequence,
     build_teacher_privileged_prompt,
 )
-from verl.experimental.opd_mm.tools import OPDFilterTool, hidden_store_from_records, openai_tool_schemas
+from verl.experimental.opd_mm.tools import (
+    OPDFilterTool,
+    OPDRetrieveTool,
+    OPDStopTool,
+    hidden_store_from_records,
+    openai_tool_schemas,
+)
+from verl.trainer.distillation.losses import distillation_ppo_loss
+from verl.utils import tensordict_utils as tu
 from verl.tools.tool_registry import load_all_tools
+from verl.workers.config import ActorConfig, DistillationConfig
 
 
 def _records() -> list[MemoryRecord]:
@@ -87,14 +103,131 @@ def _records() -> list[MemoryRecord]:
     ]
 
 
-def test_validator_rejects_memory_ids_and_custom_retrieve_query() -> None:
+class FakeRawInspector:
+    def __init__(self) -> None:
+        self.calls: list[str] = []
+
+    def inspect(
+        self,
+        raw_pointer: str,
+        query: str,
+        question_image: str | None = None,
+        text_context: str = "",
+    ) -> str:
+        del query, question_image, text_context
+        self.calls.append(raw_pointer)
+        return f"observed {raw_pointer}"
+
+
+class RecordingRetriever:
+    def __init__(self) -> None:
+        self.queries: list[str] = []
+
+    def retrieve(
+        self,
+        pool: list[Any],
+        query: str,
+        store: HiddenMemoryStore,
+        method: str = "hybrid",
+        top_k: int = 5,
+        question_image: str | None = None,
+    ) -> list[Any]:
+        del store, method, question_image
+        self.queries.append(query)
+        return pool[:top_k]
+
+
+class QuerySwitchRetriever:
+    def retrieve(
+        self,
+        pool: list[Any],
+        query: str,
+        store: HiddenMemoryStore,
+        method: str = "hybrid",
+        top_k: int = 5,
+        question_image: str | None = None,
+    ) -> list[Any]:
+        del pool, method, top_k, question_image
+        records = {item.memory.memory_id: item for item in store.initial_pool()}
+        if "assistant" in query:
+            return [records["m_assistant_image"]]
+        return [records["m_cat_text"]]
+
+
+def test_validator_rejects_memory_ids_and_accepts_rewritten_retrieve_query() -> None:
     validator = TrajectoryValidator(max_actions=4)
 
     with pytest.raises(TrajectoryValidationError, match="memory IDs"):
         validator.validate([{"tool": "FILTER", "field": "status", "op": "eq", "value": "m_001"}])
 
-    with pytest.raises(TrajectoryValidationError, match="forbidden arguments"):
-        validator.validate([{"tool": "RETRIEVE", "query": "custom query", "top_k": 3}])
+    validated_filter = validator.validate(
+        [{"tool": "FILTER", "field": "author", "op": "eq", "value": "user", "scope": "full_memory"}]
+    )
+    assert validated_filter[0].arguments["scope"] == "full_memory"
+
+    with pytest.raises(TrajectoryValidationError, match="invalid FILTER scope"):
+        validator.validate([{"tool": "FILTER", "field": "author", "op": "eq", "value": "user", "scope": "all"}])
+
+    validated = validator.validate([{"tool": "RETRIEVE", "query": "custom query", "top_k": 3}])
+    assert validated[0].arguments["query"] == "custom query"
+
+    with pytest.raises(TrajectoryValidationError, match="memory IDs"):
+        validator.validate([{"tool": "RETRIEVE", "query": "look up m_001", "top_k": 3}])
+
+
+def test_executor_uses_rewritten_retrieve_query_when_provided() -> None:
+    retriever = RecordingRetriever()
+    ToolExecutor(retriever=retriever).run(
+        [{"tool": "RETRIEVE", "method": "bm25", "query": "rewritten cat sofa", "top_k": 1}],
+        query="original user question",
+        memory_store=HiddenMemoryStore(_records()),
+    )
+
+    assert retriever.queries == ["rewritten cat sofa"]
+
+
+def test_filter_scope_can_restart_from_full_memory_pool() -> None:
+    store = HiddenMemoryStore(_records())
+
+    narrowed_result = ToolExecutor().run(
+        [
+            {"tool": "FILTER", "field": "modality", "op": "eq", "value": "image"},
+            {"tool": "FILTER", "field": "author", "op": "eq", "value": "assistant"},
+            {"tool": "FILTER", "field": "author", "op": "eq", "value": "user"},
+        ],
+        query="Show user memories after a wrong narrow filter.",
+        memory_store=store,
+    )
+    assert narrowed_result.final_memory_ids == []
+
+    reset_result = ToolExecutor().run(
+        [
+            {"tool": "FILTER", "field": "modality", "op": "eq", "value": "image"},
+            {"tool": "FILTER", "field": "author", "op": "eq", "value": "assistant"},
+            {"tool": "FILTER", "field": "author", "op": "eq", "value": "user", "scope": "full_memory"},
+        ],
+        query="Show user memories after resetting the filter scope.",
+        memory_store=store,
+    )
+    assert reset_result.final_memory_ids == ["m_assistant_image", "m_text_old", "m_cat_text", "m_cat_image"]
+    assert reset_result.steps[2].pool_before == 1
+    assert reset_result.steps[2].pool_after == 4
+    assert len({item.memory_id for item in reset_result.evidence}) == len(reset_result.evidence)
+
+
+def test_repeated_retrieve_merges_and_deduplicates_candidates() -> None:
+    result = ToolExecutor(retriever=QuerySwitchRetriever()).run(
+        [
+            {"tool": "RETRIEVE", "method": "hybrid", "top_k": 1, "query": "cat"},
+            {"tool": "RETRIEVE", "method": "hybrid", "top_k": 1, "query": "cat"},
+            {"tool": "RETRIEVE", "method": "hybrid", "top_k": 1, "query": "assistant"},
+        ],
+        query="Find multiple memories.",
+        memory_store=HiddenMemoryStore(_records()),
+    )
+
+    assert result.final_memory_ids == ["m_cat_text", "m_assistant_image"]
+    assert [item.memory_id for item in result.evidence] == ["m_cat_text", "m_assistant_image"]
 
 
 def test_executor_composes_generic_tools_to_latest_user_image() -> None:
@@ -117,6 +250,55 @@ def test_executor_composes_generic_tools_to_latest_user_image() -> None:
     assert result.evidence[0].fields["session_date"] == "2026-01-01"
 
 
+def test_timestamp_filter_accepts_date_only_model_values() -> None:
+    records = [
+        *_records(),
+        MemoryRecord(
+            memory_id="m_next_day",
+            turn_id="4",
+            timestamp="2026-01-02T09:00:00",
+            author="user",
+            modality="text",
+            source_type="conversation",
+            summary="A next-day note.",
+        ),
+    ]
+    store = HiddenMemoryStore(records)
+
+    eq_result = ToolExecutor().run(
+        [{"tool": "FILTER", "field": "timestamp", "op": "eq", "value": "2026-01-01"}],
+        query="Which memories are from 2026-01-01?",
+        memory_store=store,
+    )
+    assert set(eq_result.final_memory_ids) == {
+        "m_text_old",
+        "m_cat_text",
+        "m_cat_image",
+        "m_assistant_image",
+    }
+
+    contains_result = ToolExecutor().run(
+        [{"tool": "FILTER", "field": "timestamp", "op": "contains", "value": "2026/1/1"}],
+        query="Which memories are from 2026-01-01?",
+        memory_store=store,
+    )
+    assert set(contains_result.final_memory_ids) == set(eq_result.final_memory_ids)
+
+    before_result = ToolExecutor().run(
+        [{"tool": "FILTER", "field": "timestamp", "op": "before", "value": "2026-01-02"}],
+        query="Which memories are before 2026-01-02?",
+        memory_store=store,
+    )
+    assert set(before_result.final_memory_ids) == set(eq_result.final_memory_ids)
+
+    after_result = ToolExecutor().run(
+        [{"tool": "FILTER", "field": "timestamp", "op": "after", "value": "2026-01-01"}],
+        query="Which memories are after 2026-01-01?",
+        memory_store=store,
+    )
+    assert after_result.final_memory_ids == ["m_next_day"]
+
+
 def test_turn_aware_retrieval_returns_text_and_image_from_same_turn() -> None:
     store = HiddenMemoryStore(_records())
     result = ToolExecutor(retriever=TurnAwareHybridRetriever()).run(
@@ -131,6 +313,43 @@ def test_turn_aware_retrieval_returns_text_and_image_from_same_turn() -> None:
     modalities = {item.fields["modality"] for item in result.evidence}
     assert modalities == {"text", "image"}
     assert {item.memory_id for item in result.evidence} == {"m_cat_text", "m_cat_image"}
+    assert {item.source for item in result.evidence} == {"RETRIEVE"}
+    assert result.steps[0].evidence_added == 2
+
+
+def test_inspect_raw_only_reads_retrieved_candidate_pool() -> None:
+    store = HiddenMemoryStore(_records())
+    inspector = FakeRawInspector()
+
+    filtered_result = ToolExecutor(raw_inspector=inspector).run(
+        [
+            {"tool": "FILTER", "field": "modality", "op": "eq", "value": "image"},
+            {"tool": "INSPECT_RAW"},
+        ],
+        query="What is in the cat image?",
+        memory_store=store,
+    )
+
+    assert inspector.calls == []
+    assert filtered_result.steps[1].evidence_added == 0
+    assert all("visual_observation" not in item.fields for item in filtered_result.evidence)
+
+    retrieved_inspector = FakeRawInspector()
+    retrieved_result = ToolExecutor(
+        retriever=TurnAwareHybridRetriever(),
+        raw_inspector=retrieved_inspector,
+    ).run(
+        [
+            {"tool": "RETRIEVE", "method": "bm25", "top_k": 1},
+            {"tool": "INSPECT_RAW"},
+        ],
+        query="tabby cat sofa",
+        memory_store=store,
+    )
+
+    assert retrieved_inspector.calls == ["images/cat.png"]
+    assert retrieved_result.steps[1].evidence_added == 1
+    assert any(item.source == "INSPECT_RAW" and "visual_observation" in item.fields for item in retrieved_result.evidence)
 
 
 @dataclass
@@ -159,10 +378,76 @@ async def test_verl_native_opd_tools_share_hidden_state_and_hide_ids() -> None:
     observation = json.loads(response.text)
     assert observation["pool_count"] == 1
     assert observation["pool_preview"][0]["raw_pointer"] == "images/cat.png"
-    assert metrics["opd_mm_evidence_count"] == 0
+    assert metrics["opd_mm_evidence_count"] == 2
     assert "memory_id" not in json.dumps(observation)
     assert agent_data.extra_fields["opd_mm"]["pool_count"] == 1
+    assert agent_data.extra_fields["opd_mm"]["evidence_count"] == 2
     assert "memory_id" not in json.dumps(agent_data.extra_fields["opd_mm"])
+
+
+@pytest.mark.asyncio
+async def test_verl_native_filter_scope_can_restart_hidden_pool() -> None:
+    records = [record.to_dict() for record in _records()]
+    agent_data = FakeAgentData(
+        messages=[{"role": "user", "content": "Find user memories."}],
+        tools_kwargs={"opd_mm": {"query": "Find user memories.", "records": records}},
+    )
+    filter_tool = OPDFilterTool(config={"type": "native"}, tool_schema=None)
+
+    await filter_tool.execute("instance", {"field": "modality", "op": "eq", "value": "image"}, agent_data=agent_data)
+    await filter_tool.execute("instance", {"field": "author", "op": "eq", "value": "assistant"}, agent_data=agent_data)
+    response, _, _ = await filter_tool.execute(
+        "instance",
+        {"field": "author", "op": "eq", "value": "user", "scope": "full_memory"},
+        agent_data=agent_data,
+    )
+
+    observation = json.loads(response.text)
+    assert observation["pool_count"] == 4
+    assert {item["author"] for item in observation["pool_preview"]} == {"assistant", "user"}
+    assert observation["evidence_count"] == 4
+
+
+@pytest.mark.asyncio
+async def test_retrieve_tool_adds_public_evidence_before_inspect_raw() -> None:
+    records = [record.to_dict() for record in _records()]
+    agent_data = FakeAgentData(
+        messages=[{"role": "user", "content": "Find the tabby cat on the sofa."}],
+        tools_kwargs={"opd_mm": {"query": "Find the tabby cat on the sofa.", "records": records}},
+    )
+    retrieve_tool = OPDRetrieveTool(config={"type": "native"}, tool_schema=None)
+
+    response, _, metrics = await retrieve_tool.execute(
+        "instance",
+        {"method": "bm25", "top_k": 1},
+        agent_data=agent_data,
+    )
+
+    observation = json.loads(response.text)
+    assert observation["evidence_count"] == 2
+    assert metrics["opd_mm_evidence_count"] == 2
+    assert {item["source"] for item in observation["new_evidence"]} == {"RETRIEVE"}
+    assert {item["modality"] for item in observation["new_evidence"]} == {"text", "image"}
+    assert all("visual_observation" not in item for item in observation["new_evidence"])
+    assert "memory_id" not in json.dumps(observation)
+
+
+@pytest.mark.asyncio
+async def test_opd_stop_tool_requests_agent_loop_termination() -> None:
+    records = [record.to_dict() for record in _records()]
+    agent_data = FakeAgentData(
+        messages=[{"role": "user", "content": "Find the tabby cat on the sofa."}],
+        tools_kwargs={"opd_mm": {"query": "Find the tabby cat on the sofa.", "records": records}},
+    )
+    stop_tool = OPDStopTool(config={"type": "native"}, tool_schema=None)
+
+    response, _, metrics = await stop_tool.execute("instance", {}, agent_data=agent_data)
+
+    observation = json.loads(response.text)
+    assert observation["stopped"] is True
+    assert agent_data.extra_fields["opd_mm"]["stopped"] is True
+    assert metrics["opd_mm_terminate"] is True
+    assert metrics["agent_loop_terminate"] is True
 
 
 def test_tool_config_loads_verl_native_opd_tools() -> None:
@@ -222,6 +507,7 @@ def test_opd_sample_converts_to_on_policy_distillation_row() -> None:
     ]
     for tool_name in ("RETRIEVE", "FILTER", "SORT", "TOPK", "INSPECT_RAW", "STOP"):
         assert tool_name in row["prompt"][0]["content"]
+    assert "scope=full_memory" in row["prompt"][0]["content"]
     assert "READ" not in row["prompt"][0]["content"]
     assert row["extra_info"]["need_tools_kwargs"] is True
     assert row["extra_info"]["teacher_privilege_mode"] == "opd_mm"
@@ -283,6 +569,56 @@ def test_teacher_privileged_logprobs_align_to_student_response_slice() -> None:
 
     assert aligned_ids.squeeze(-1).tolist() == [-1, -1, 3, 4, 5, -1]
     assert aligned_logprobs.squeeze(-1).tolist() == [0.0, 0.0, 83.0, 84.0, 85.0, 0.0]
+
+
+def _minimal_distillation_batch() -> TensorDict:
+    data = TensorDict(
+        {
+            "prompts": torch.tensor([[1, 2]], dtype=torch.long),
+            "responses": torch.tensor([[3, 0]], dtype=torch.long),
+            "response_mask": torch.tensor([[1, 0]], dtype=torch.long),
+            "input_ids": torch.tensor([[1, 2, 3, 0]], dtype=torch.long),
+            "attention_mask": torch.tensor([[1, 1, 1, 0]], dtype=torch.long),
+            "position_ids": torch.tensor([[0, 1, 2, 0]], dtype=torch.long),
+        },
+        batch_size=1,
+    )
+    tu.assign_non_tensor(data, dp_size=1, batch_num_tokens=1, global_batch_size=1)
+    return data
+
+
+def test_opd_mm_xml_sft_loss_uses_marker_when_mask_is_missing() -> None:
+    data = _minimal_distillation_batch()
+    tu.assign_non_tensor(data, opd_mm_sft_batch=True)
+    config = ActorConfig(strategy="fsdp", rollout_n=1, ppo_micro_batch_size_per_gpu=1)
+    model_output = {"log_probs": torch.tensor([0.0, -0.5, -0.25])}
+
+    loss, metrics = distillation_ppo_loss(
+        config,
+        DistillationConfig(),
+        model_output=model_output,
+        data=data,
+    )
+
+    assert loss.item() == pytest.approx(0.5)
+    assert metrics["distillation/opd_mm_sft_tokens"].values == [1.0]
+
+
+def test_opd_mm_batch_without_teacher_logprobs_returns_zero_loss() -> None:
+    data = _minimal_distillation_batch()
+    tu.assign_non_tensor(data, data_source="opd_mm")
+    config = ActorConfig(strategy="fsdp", rollout_n=1, ppo_micro_batch_size_per_gpu=1)
+    model_output = {"log_probs": torch.tensor([0.0, -0.5, -0.25])}
+
+    loss, metrics = distillation_ppo_loss(
+        config,
+        DistillationConfig(),
+        model_output=model_output,
+        data=data,
+    )
+
+    assert loss.item() == pytest.approx(0.0)
+    assert metrics["distillation/opd_mm_no_supervision_batches"].values == [1.0]
 
 
 class FakeStudent:
@@ -413,6 +749,178 @@ def test_online_self_distill_collects_step_corrections_from_rollout_extra_fields
     assert "teacher_feedback" not in corrections[1]["example"]["metadata"]["opd"]
 
 
+def test_teacher_xml_correction_extracts_only_canonical_tool_call() -> None:
+    parsed = extract_canonical_tool_call_xml(
+        "Reasoning first.\n"
+        "<tool_call>\n"
+        "<function=retrieve>\n"
+        "<parameter=method>\nhybrid\n</parameter>\n"
+        "<parameter=top_k>\n5\n</parameter>\n"
+        "</function>\n"
+        "</tool_call>\nDone."
+    )
+
+    assert parsed is not None
+    target_xml, action, raw_xml = parsed
+    assert action.tool == "RETRIEVE"
+    assert action.arguments == {"method": "hybrid", "top_k": 5}
+    assert raw_xml.startswith("<tool_call>")
+    assert target_xml == (
+        "<tool_call>\n"
+        "<function=retrieve>\n"
+        "<parameter=method>\n"
+        "hybrid\n"
+        "</parameter>\n"
+        "<parameter=top_k>\n"
+        "5\n"
+        "</parameter>\n"
+        "</function>\n"
+        "</tool_call>"
+    )
+
+
+def test_teacher_xml_correction_accepts_rewritten_retrieve_query() -> None:
+    parsed = extract_canonical_tool_call_xml(
+        "<tool_call>\n"
+        "<function=retrieve>\n"
+        "<parameter=method>\nhybrid\n</parameter>\n"
+        "<parameter=top_k>\n10\n</parameter>\n"
+        "<parameter=query>\npark walk dog YYYY-MM-DD\n</parameter>\n"
+        "</function>\n"
+        "</tool_call>"
+    )
+
+    assert parsed is not None
+    target_xml, action, _ = parsed
+    assert action.tool == "RETRIEVE"
+    assert action.arguments == {"method": "hybrid", "top_k": 10, "query": "park walk dog YYYY-MM-DD"}
+    assert "<parameter=query>\npark walk dog YYYY-MM-DD\n</parameter>" in target_xml
+
+
+def test_teacher_xml_correction_recovers_unclosed_rewritten_retrieve_query() -> None:
+    parsed = extract_canonical_tool_call_xml(
+        "<tool_call>\n"
+        "<function=retrieve>\n"
+        "<parameter=method>\nhybrid</parameter>\n"
+        "<parameter=top_k>\n5</parameter>\n"
+        "<parameter=query>\nMaria travel Paris date YYYY-MM-DD</parameter>\n"
+        "</parameter>\n"
+    )
+
+    assert parsed is not None
+    target_xml, action, _ = parsed
+    assert action.arguments == {"method": "hybrid", "top_k": 5, "query": "Maria travel Paris date YYYY-MM-DD"}
+    assert target_xml.endswith("</tool_call>")
+
+
+def test_online_xml_correction_requests_include_invalid_student_state() -> None:
+    requests = build_online_step_correction_requests(
+        sample_kwargs={
+            "raw_prompt": [{"role": "user", "content": "Find the tabby cat sofa memory."}],
+            "tools_kwargs": {
+                "opd_mm": {
+                    "query": "Find the tabby cat sofa memory.",
+                    "records": [record.to_dict(include_internal_id=True) for record in _records()],
+                }
+            },
+            "extra_info": {
+                "gold_answer": "on the sofa",
+                "opd_mm_online_self_distill": True,
+                "sample_id": "online-xml-sample",
+            },
+        },
+        output_extra_fields={
+            "opd_mm_generation_snapshots": [
+                {
+                    "prompt_ids": [11, 22, 33],
+                    "response_text": "I should search the memories, but I forgot the XML.",
+                    "parsed_tool_calls": [],
+                }
+            ]
+        },
+    )
+
+    assert len(requests) == 1
+    assert requests[0]["student_prompt_ids"] == [11, 22, 33]
+    assert requests[0]["student_next_action"] is None
+    assert "Teacher role:" in requests[0]["teacher_prompt"]
+    assert "Correct exactly one next tool action" in requests[0]["teacher_prompt"]
+    assert "Gold answer role:" in requests[0]["teacher_prompt"]
+    assert "teacher-only supervision/rubric" in requests[0]["teacher_prompt"]
+    assert "not a lexical source for RETRIEVE.query" in requests[0]["teacher_prompt"]
+    assert "as if the Gold answer section were hidden" in requests[0]["teacher_prompt"]
+    assert "Gold answer" in requests[0]["teacher_prompt"]
+    assert "not student-visible evidence" in requests[0]["teacher_prompt"]
+    assert "not an instruction to copy" in requests[0]["teacher_prompt"]
+    assert "Do not output stop solely because the gold answer is known" in requests[0]["teacher_prompt"]
+    assert "history/trace is empty and evidence_count is 0, do not output stop" in requests[0]["teacher_prompt"]
+    assert 'gold answer is "Not mentioned" or similar' in requests[0]["teacher_prompt"]
+    assert 'If the JSON observation above has "evidence_count": 0 and "trace": [], stop is invalid' in requests[
+        0
+    ]["teacher_prompt"]
+    assert "not to reveal answer-only entities in the query" in requests[0]["teacher_prompt"]
+    assert "Do not include gold-only answer entities" in requests[0]["teacher_prompt"]
+    assert "never enumerate the gold answer list items" in requests[0]["teacher_prompt"]
+    assert "search for the requested category generically" in requests[0]["teacher_prompt"]
+    assert "ignore the Gold answer section except as a private grading rubric" in requests[0]["teacher_prompt"]
+    assert "scope=full_memory" in requests[0]["teacher_prompt"]
+    assert "optionally query as rewritten search text" in requests[0]["teacher_prompt"]
+
+    correction = finalize_online_step_correction(
+        requests[0],
+        teacher_raw_response='<tool_call>{"name":"retrieve","arguments":{"method":"bm25","top_k":1}}</tool_call>',
+    )
+    assert correction is not None
+    assert correction["teacher_actions"][0]["tool"] == "RETRIEVE"
+    assert correction["sft_prompt_ids"] == [11, 22, 33]
+    assert correction["sft_target_xml"] == (
+        "<tool_call>\n"
+        "<function=retrieve>\n"
+        "<parameter=method>\n"
+        "bm25\n"
+        "</parameter>\n"
+        "<parameter=top_k>\n"
+        "1\n"
+        "</parameter>\n"
+        "</function>\n"
+        "</tool_call>"
+    )
+
+
+def test_online_teacher_correction_dump_writes_jsonl(tmp_path, monkeypatch) -> None:
+    request = {
+        "sample_id": "sample-dump",
+        "step_index": 0,
+        "query": "Find the cat memory.",
+        "gold_answer": "cat",
+        "teacher_prompt": "teacher prompt",
+        "student_raw_response": "student raw",
+        "student_prompt_ids": [1, 2, 3],
+        "allow_inspect_raw": True,
+        "tool_format": "qwen3_coder",
+    }
+    teacher_raw = (
+        "<tool_call>\n"
+        "<function=retrieve>\n"
+        "<parameter=method>\nbm25\n</parameter>\n"
+        "<parameter=top_k>\n1\n</parameter>\n"
+        "</function>\n"
+        "</tool_call>"
+    )
+    correction = finalize_online_step_correction(request, teacher_raw_response=teacher_raw)
+    monkeypatch.setenv("OPD_MM_TEACHER_CORRECTION_DUMP_DIR", str(tmp_path))
+
+    dump_online_step_correction(request, teacher_raw_response=teacher_raw, correction=correction)
+
+    files = list(tmp_path.glob("teacher_corrections_pid*.jsonl"))
+    assert len(files) == 1
+    record = json.loads(files[0].read_text(encoding="utf-8"))
+    assert record["sample_id"] == "sample-dump"
+    assert record["parsed"] is True
+    assert record["teacher_actions"][0]["tool"] == "RETRIEVE"
+    assert "<function=retrieve>" in record["sft_target_xml"]
+
+
 def test_original_on_policy_distiller_runs_verify_and_teacher_correction() -> None:
     sample = OPDSample(
         sample_id="sample-2",
@@ -459,10 +967,13 @@ def test_reward_manager_places_score_on_last_response_token() -> None:
 def test_helpers_build_hidden_store_from_dicts_and_schemas() -> None:
     store = hidden_store_from_records([{"memory_id": "m1", "turn_id": "1", "timestamp": "", "author": "user"}])
     assert len(store) == 1
-    assert [schema["function"]["name"] for schema in openai_tool_schemas(include_inspect_raw=False)] == [
+    schemas = openai_tool_schemas(include_inspect_raw=False)
+    assert [schema["function"]["name"] for schema in schemas] == [
         "filter",
         "sort",
         "topk",
         "retrieve",
         "stop",
     ]
+    filter_scope = schemas[0]["function"]["parameters"]["properties"]["scope"]
+    assert filter_scope["enum"] == ["current_pool", "full_memory"]

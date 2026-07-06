@@ -139,3 +139,32 @@ class AsyncTeacherLLMServerManager:
         teacher_logprobs = torch.tensor(teacher_output.extra_fields["prompt_logprobs"])
         assert teacher_ids.shape[0] == teacher_logprobs.shape[0] == len(sequence_ids)
         return teacher_ids, teacher_logprobs
+
+    async def generate_teacher_response_single(
+        self,
+        prompt_ids: list[int],
+        sampling_params: Optional[dict[str, Any]] = None,
+        multi_modal_data: Optional[dict[str, Any]] = None,
+        mm_processor_kwargs: Optional[dict[str, Any]] = None,
+        routing_key: Optional[str] = None,
+    ) -> list[int]:
+        """Generate one teacher response for online correction.
+
+        The regular distillation path only asks the teacher for prompt
+        log-probabilities and therefore uses ``max_tokens=1``. OPD-MM
+        step-level correction needs the frozen teacher to emit an executable
+        tool-call XML target, so it uses an explicit generation request.
+        """
+        multi_modal_data = multi_modal_data or {}
+        teacher_key = self._resolve_teacher_key(routing_key)
+        client = self.teacher_client[teacher_key]
+        output = await client.generate(
+            request_id=uuid4().hex,
+            prompt_ids=prompt_ids,
+            sampling_params=dict(sampling_params or {}),
+            image_data=multi_modal_data.get("images"),
+            video_data=multi_modal_data.get("videos"),
+            audio_data=multi_modal_data.get("audios"),
+            mm_processor_kwargs=mm_processor_kwargs,
+        )
+        return list(output.token_ids)

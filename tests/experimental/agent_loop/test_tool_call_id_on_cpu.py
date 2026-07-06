@@ -152,6 +152,7 @@ class TestToolCallIdOnCpu(unittest.IsolatedAsyncioTestCase):
             tool_rewards=[],
             prompt_ids=[1, 2, 3],
             response_mask=[],
+            distillation_mask=[],
             response_logprobs=[],
             image_data=None,
             user_turns=0,
@@ -169,6 +170,59 @@ class TestToolCallIdOnCpu(unittest.IsolatedAsyncioTestCase):
         assert agent_data.prompt_ids == [1, 2, 3, 41, 42]
         assert agent_data.response_mask == [0, 0]
         assert agent_data.tool_rewards == [1.0]
+
+    async def test_processing_tools_state_terminates_when_tool_requests_it(self) -> None:
+        async def call_tool(
+            tool_call: FunctionCall, tools_kwargs: dict[str, Any], agent_data: SimpleNamespace
+        ) -> tuple[ToolResponse, float, dict[str, Any]]:
+            del tool_call, tools_kwargs, agent_data
+            return ToolResponse(text='{"stopped": true}'), 0.0, {"agent_loop_terminate": True}
+
+        async def apply_chat_template(*args: Any, **kwargs: Any) -> list[int]:
+            raise AssertionError("terminating tool response should not trigger another prompt merge")
+
+        loop = SimpleNamespace(
+            max_parallel_calls=1,
+            processor=None,
+            enable_continuous_token=False,
+            tool_parser_name="qwen3_coder",
+            response_length=128,
+            apply_chat_template=apply_chat_template,
+            _call_tool=call_tool,
+        )
+        agent_data = SimpleNamespace(
+            messages=[
+                {"role": "user", "content": "done?"},
+                {
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [
+                        {
+                            "type": "function",
+                            "function": {"name": "stop", "arguments": {}},
+                        }
+                    ],
+                },
+            ],
+            tool_calls=[FunctionCall(name="stop", arguments="{}", tool_call_id=None)],
+            tools_kwargs={},
+            metrics={},
+            tool_rewards=[],
+            prompt_ids=[1, 2, 3],
+            response_mask=[],
+            distillation_mask=[],
+            response_logprobs=[],
+            image_data=None,
+            user_turns=0,
+        )
+
+        state = await ToolAgentLoop._handle_processing_tools_state(loop, agent_data)
+
+        assert state == AgentState.TERMINATED
+        assert agent_data.messages[-1] == {"role": "tool", "content": '{"stopped": true}'}
+        assert agent_data.prompt_ids == [1, 2, 3]
+        assert agent_data.response_mask == []
+        assert agent_data.user_turns == 0
 
 
 if __name__ == "__main__":

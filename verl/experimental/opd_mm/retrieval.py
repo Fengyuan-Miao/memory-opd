@@ -421,7 +421,7 @@ class HybridRetriever:
                     question_image,
                 )
         ranked = [
-            PoolItem(item.memory, float(scores.get(item.memory.memory_id, 0.0)))
+            PoolItem(item.memory, float(scores.get(item.memory.memory_id, 0.0)), retrieved=True)
             for item in pool
         ]
         ranked.sort(
@@ -667,7 +667,7 @@ class TurnAwareHybridRetriever(HybridRetriever):
         for turn_id in ranked_turns:
             turn_score = float(scores.get(turn_id, 0.0))
             ranked.extend(
-                PoolItem(item.memory, turn_score)
+                PoolItem(item.memory, turn_score, retrieved=True)
                 for item in sorted(
                     groups[turn_id],
                     key=lambda value: (

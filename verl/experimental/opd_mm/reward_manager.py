@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 
+import re
 from typing import Any
 
 import torch
@@ -42,6 +43,66 @@ def opd_mm_score(row: dict[str, Any]) -> tuple[float, dict[str, Any]]:
         evidence_count = len(evidence) if isinstance(evidence, list) else 0
     value = 1.0 if int(evidence_count or 0) > 0 else 0.0
     return value, {"opd_mm/evidence_present": value}
+
+
+def _as_dict(value: Any) -> dict[str, Any]:
+    if isinstance(value, dict):
+        return value
+    if hasattr(value, "item"):
+        try:
+            item = value.item()
+        except Exception:
+            item = None
+        if isinstance(item, dict):
+            return item
+    return {}
+
+
+def _normalize_answer(value: Any) -> str:
+    text = str(value or "").lower()
+    return re.sub(r"\s+", " ", re.sub(r"[^\w\s]", " ", text)).strip()
+
+
+def compute_score(
+    data_source: str,
+    solution_str: str,
+    ground_truth: Any,
+    extra_info: dict[str, Any] | None = None,
+    **kwargs: Any,
+) -> dict[str, float]:
+    """OPD-MM reward function for verl's native reward loop.
+
+    The main training signal in the OPD-MM path is teacher-logprob
+    distillation. This reward is intentionally lightweight: use explicit
+    rollout metadata when available, otherwise reward trajectories that collect
+    evidence and expose simple diagnostics for answer matching.
+    """
+    del kwargs
+    if data_source != "opd_mm":
+        raise NotImplementedError(f"Reward function is not implemented for {data_source=}")
+
+    info = _as_dict(extra_info)
+    opd_state = _as_dict(info.get("opd_mm"))
+
+    row: dict[str, Any] = dict(info)
+    if "evidence_count" not in row:
+        row["evidence_count"] = opd_state.get("evidence_count")
+    if "evidence" not in row:
+        row["evidence"] = opd_state.get("evidence")
+
+    score, score_info = opd_mm_score(row)
+
+    gold_answer = info.get("gold_answer", ground_truth)
+    normalized_gold = _normalize_answer(gold_answer)
+    normalized_solution = _normalize_answer(solution_str)
+    answer_match = float(bool(normalized_gold) and normalized_gold in normalized_solution)
+
+    return {
+        "score": float(score),
+        **score_info,
+        "opd_mm/answer_match": answer_match,
+        "opd_mm/num_turns": float(info.get("num_turns") or 0),
+    }
 
 
 class OPDMMRewardManager(AbstractRewardManager):

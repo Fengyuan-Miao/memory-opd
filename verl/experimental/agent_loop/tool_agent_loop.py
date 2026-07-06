@@ -15,6 +15,8 @@ import asyncio
 import json
 import logging
 import os
+import re
+import time
 from enum import Enum
 from typing import Any, Optional
 from uuid import uuid4
@@ -44,6 +46,131 @@ SPEC_DECODE_EXTRA_KEYS = (
     "spec_num_accepted_tokens",
     "spec_num_verify_steps",
 )
+
+TOOL_CALL_XML_RE = re.compile(r"<tool_call>.*?</tool_call>", re.DOTALL)
+
+
+def _last_user_text(messages: list[dict[str, Any]]) -> str:
+    for message in reversed(messages):
+        if not isinstance(message, dict) or message.get("role") != "user":
+            continue
+        content = message.get("content", "")
+        if isinstance(content, str):
+            return content
+        if isinstance(content, list):
+            parts = []
+            for item in content:
+                if isinstance(item, dict) and item.get("type") == "text":
+                    parts.append(str(item.get("text", "")))
+            return "\n".join(parts)
+    return ""
+
+
+def _dump_student_raw_output(
+    *,
+    agent_data: "AgentData",
+    tokenizer: Any,
+    response_ids: list[int],
+    distillation_mask: list[int],
+    assistant_content: str,
+) -> None:
+    """Optionally save student raw rollout text for OPD-MM debugging.
+
+    This is intentionally side-effect-only and guarded by an environment
+    variable so normal training behavior is unchanged.
+    """
+    dump_dir = os.getenv("OPD_MM_STUDENT_ROLLOUT_DUMP_DIR")
+    if not dump_dir:
+        return
+
+    try:
+        text = tokenizer.decode(response_ids, skip_special_tokens=False)
+        max_chars = int(os.getenv("OPD_MM_STUDENT_ROLLOUT_DUMP_MAX_CHARS", "0") or "0")
+        dumped_text = text if max_chars <= 0 else text[:max_chars]
+        if max_chars > 0 and len(text) > max_chars:
+            dumped_text += f"...[truncated {len(text) - max_chars} chars]"
+
+        tool_spans = [match.span() for match in TOOL_CALL_XML_RE.finditer(text)]
+        last_open = text.rfind("<tool_call>")
+        last_close = text.rfind("</tool_call>")
+        parsed_calls = [
+            {
+                "name": tool_call.name,
+                "arguments": tool_call.arguments,
+                "tool_call_id": tool_call.tool_call_id,
+            }
+            for tool_call in agent_data.tool_calls
+        ]
+        record = {
+            "time": time.time(),
+            "pid": os.getpid(),
+            "request_id": agent_data.request_id,
+            "assistant_turn": agent_data.assistant_turns,
+            "token_len": len(response_ids),
+            "text_len": len(text),
+            "distillation_mask_tokens": int(sum(distillation_mask)) if distillation_mask else 0,
+            "has_complete_tool_call_xml": bool(tool_spans),
+            "has_unclosed_tool_call_xml": bool(last_open >= 0 and last_open > last_close),
+            "tool_call_xml_spans": tool_spans,
+            "parsed_tool_calls": parsed_calls,
+            "assistant_content": assistant_content,
+            "query": (agent_data.tools_kwargs.get("opd_mm", {}) or {}).get("query") or _last_user_text(agent_data.messages),
+            "text": dumped_text,
+        }
+        os.makedirs(dump_dir, exist_ok=True)
+        path = os.path.join(dump_dir, f"student_rollout_pid{os.getpid()}.jsonl")
+        with open(path, "a", encoding="utf-8") as file:
+            file.write(json.dumps(record, ensure_ascii=False) + "\n")
+    except Exception as exc:
+        logger.warning(f"Failed to dump student raw rollout output: {exc}")
+
+
+def build_tool_call_xml_span_mask(tokenizer: Any, response_ids: list[int]) -> list[int]:
+    """Return a token mask that keeps only ``<tool_call>...</tool_call>`` XML spans.
+
+    Tool-capable models may emit natural-language reasoning before a function
+    call or malformed suffix text after it. OPD-MM distillation should not
+    reinforce that prose: only the executable XML tool-call span is action
+    supervision.
+    """
+    if not response_ids:
+        return []
+
+    text = tokenizer.decode(response_ids, skip_special_tokens=False)
+    spans = [match.span() for match in TOOL_CALL_XML_RE.finditer(text)]
+
+    # If generation is truncated inside an XML tool call, keep the partial
+    # action body but still mask any preamble before the opening tag.
+    last_open = text.rfind("<tool_call>")
+    last_close = text.rfind("</tool_call>")
+    if last_open >= 0 and last_open > last_close:
+        spans.append((last_open, len(text)))
+
+    if not spans:
+        return [0] * len(response_ids)
+
+    try:
+        encoded = tokenizer(text, add_special_tokens=False, return_offsets_mapping=True)
+        offsets = encoded.get("offset_mapping")
+    except Exception:
+        offsets = None
+
+    mask = [0] * len(response_ids)
+    if offsets is not None:
+        limit = min(len(response_ids), len(offsets))
+        for index in range(limit):
+            start, end = offsets[index]
+            if any(start < span_end and end > span_start for span_start, span_end in spans):
+                mask[index] = 1
+        return mask
+
+    # Fallback for tokenizers without offset mappings.
+    for span_start, span_end in spans:
+        start = len(tokenizer.encode(text[:span_start], add_special_tokens=False))
+        end = start + len(tokenizer.encode(text[span_start:span_end], add_special_tokens=False))
+        for index in range(max(0, start), min(len(mask), end)):
+            mask[index] = 1
+    return mask
 
 
 class AgentState(Enum):
@@ -81,6 +208,7 @@ class AgentData:
         self.prompt_ids: list[int] = []
         self.response_ids: list[int] = []
         self.response_mask: list[int] = []
+        self.distillation_mask: list[int] = []
         self.response_logprobs: list[float] = []
         self.turn_scores: list[float] = []
         self.tool_rewards: list[float] = []
@@ -89,6 +217,7 @@ class AgentData:
 
         # Temporary state for tool calls
         self.tool_calls: list[FunctionCall] = []
+        self.generation_snapshots: list[dict[str, Any]] = []
 
         self.routed_experts = None
 
@@ -188,6 +317,9 @@ class ToolAgentLoop(AgentLoopBase):
             prompt_ids=prompt_ids,
             response_ids=response_ids[: self.response_length],
             response_mask=agent_data.response_mask[: self.response_length],
+            distillation_mask=agent_data.distillation_mask[: self.response_length]
+            if agent_data.distillation_mask
+            else None,
             multi_modal_data=multi_modal_data,
             mm_processor_kwargs=agent_data.mm_processor_kwargs,
             response_logprobs=agent_data.response_logprobs[: self.response_length]
@@ -231,6 +363,7 @@ class ToolAgentLoop(AgentLoopBase):
             stop_token_ids = list(set((sampling_params.get("stop_token_ids") or []) + self.tool_parser.stop_token_ids))
             sampling_params = {**sampling_params, "stop_token_ids": stop_token_ids}
 
+        state_prompt_ids = list(agent_data.prompt_ids)
         with simple_timer("generate_sequences", agent_data.metrics):
             output: TokenOutput = await self.server_manager.generate(
                 request_id=agent_data.request_id,
@@ -276,8 +409,12 @@ class ToolAgentLoop(AgentLoopBase):
         else:
             agent_data.prompt_ids += agent_data.response_ids
             agent_data.response_mask += [1] * len(agent_data.response_ids)
+            current_distillation_mask = build_tool_call_xml_span_mask(self.tokenizer, agent_data.response_ids)
+            agent_data.distillation_mask += current_distillation_mask
             if output.log_probs:
                 agent_data.response_logprobs += output.log_probs
+        if self.enable_continuous_token:
+            current_distillation_mask = []
 
         if output.routed_experts is not None:
             agent_data.routed_experts = output.routed_experts
@@ -296,6 +433,20 @@ class ToolAgentLoop(AgentLoopBase):
         assistant_content, agent_data.tool_calls = await self.tool_parser.extract_tool_calls(
             agent_data.response_ids, tools
         )
+        self._append_generation_snapshot(
+            agent_data=agent_data,
+            state_prompt_ids=state_prompt_ids,
+            response_ids=agent_data.response_ids,
+            distillation_mask=current_distillation_mask,
+            assistant_content=assistant_content,
+        )
+        _dump_student_raw_output(
+            agent_data=agent_data,
+            tokenizer=self.tokenizer,
+            response_ids=agent_data.response_ids,
+            distillation_mask=current_distillation_mask,
+            assistant_content=assistant_content,
+        )
         if self.enable_continuous_token:
             agent_data.messages.append(self._build_assistant_message(assistant_content, agent_data))
 
@@ -303,6 +454,49 @@ class ToolAgentLoop(AgentLoopBase):
             return AgentState.PROCESSING_TOOLS
         else:
             return AgentState.TERMINATED
+
+    def _append_generation_snapshot(
+        self,
+        *,
+        agent_data: AgentData,
+        state_prompt_ids: list[int],
+        response_ids: list[int],
+        distillation_mask: list[int],
+        assistant_content: str,
+    ) -> None:
+        """Save the student-visible decision state for online OPD-MM correction.
+
+        The final rollout tensor must keep one row per original prompt, so
+        state-level correction examples are carried through ``extra_fields`` and
+        expanded later in the trainer's actor-update path.
+        """
+
+        parsed_tool_calls = []
+        for tool_call in agent_data.tool_calls[: self.max_parallel_calls]:
+            try:
+                arguments = json.loads(tool_call.arguments)
+            except (TypeError, json.JSONDecodeError):
+                arguments = tool_call.arguments
+            parsed_tool_calls.append(
+                {
+                    "name": tool_call.name,
+                    "arguments": arguments,
+                    "tool_call_id": tool_call.tool_call_id,
+                }
+            )
+
+        response_text = self.tokenizer.decode(response_ids, skip_special_tokens=False)
+        snapshot = {
+            "assistant_turn": agent_data.assistant_turns,
+            "prompt_ids": state_prompt_ids,
+            "response_ids": response_ids,
+            "response_text": response_text,
+            "assistant_content": assistant_content,
+            "distillation_mask_tokens": int(sum(distillation_mask)) if distillation_mask else 0,
+            "parsed_tool_calls": parsed_tool_calls,
+        }
+        agent_data.generation_snapshots.append(snapshot)
+        agent_data.extra_fields["opd_mm_generation_snapshots"] = agent_data.generation_snapshots
 
     async def _handle_processing_tools_state(self, agent_data: AgentData) -> AgentState:
         """Handle the processing tools state: execute tool calls and prepare tool responses."""
@@ -321,8 +515,12 @@ class ToolAgentLoop(AgentLoopBase):
 
         # Process tool responses and update multi_modal_data
         # Removed: agent_data.new_images_this_turn = []
-        for tool_index, (tool_response, tool_reward, _) in enumerate(responses):
+        terminate_after_tools = False
+        for tool_index, (tool_response, tool_reward, tool_metrics) in enumerate(responses):
             tool_call = agent_data.tool_calls[tool_index]
+            if isinstance(tool_metrics, dict) and tool_metrics.get("agent_loop_terminate"):
+                terminate_after_tools = True
+
             # Create message from tool response
             if tool_response.image or tool_response.video:
                 # Multi-modal content with structured format
@@ -373,6 +571,8 @@ class ToolAgentLoop(AgentLoopBase):
                 agent_data.tool_rewards.append(tool_reward)
 
         agent_data.messages.extend(add_messages)
+        if terminate_after_tools:
+            return AgentState.TERMINATED
 
         if self.enable_continuous_token and not new_images_this_turn:
             schemas = getattr(agent_data, "_active_tool_schemas", self.tool_schemas)
@@ -438,6 +638,8 @@ class ToolAgentLoop(AgentLoopBase):
 
         agent_data.prompt_ids += response_ids
         agent_data.response_mask += [0] * len(response_ids)
+        if agent_data.distillation_mask:
+            agent_data.distillation_mask += [0] * len(response_ids)
         if agent_data.response_logprobs:
             agent_data.response_logprobs += [0.0] * len(response_ids)
         agent_data.user_turns += 1

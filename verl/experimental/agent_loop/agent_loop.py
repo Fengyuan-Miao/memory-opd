@@ -96,6 +96,8 @@ class AgentLoopOutput(BaseModel):
     """Response token ids including LLM generated token, tool response token."""
     response_mask: list[int]
     """Response mask, 1 for LLM generated token, 0 for tool response token."""
+    distillation_mask: Optional[list[int]] = None
+    """Optional response-side distillation mask; 1 for tokens that should receive distillation loss."""
     response_logprobs: Optional[list[float]] = None
     """Log probabilities for the response tokens."""
     routed_experts: Optional[Any] = None
@@ -120,6 +122,9 @@ class AgentLoopOutput(BaseModel):
         output["prompts"] = torch.tensor(output.pop("prompt_ids"), dtype=torch.int64)
         output["responses"] = torch.tensor(output.pop("response_ids"), dtype=torch.int64)
         output["response_mask"] = torch.tensor(output.pop("response_mask"), dtype=torch.int64)
+        distillation_mask = output.pop("distillation_mask", None)
+        if distillation_mask is not None:
+            output["distillation_mask"] = torch.tensor(distillation_mask, dtype=torch.int64)
 
         response_logprobs = output.pop("response_logprobs", None)
         if response_logprobs is not None:
@@ -162,6 +167,8 @@ class _InternalAgentLoopOutput(AgentLoopOutput):
     """Padded position ids."""
     response_mask: torch.Tensor
     """Padded response mask."""
+    distillation_mask: Optional[torch.Tensor] = None
+    """Optional padded distillation mask."""
     attention_mask: torch.Tensor
     """Padded attention mask."""
     response_logprobs: Optional[torch.Tensor] = None
@@ -764,6 +771,16 @@ class AgentLoopWorker:
             return_attention_mask=False,
         )
 
+        distillation_mask = None
+        if output.distillation_mask is not None:
+            distillation_mask_output = self._pad_token_ids(
+                output.distillation_mask,
+                max_length=self.rollout_config.response_length,
+                padding_side="right",
+                return_attention_mask=False,
+            )
+            distillation_mask = distillation_mask_output["input_ids"] * response_output["attention_mask"]
+
         response_logprobs = None
         if output.response_logprobs is not None:
             pad_size = self.rollout_config.response_length - len(output.response_logprobs)
@@ -813,13 +830,17 @@ class AgentLoopWorker:
         )
         await self._compute_score([output], kwargs=kwargs)
         await self._collect_opd_mm_online_step_corrections(output, validate=validate, sample_kwargs=kwargs)
-        await self._compute_teacher_logprobs(
-            output,
-            prompt_ids=output.prompt_ids,
-            response_ids=output.response_ids,
-            validate=validate,
-            sample_kwargs=kwargs,
-        )
+        if (
+            not AgentLoopWorker._is_opd_mm_online_self_distill(kwargs)
+            and "opd_mm_step_corrections" not in output.extra_fields
+        ):
+            await self._compute_teacher_logprobs(
+                output,
+                prompt_ids=output.prompt_ids,
+                response_ids=output.response_ids,
+                validate=validate,
+                sample_kwargs=kwargs,
+            )
         teacher_ids, teacher_logprobs = (
             output.extra_fields.pop("teacher_ids", None),
             output.extra_fields.pop("teacher_logprobs", None),
@@ -844,6 +865,7 @@ class AgentLoopWorker:
             input_ids=input_ids,
             position_ids=position_ids,
             response_mask=response_mask,
+            distillation_mask=distillation_mask,
             attention_mask=attention_mask,
             response_logprobs=response_logprobs,
             routed_experts=routed_experts,
@@ -1007,6 +1029,61 @@ class AgentLoopWorker:
         """Collect opt-in OPD-MM online step corrections for one rollout."""
         if validate or sample_kwargs is None:
             return
+        corrections = []
+        if self.distillation_enabled:
+            try:
+                from verl.experimental.opd_mm.online_self_distill import (
+                    build_online_step_correction_requests,
+                    dump_online_step_correction,
+                    finalize_online_step_correction,
+                )
+
+                requests = build_online_step_correction_requests(
+                    sample_kwargs=sample_kwargs,
+                    output_extra_fields=output.extra_fields,
+                    tool_format=self.rollout_config.multi_turn.format,
+                )
+                routing_key = None
+                routing_value = sample_kwargs.get(self.teacher_key)
+                if routing_value is not None:
+                    routing_key = routing_value.item() if hasattr(routing_value, "item") else routing_value
+                teacher_kwargs = {}
+                extra_info = sample_kwargs.get("extra_info") or {}
+                if isinstance(extra_info, dict):
+                    teacher_kwargs = extra_info.get("opd_mm_step_teacher_kwargs") or {}
+                sampling_params = {
+                    "max_tokens": int(teacher_kwargs.get("max_tokens", 128)),
+                    "temperature": float(teacher_kwargs.get("temperature", 0.0)),
+                    "top_p": float(teacher_kwargs.get("top_p", 1.0)),
+                    "top_k": int(teacher_kwargs.get("top_k", -1)),
+                }
+                for request in requests:
+                    teacher_prompt_ids = self._encode_opd_mm_teacher_prompt(request["teacher_prompt"])
+                    teacher_response_ids = await self.teacher_server_manager.generate_teacher_response_single(
+                        prompt_ids=teacher_prompt_ids,
+                        sampling_params=sampling_params,
+                        multi_modal_data=output.multi_modal_data,
+                        mm_processor_kwargs=output.mm_processor_kwargs,
+                        routing_key=routing_key,
+                    )
+                    teacher_raw_response = self.tokenizer.decode(teacher_response_ids, skip_special_tokens=False)
+                    correction = finalize_online_step_correction(
+                        request,
+                        teacher_raw_response=teacher_raw_response,
+                    )
+                    dump_online_step_correction(
+                        request,
+                        teacher_raw_response=teacher_raw_response,
+                        correction=correction,
+                    )
+                    if correction is not None:
+                        corrections.append(correction)
+            except Exception as e:
+                logger.warning("Failed to collect OPD-MM teacher XML step corrections: %s", e)
+        if corrections:
+            output.extra_fields["opd_mm_step_corrections"] = corrections
+            output.metrics.tool_calls += 0.0
+            return
         try:
             from verl.experimental.opd_mm.online_self_distill import maybe_collect_online_step_corrections
 
@@ -1019,6 +1096,29 @@ class AgentLoopWorker:
             return
         if corrections:
             output.extra_fields["opd_mm_step_corrections"] = corrections
+
+    def _encode_opd_mm_teacher_prompt(self, prompt: str) -> list[int]:
+        messages = [
+            {"role": "system", "content": "You are a precise OPD-MM teacher."},
+            {"role": "user", "content": prompt},
+        ]
+        try:
+            tokenized = self.tokenizer.apply_chat_template(
+                messages,
+                add_generation_prompt=True,
+                tokenize=True,
+                enable_thinking=False,
+            )
+            return normalize_token_ids(tokenized)
+        except TypeError:
+            tokenized = self.tokenizer.apply_chat_template(
+                messages,
+                add_generation_prompt=True,
+                tokenize=True,
+            )
+            return normalize_token_ids(tokenized)
+        except Exception:
+            return normalize_token_ids(self.tokenizer(prompt, add_special_tokens=False)["input_ids"])
 
     async def _compute_teacher_logprobs(
         self,
@@ -1076,6 +1176,38 @@ class AgentLoopWorker:
             output.extra_fields["teacher_ids"] = teacher_ids
             output.extra_fields["teacher_logprobs"] = teacher_logprobs
 
+    @staticmethod
+    def _default_extra_field_value(key: str) -> Any:
+        """Default value for optional rollout extra fields.
+
+        Each agent-loop worker independently builds a DataProto chunk. If a
+        field appears only in some chunks, DataProto.concat will concatenate the
+        present arrays and produce a shorter non-tensor column than the tensor
+        batch. Keep known optional fields present in every chunk so missing
+        per-sample values are represented explicitly.
+        """
+        if key in {"turn_scores", "tool_rewards"}:
+            return []
+        return None
+
+    @staticmethod
+    def _is_opd_mm_online_self_distill(sample_kwargs: Optional[dict[str, Any]]) -> bool:
+        """Return true for OPD-MM samples that should use XML correction SFT only."""
+        if not sample_kwargs:
+            return False
+        try:
+            from verl.experimental.opd_mm.teacher_privilege import to_plain
+
+            extra_info = to_plain(sample_kwargs.get("extra_info")) or {}
+        except Exception:
+            extra_info = sample_kwargs.get("extra_info") or {}
+            if hasattr(extra_info, "item"):
+                try:
+                    extra_info = extra_info.item()
+                except Exception:
+                    pass
+        return isinstance(extra_info, dict) and bool(extra_info.get("opd_mm_online_self_distill"))
+
     def _postprocess(
         self,
         inputs: list[_InternalAgentLoopOutput],
@@ -1095,9 +1227,19 @@ class AgentLoopWorker:
             optional_outputs["rollout_log_probs"] = torch.cat([input.response_logprobs for input in inputs], dim=0)
         if inputs[0].routed_experts is not None:
             optional_outputs["routed_experts"] = torch.cat([input.routed_experts for input in inputs], dim=0)
-        if inputs[0].teacher_logprobs is not None and inputs[0].teacher_ids is not None:
+        if all(input.teacher_logprobs is not None and input.teacher_ids is not None for input in inputs):
             optional_outputs["teacher_logprobs"] = torch.cat([input.teacher_logprobs for input in inputs], dim=0)
             optional_outputs["teacher_ids"] = torch.cat([input.teacher_ids for input in inputs], dim=0)
+        if any(input.distillation_mask is not None for input in inputs):
+            optional_outputs["distillation_mask"] = torch.cat(
+                [
+                    input.distillation_mask
+                    if input.distillation_mask is not None
+                    else torch.zeros_like(input.response_mask)
+                    for input in inputs
+                ],
+                dim=0,
+            )
         batch = TensorDict(
             {
                 "prompts": prompt_ids,  # [bsz, prompt_length]
@@ -1147,11 +1289,21 @@ class AgentLoopWorker:
             "min_global_steps",
             "max_global_steps",
             "extras",
+            # OPD-MM online/tool-agent fields are optional per sample. They must
+            # nevertheless stay schema-stable across worker chunks, otherwise a
+            # batch where only some samples call tools can fail at
+            # DataProto.concat with e.g. "key opd_mm length 30 is not equal to
+            # batch size 48".
+            "opd_mm",
+            "opd_mm_step_corrections",
         }
         all_keys = set(key for input_item in inputs for key in input_item.extra_fields) | default_extra_keys
         for key in all_keys:
             temp_arr = np.empty(len(inputs), dtype=object)
-            temp_arr[:] = [input.extra_fields.get(key) for input in inputs]
+            temp_arr[:] = [
+                input.extra_fields[key] if key in input.extra_fields else self._default_extra_field_value(key)
+                for input in inputs
+            ]
             extra_fields[key] = temp_arr
 
         non_tensor_batch.update(extra_fields)
@@ -1273,6 +1425,7 @@ class AgentLoopManager:
                 for worker, chunk in zip(self.agent_loop_workers, chunkes, strict=True)
             ]
         )
+        self._normalize_optional_tensor_keys(outputs)
         output = DataProto.concat(outputs)
 
         # calculate performance metrics
@@ -1281,6 +1434,37 @@ class AgentLoopManager:
 
         output.meta_info = {"timing": timing, **outputs[0].meta_info}
         return output
+
+    @staticmethod
+    def _normalize_optional_tensor_keys(outputs: list[DataProto]) -> None:
+        """Keep worker chunk TensorDict schemas compatible before DataProto.concat.
+
+        OPD-MM XML-SFT samples may intentionally skip teacher-logprob tensors,
+        while other chunks in the same rollout can still contain them through
+        generic distillation paths.  TensorDict concatenation is strict about
+        keys, so optional tensor fields must be present in every chunk or in
+        none.  When incomplete, drop the optional field group and let the
+        OPD-MM correction batch drive the actor loss from non-tensor fields.
+        """
+        optional_groups = (
+            ("teacher_ids", "teacher_logprobs"),
+            ("distillation_mask",),
+        )
+        for group in optional_groups:
+            if not outputs:
+                continue
+            has_group = [
+                output.batch is not None and all(key in output.batch.keys() for key in group)
+                for output in outputs
+            ]
+            if all(has_group) or not any(has_group):
+                continue
+            for output in outputs:
+                if output.batch is None:
+                    continue
+                for key in group:
+                    if key in output.batch.keys():
+                        del output.batch[key]
 
     def _performance_metrics(self, metrics: list[list[dict[str, str]]], output: DataProto) -> dict[str, float]:
         timing = {}

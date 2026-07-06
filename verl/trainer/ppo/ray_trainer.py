@@ -19,6 +19,7 @@ This trainer supports model-agonistic model initialization with huggingface
 """
 
 import json
+import math
 import os
 import uuid
 from collections import defaultdict
@@ -29,6 +30,7 @@ from typing import Any, Optional
 import numpy as np
 import torch
 from omegaconf import OmegaConf, open_dict
+from tensordict import TensorDict
 from torch.utils.data import Dataset, Sampler
 from torchdata.stateful_dataloader import StatefulDataLoader
 from tqdm import tqdm
@@ -1288,6 +1290,11 @@ class RayPPOTrainer:
         return old_log_prob, old_log_prob_mfu
 
     def _update_actor(self, batch: DataProto) -> DataProto:
+        opd_mm_sft_examples = 0
+        opd_mm_sft_batch = self._build_opd_mm_correction_sft_batch(batch)
+        if opd_mm_sft_batch is not None:
+            batch = opd_mm_sft_batch
+            opd_mm_sft_examples = len(batch)
         rollout_config = self.config.actor_rollout_ref.rollout
         batch.meta_info["multi_turn"] = rollout_config.multi_turn.enable
         # TODO: Make "temperature" single source of truth from generation.
@@ -1296,6 +1303,9 @@ class RayPPOTrainer:
         batch_td = batch.to_tensordict()
         # step 2: convert from padding to no-padding
         batch_td = left_right_2_no_padding(batch_td)
+        if opd_mm_sft_examples:
+            if "opd_mm_sft_loss_mask" not in batch_td.keys():
+                batch_td["opd_mm_sft_loss_mask"] = batch_td["response_mask"]
         calculate_entropy = self.config.actor_rollout_ref.actor.calculate_entropy or (
             self.config.actor_rollout_ref.actor.entropy_coeff != 0.0
         )
@@ -1304,6 +1314,8 @@ class RayPPOTrainer:
             if is_distillation_enabled(self.config.get("distillation"))
             else False
         )
+        if opd_mm_sft_examples:
+            distillation_use_topk = False
         distillation_only = False  # distillation_only flag means we can skip policy loss and reduce mem footprint
         if is_distillation_enabled(self.config.get("distillation")):
             distillation_loss_cfg = self.distillation_config.distillation_loss
@@ -1314,6 +1326,11 @@ class RayPPOTrainer:
             )
         ppo_mini_batch_size = self.config.actor_rollout_ref.actor.ppo_mini_batch_size
         ppo_mini_batch_size = ppo_mini_batch_size * self.config.actor_rollout_ref.rollout.n
+        if opd_mm_sft_examples:
+            ppo_mini_batch_size = self._opd_mm_sft_mini_batch_size(
+                batch_size=opd_mm_sft_examples,
+                default_mini_batch_size=ppo_mini_batch_size,
+            )
         ppo_epochs = self.config.actor_rollout_ref.actor.ppo_epochs
         seed = self.config.actor_rollout_ref.actor.data_loader_seed
         shuffle = self.config.actor_rollout_ref.actor.shuffle
@@ -1324,6 +1341,7 @@ class RayPPOTrainer:
             distillation_only=distillation_only,
             global_batch_size=ppo_mini_batch_size,
             mini_batch_size=ppo_mini_batch_size,
+            opd_mm_sft_batch=bool(opd_mm_sft_examples),
             epochs=ppo_epochs,
             seed=seed,
             dataloader_kwargs={"shuffle": shuffle},
@@ -1332,11 +1350,139 @@ class RayPPOTrainer:
         actor_output = self.actor_rollout_wg.update_actor(batch_td)
         actor_output = tu.get(actor_output, "metrics")
         actor_output = rename_dict(actor_output, "actor/")
+        if opd_mm_sft_examples:
+            actor_output["actor/opd_mm_sft_examples"] = opd_mm_sft_examples
         # modify key name
         actor_output["perf/mfu/actor"] = actor_output.pop("actor/mfu")
         actor_output = DataProto.from_single_dict(data={}, meta_info={"metrics": actor_output})
 
         return actor_output
+
+    def _opd_mm_sft_mini_batch_size(self, *, batch_size: int, default_mini_batch_size: int) -> int:
+        dp_size = self._get_dp_size(self.actor_rollout_wg, "actor")
+        mini_batch_size = max(dp_size, int(default_mini_batch_size))
+        if mini_batch_size % dp_size != 0:
+            mini_batch_size = max(dp_size, (mini_batch_size // dp_size) * dp_size)
+        if batch_size < mini_batch_size:
+            return mini_batch_size
+        if batch_size % mini_batch_size == 0:
+            return mini_batch_size
+        return batch_size
+
+    def _build_opd_mm_correction_sft_batch(self, batch: DataProto) -> Optional[DataProto]:
+        corrections_column = batch.non_tensor_batch.get("opd_mm_step_corrections")
+        if corrections_column is None:
+            return None
+
+        prompt_width = int(self.config.actor_rollout_ref.rollout.prompt_length)
+        response_width = int(self.config.actor_rollout_ref.rollout.response_length)
+        pad_id = self.tokenizer.pad_token_id if self.tokenizer.pad_token_id is not None else 0
+
+        rows: list[tuple[list[int], list[int], dict[str, Any]]] = []
+        for sample_corrections in corrections_column:
+            sample_corrections = sample_corrections.item() if hasattr(sample_corrections, "item") else sample_corrections
+            if isinstance(sample_corrections, np.ndarray):
+                sample_corrections = sample_corrections.tolist()
+            if isinstance(sample_corrections, dict):
+                sample_corrections = [sample_corrections]
+            if not isinstance(sample_corrections, list):
+                continue
+            for correction in sample_corrections:
+                if not isinstance(correction, dict):
+                    continue
+                target_xml = correction.get("sft_target_xml")
+                if not isinstance(target_xml, str) or "<tool_call>" not in target_xml:
+                    example = correction.get("example") or {}
+                    target_xml = example.get("target") if isinstance(example, dict) else None
+                if not isinstance(target_xml, str) or "<tool_call>" not in target_xml:
+                    continue
+                prompt_ids = correction.get("sft_prompt_ids") or []
+                if hasattr(prompt_ids, "tolist"):
+                    prompt_ids = prompt_ids.tolist()
+                if not isinstance(prompt_ids, list) or not prompt_ids:
+                    example = correction.get("example") or {}
+                    input_text = example.get("input") if isinstance(example, dict) else None
+                    if isinstance(input_text, str) and input_text:
+                        prompt_ids = self.tokenizer(input_text, add_special_tokens=False)["input_ids"]
+                if not isinstance(prompt_ids, list) or not prompt_ids:
+                    continue
+                target_ids = self.tokenizer(target_xml, add_special_tokens=False)["input_ids"]
+                if not target_ids or len(target_ids) > response_width:
+                    continue
+                rows.append(([int(token) for token in prompt_ids], [int(token) for token in target_ids], correction))
+
+        if not rows:
+            return None
+
+        default_mini_batch_size = (
+            int(self.config.actor_rollout_ref.actor.ppo_mini_batch_size)
+            * int(self.config.actor_rollout_ref.rollout.n)
+        )
+        dp_size = self._get_dp_size(self.actor_rollout_wg, "actor")
+        multiple = max(dp_size, default_mini_batch_size)
+        if multiple % dp_size != 0:
+            multiple = max(dp_size, (multiple // dp_size) * dp_size)
+        target_size = max(multiple, math.ceil(len(rows) / multiple) * multiple)
+        if len(rows) < target_size:
+            repeats = math.ceil(target_size / len(rows))
+            rows = (rows * repeats)[:target_size]
+
+        prompts = []
+        responses = []
+        response_masks = []
+        input_ids = []
+        attention_masks = []
+        position_ids = []
+        for prompt_ids, target_ids, _ in rows:
+            prompt_ids = prompt_ids[-prompt_width:]
+            left_pad = prompt_width - len(prompt_ids)
+            padded_prompt = [pad_id] * left_pad + prompt_ids
+            prompt_attention = [0] * left_pad + [1] * len(prompt_ids)
+
+            right_pad = response_width - len(target_ids)
+            padded_response = target_ids + [pad_id] * right_pad
+            response_attention = [1] * len(target_ids) + [0] * right_pad
+
+            sample_input_ids = padded_prompt + padded_response
+            sample_attention = prompt_attention + response_attention
+            sample_position_ids = [0] * len(sample_input_ids)
+            position = 0
+            for index, is_valid in enumerate(sample_attention):
+                if is_valid:
+                    sample_position_ids[index] = position
+                    position += 1
+
+            prompts.append(padded_prompt)
+            responses.append(padded_response)
+            response_masks.append(response_attention)
+            input_ids.append(sample_input_ids)
+            attention_masks.append(sample_attention)
+            position_ids.append(sample_position_ids)
+
+        tensor_batch = TensorDict(
+            {
+                "prompts": torch.tensor(prompts, dtype=torch.long),
+                "responses": torch.tensor(responses, dtype=torch.long),
+                "response_mask": torch.tensor(response_masks, dtype=torch.long),
+                "opd_mm_sft_loss_mask": torch.tensor(response_masks, dtype=torch.long),
+                "input_ids": torch.tensor(input_ids, dtype=torch.long),
+                "attention_mask": torch.tensor(attention_masks, dtype=torch.long),
+                "position_ids": torch.tensor(position_ids, dtype=torch.long),
+            },
+            batch_size=len(rows),
+        )
+        non_tensor_batch = {
+            "uid": np.array([str(uuid.uuid4()) for _ in rows], dtype=object),
+            "data_source": np.array(["opd_mm"] * len(rows), dtype=object),
+            "multi_modal_inputs": np.array([{} for _ in rows], dtype=object),
+            "opd_mm_sft_batch": np.array([True for _ in rows], dtype=object),
+            "opd_mm_step_corrections": np.array([row[2] for row in rows], dtype=object),
+        }
+        return DataProto(
+            batch=tensor_batch,
+            non_tensor_batch=non_tensor_batch,
+            meta_info=dict(batch.meta_info),
+        )
 
     def _update_critic(self, batch: DataProto) -> DataProto:
         batch_td = batch.to_tensordict()

@@ -13,8 +13,9 @@ The migration keeps the original OPD-MM isolation contract:
 - the policy sees the user query and public tool schemas;
 - the hidden memory store is available only to the OPD-MM tools/executor;
 - tool observations omit memory IDs;
-- retrieve always uses the original user query and rejects custom query fields
-  through the validator.
+- retrieve uses the original user query by default and may optionally receive a
+  rewritten query string for that retrieval step; hidden memory IDs are still
+  rejected through the validator.
 
 ## verl-native tool path
 

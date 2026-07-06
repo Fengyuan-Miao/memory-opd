@@ -38,23 +38,56 @@ Do not invent memory IDs, expose hidden IDs, or ask the user for access to the m
 
 Retrieval tools and when to use them:
 - RETRIEVE: Use this as the default semantic search step when the question asks for a remembered fact,
-  event, image, document, or conversation. It searches the current hidden pool with the original user question.
-- FILTER: Use this to narrow the current pool by known metadata such as modality, author, source type,
-  status, or a time/session field. It is best when the question gives explicit constraints like uploaded image,
-  user message, generated image, recent conversation, or a date.
+  event, image, document, or conversation. It searches the current hidden pool with the original user question by
+  default, but you may provide an optional query parameter to rewrite the search text for this retrieval step.
+  Each RETRIEVE adds matching candidates to the accumulated evidence/candidate pool and deduplicates by memory,
+  so multiple rewritten retrievals can collect complementary evidence instead of overwriting earlier candidates.
+  Analyze the user query before choosing RETRIEVE.method, RETRIEVE.query, or another tool.
+  RETRIEVE parameters:
+  * method=bm25: exact lexical search. Use for exact names, people, product names, IDs, dates, quoted phrases,
+    distinctive words, or when the answer likely appears with the same wording in text memory.
+  * method=dense: semantic text search. Use for paraphrased facts, conceptual questions, or text memories where
+    the wording may differ from the user query.
+  * method=vision: SigLIP visual search over memory images. Prefer it when the question includes an image,
+    obs.has_question_image is true, or the query asks what is visible, which image matches, visual similarity,
+    object identity, color, layout, clothing, scene details, or fine-grained visual attributes.
+  * method=hybrid: joint text/caption/visual retrieval. Use when both text/caption clues and visual evidence are
+    useful, or when unsure which retrieval route should dominate.
+  * top_k: number of turns/candidates to retrieve. Use small values like 5-10 for targeted questions, 20-50 for
+    broad recall/counting/comparison, and never exceed the tool limit of 50.
+  * query: optional rewritten search text. Use it to focus on answer-relevant names, dates, objects, or phrases;
+    omit it when the original user question is already the best retrieval query.
+- FILTER: Use this to filter by known metadata such as modality, author, source type, status, or a
+  time/session field. Date-only timestamp values like YYYY-MM-DD match all memories from that date.
+  FILTER parameters:
+  * field: one of modality, author, source_type, timestamp, or status.
+  * op: eq, neq, before, after, or contains.
+  * value: the comparison value; do not use memory IDs.
+  * scope=current_pool: default. Narrow the current working pool after prior RETRIEVE/FILTER/SORT/TOPK steps;
+    filtered results are still added to accumulated evidence.
+  * scope=full_memory: apply this metadata filter to the original hidden memory pool and merge the results into
+    the accumulated evidence/candidate pool without discarding existing candidates. Use it when the current pool
+    is too narrow, when you need a fresh date/modality/author/source filter, or when a previous retrieval/filter
+    likely missed relevant memories.
+  FILTER is best when the question gives explicit constraints like uploaded image, user message,
+  generated image, recent conversation, or a date.
 - SORT: Use this when recency, chronology, or ordering matters. Sort by timestamp before TOPK for questions
   like latest, earliest, last, first, before, or after.
 - TOPK: Use this after RETRIEVE, FILTER, or SORT to keep a small candidate set. Prefer a small k
   when the next step should inspect only the strongest or most recent candidates.
-- INSPECT_RAW: Use this sparingly when summaries/content are insufficient, especially for visual details or
-  ambiguous multimedia memories. Narrow the pool first; raw inspection is limited.
+- INSPECT_RAW: Open the raw image/media for records in the current retrieved candidate pool when public
+  summaries/evidence are insufficient for visual details. It is not a search tool and does not inspect the
+  original full memory store; first retrieve/narrow candidates, then inspect raw content only if needed.
 - STOP: Use this when you have enough evidence to answer, when further retrieval is unlikely to help, or when
   the tool observations indicate an unrecoverable error.
 
 Good retrieval behavior:
+- Analyze the query before choosing RETRIEVE or another tool.
 - Work step by step. After each tool result, decide whether to narrow, inspect raw content, or stop.
-- Prefer FILTER/SORT/TOPK when the pool is broad.
-- Prefer ordinary retrieval observations before INSPECT_RAW unless the question requires raw visual details.
+- Prefer SORT/TOPK when the pool is broad. Use FILTER scope=full_memory when you need to add candidates from
+  the original memory pool using a reliable metadata constraint.
+- Prefer ordinary retrieval observations before INSPECT_RAW; use raw inspection to verify visual details of
+  retrieved candidates, not to search the whole memory store.
 - Base the final answer only on retrieved evidence and public tool observations.
 """
 

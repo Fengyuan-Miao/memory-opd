@@ -83,8 +83,9 @@ def build_student_prompt(query: str, tool_schema: Optional[str] = None) -> str:
 Generate a short sequence of executable tool calls for the user query.
 
 You cannot see the memory store, memory index, candidate memories, or memory IDs.
-Do not invent answer words or a new search query. RETRIEVE automatically uses
-the original user query. Use only the allowed schema.
+Do not invent answer words. RETRIEVE uses the original user query by default,
+but you may provide a query argument to rewrite the search text for the current
+retrieval step. Use only the allowed schema.
 
 {schema}
 

@@ -1,19 +1,21 @@
+opd_mm_common_config: &opd_mm_common_config
+  type: native
+  vector_store_dir: dataset/mem_gallery/opd_mm_store
+  dense_model_path: /home/miaofy/data/pretrained_models/all-MiniLM-L6-v2
+  vision_model_path: /home/miaofy/data/pretrained_models/SigLIP-Base-Patch16-384
+  hybrid_model_path: /home/miaofy/data/pretrained_models/gme-Qwen2-VL-2B-Instruct
+  vector_device: cuda:0
+
 tools:
   - class_name: "verl.experimental.opd_mm.tools.OPDFilterTool"
-    config:
-      type: native
+    config: *opd_mm_common_config
   - class_name: "verl.experimental.opd_mm.tools.OPDSortTool"
-    config:
-      type: native
+    config: *opd_mm_common_config
   - class_name: "verl.experimental.opd_mm.tools.OPDTopKTool"
-    config:
-      type: native
+    config: *opd_mm_common_config
   - class_name: "verl.experimental.opd_mm.tools.OPDRetrieveTool"
-    config:
-      type: native
+    config: *opd_mm_common_config
   - class_name: "verl.experimental.opd_mm.tools.OPDInspectRawTool"
-    config:
-      type: native
+    config: *opd_mm_common_config
   - class_name: "verl.experimental.opd_mm.tools.OPDStopTool"
-    config:
-      type: native
+    config: *opd_mm_common_config

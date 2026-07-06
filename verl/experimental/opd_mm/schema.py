@@ -33,6 +33,7 @@ ALLOWED_TOOLS = {
 }
 FILTER_FIELDS = {"modality", "author", "source_type", "timestamp", "status"}
 FILTER_OPS = {"eq", "neq", "before", "after", "contains"}
+FILTER_SCOPES = {"current_pool", "full_memory"}
 SORT_FIELDS = {"timestamp", "turn_id", "score"}
 SORT_ORDERS = {"asc", "desc"}
 RETRIEVAL_METHODS = {"bm25", "dense", "vision", "hybrid"}
@@ -43,21 +44,27 @@ FORBIDDEN_ARGUMENT_KEYS = {
     "memory_ids",
     "candidate_id",
     "candidate_ids",
-    "query",
     "search_query",
 }
 MEMORY_ID_PATTERN = re.compile(r"\b(?:m|memory|mau)[-_]?\d+\b", re.IGNORECASE)
 
 TOOL_SCHEMA_TEXT = """Allowed executable tools:
 FILTER(field=modality|author|source_type|timestamp|status,
-       op=eq|neq|before|after|contains, value=...)
+       op=eq|neq|before|after|contains, value=...,
+       scope=optional current_pool|full_memory)
 SORT(field=timestamp|turn_id|score, order=asc|desc)
 TOPK(k=positive integer)
-RETRIEVE(method=bm25|dense|vision|hybrid, top_k=positive integer)
+RETRIEVE(method=bm25|dense|vision|hybrid, top_k=positive integer, query=optional rewritten search text)
 STOP()
 
-Return only a JSON array of tool calls. Do not emit memory IDs. RETRIEVE always
-uses the original user query and therefore accepts no query argument."""
+Return only a JSON array of tool calls. Do not emit memory IDs. RETRIEVE uses
+the original user query by default; optionally provide query to rewrite the
+search text for the current retrieval step. RETRIEVE and full_memory FILTER
+merge new candidates into the accumulated pool and deduplicate by memory. For
+timestamp filters, date-only values such as YYYY-MM-DD match all memory
+timestamps from that date. FILTER scope defaults to current_pool; use
+scope=full_memory to collect metadata-filtered candidates from the original
+hidden memory pool without discarding existing candidates."""
 
 
 def build_tool_schema(allow_inspect_raw: bool = True) -> str:
@@ -67,6 +74,8 @@ def build_tool_schema(allow_inspect_raw: bool = True) -> str:
         lines[stop_index:stop_index] = [
             "INSPECT_RAW(target=current_pool,",
             "            instruction=answer_query_related_visual_details)",
+            "# INSPECT_RAW opens raw media only for the current retrieved candidate pool;",
+            "# it is not a search over the original full memory store.",
         ]
     return "\n".join(lines)
 
@@ -155,13 +164,15 @@ class TrajectoryValidator:
             )
 
     def _validate_filter(self, args: Dict[str, Any], index: int) -> None:
-        self._require_exact_keys(args, {"field", "op", "value"}, set(), index)
+        self._require_exact_keys(args, {"field", "op", "value"}, {"scope"}, index)
         if args["field"] not in FILTER_FIELDS:
             raise TrajectoryValidationError(f"action {index}: invalid FILTER field")
         if args["op"] not in FILTER_OPS:
             raise TrajectoryValidationError(f"action {index}: invalid FILTER op")
         if not isinstance(args["value"], (str, int, float, bool)):
             raise TrajectoryValidationError(f"action {index}: invalid FILTER value")
+        if args.get("scope", "current_pool") not in FILTER_SCOPES:
+            raise TrajectoryValidationError(f"action {index}: invalid FILTER scope")
 
     def _validate_sort(self, args: Dict[str, Any], index: int) -> None:
         self._require_exact_keys(args, {"field", "order"}, set(), index)
@@ -173,10 +184,12 @@ class TrajectoryValidator:
         self._validate_k(args["k"], index, "k")
 
     def _validate_retrieve(self, args: Dict[str, Any], index: int) -> None:
-        self._require_exact_keys(args, set(), {"method", "top_k"}, index)
+        self._require_exact_keys(args, set(), {"method", "top_k", "query"}, index)
         if args.get("method", "hybrid") not in RETRIEVAL_METHODS:
             raise TrajectoryValidationError(f"action {index}: invalid RETRIEVE method")
         self._validate_k(args.get("top_k", 5), index, "top_k")
+        if "query" in args and (not isinstance(args["query"], str) or not args["query"].strip()):
+            raise TrajectoryValidationError(f"action {index}: invalid RETRIEVE query")
 
     def _validate_inspect_raw(self, args: Dict[str, Any], index: int) -> None:
         self._require_exact_keys(args, set(), {"target", "instruction"}, index)
