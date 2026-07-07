@@ -27,12 +27,15 @@ from verl import DataProto
 from verl.experimental.opd_mm import MemoryRecord, OPDSample, OnPolicyDistiller, PolicyOutput, ToolAction, ToolExecutor
 from verl.experimental.opd_mm.dataset import OPD_MM_SYSTEM_PROMPT, opd_messages_for_query, opd_sample_to_rlhf_record
 from verl.experimental.opd_mm.online_self_distill import (
+    build_teacher_correction_prompt,
     build_online_step_correction_requests,
     dump_online_step_correction,
     extract_canonical_tool_call_xml,
     finalize_online_step_correction,
     maybe_collect_online_step_corrections,
+    parse_state_verifier_feedback,
 )
+from verl.experimental.opd_mm.raw_inspector import RemoteVLLMRawInspector
 from verl.experimental.opd_mm.retrieval import HiddenMemoryStore, TurnAwareHybridRetriever
 from verl.experimental.opd_mm.reward_manager import OPDMMRewardManager
 from verl.experimental.opd_mm.schema import TrajectoryValidationError, TrajectoryValidator
@@ -135,6 +138,51 @@ class RecordingRetriever:
         del store, method, question_image
         self.queries.append(query)
         return pool[:top_k]
+
+
+def test_remote_vllm_raw_inspector_sends_image_and_returns_text(tmp_path, monkeypatch) -> None:
+    image = tmp_path / "cat.jpg"
+    image.write_bytes(b"fake-jpeg")
+    captured: dict[str, Any] = {}
+
+    class FakeResponse:
+        def __enter__(self) -> "FakeResponse":
+            return self
+
+        def __exit__(self, exc_type: Any, exc: Any, tb: Any) -> None:
+            return None
+
+        def read(self) -> bytes:
+            return json.dumps(
+                {"choices": [{"message": {"content": "A tabby cat is visible on a sofa."}}]},
+                ensure_ascii=False,
+            ).encode("utf-8")
+
+    def fake_urlopen(req: Any, timeout: float) -> FakeResponse:
+        captured["url"] = req.full_url
+        captured["timeout"] = timeout
+        captured["payload"] = json.loads(req.data.decode("utf-8"))
+        return FakeResponse()
+
+    monkeypatch.setattr("verl.experimental.opd_mm.raw_inspector.urllib_request.urlopen", fake_urlopen)
+
+    inspector = RemoteVLLMRawInspector(
+        base_url="http://raw-inspector:8000",
+        model="vl-test",
+        timeout=12,
+        max_tokens=64,
+    )
+    observation = inspector.inspect(str(image), "What animal is shown?", text_context="The user shared a pet photo.")
+
+    assert observation == "A tabby cat is visible on a sofa."
+    assert captured["url"] == "http://raw-inspector:8000/v1/chat/completions"
+    assert captured["timeout"] == 12
+    assert captured["payload"]["model"] == "vl-test"
+    content = captured["payload"]["messages"][1]["content"]
+    assert content[0]["type"] == "text"
+    assert "What animal is shown?" in content[0]["text"]
+    assert content[1]["type"] == "image_url"
+    assert content[1]["image_url"]["url"].startswith("data:image/jpeg;base64,")
 
 
 class QuerySwitchRetriever:
@@ -824,7 +872,7 @@ def test_online_xml_correction_requests_include_invalid_student_state() -> None:
                 }
             },
             "extra_info": {
-                "gold_answer": "on the sofa",
+                "gold_answer": "SECRET_GOLD_ANSWER",
                 "opd_mm_online_self_distill": True,
                 "sample_id": "online-xml-sample",
             },
@@ -843,26 +891,42 @@ def test_online_xml_correction_requests_include_invalid_student_state() -> None:
     assert len(requests) == 1
     assert requests[0]["student_prompt_ids"] == [11, 22, 33]
     assert requests[0]["student_next_action"] is None
+    assert "teacher_prompt" not in requests[0]
+    assert "You are the OPD-MM state verifier" in requests[0]["verifier_prompt"]
+    assert "Gold answer (private rubric" in requests[0]["verifier_prompt"]
+    assert "SECRET_GOLD_ANSWER" in requests[0]["verifier_prompt"]
+
+    verifier_feedback = {
+        "evidence_sufficient": False,
+        "reason": "Need public retrieval evidence before answering.",
+        "recommended_next_action": "retrieve",
+        "parse_error": "",
+    }
+    requests[0]["verifier_feedback"] = verifier_feedback
+    requests[0]["teacher_prompt"] = build_teacher_correction_prompt(
+        query=requests[0]["query"],
+        history=requests[0]["history"],
+        observation=requests[0]["observation"],
+        student_raw_response=requests[0]["student_raw_response"],
+        verifier_feedback=verifier_feedback,
+        gold_answer="SECRET_GOLD_ANSWER",
+        allow_inspect_raw=requests[0]["allow_inspect_raw"],
+        tool_format=requests[0]["tool_format"],
+    )
     assert "Teacher role:" in requests[0]["teacher_prompt"]
     assert "Correct exactly one next tool action" in requests[0]["teacher_prompt"]
-    assert "Gold answer role:" in requests[0]["teacher_prompt"]
-    assert "teacher-only supervision/rubric" in requests[0]["teacher_prompt"]
-    assert "not a lexical source for RETRIEVE.query" in requests[0]["teacher_prompt"]
-    assert "as if the Gold answer section were hidden" in requests[0]["teacher_prompt"]
-    assert "Gold answer" in requests[0]["teacher_prompt"]
-    assert "not student-visible evidence" in requests[0]["teacher_prompt"]
+    assert "Verifier feedback role:" in requests[0]["teacher_prompt"]
+    assert "The verifier saw the gold answer; you did not." in requests[0]["teacher_prompt"]
+    assert "Gold answer:" not in requests[0]["teacher_prompt"]
+    assert "SECRET_GOLD_ANSWER" not in requests[0]["teacher_prompt"]
+    assert "Never copy verifier reason into RETRIEVE.query" in requests[0]["teacher_prompt"]
     assert "not an instruction to copy" in requests[0]["teacher_prompt"]
-    assert "Do not output stop solely because the gold answer is known" in requests[0]["teacher_prompt"]
     assert "history/trace is empty and evidence_count is 0, do not output stop" in requests[0]["teacher_prompt"]
-    assert 'gold answer is "Not mentioned" or similar' in requests[0]["teacher_prompt"]
     assert 'If the JSON observation above has "evidence_count": 0 and "trace": [], stop is invalid' in requests[
         0
     ]["teacher_prompt"]
-    assert "not to reveal answer-only entities in the query" in requests[0]["teacher_prompt"]
-    assert "Do not include gold-only answer entities" in requests[0]["teacher_prompt"]
-    assert "never enumerate the gold answer list items" in requests[0]["teacher_prompt"]
-    assert "search for the requested category generically" in requests[0]["teacher_prompt"]
-    assert "ignore the Gold answer section except as a private grading rubric" in requests[0]["teacher_prompt"]
+    assert "If verifier.evidence_sufficient is false, STOP is invalid" in requests[0]["teacher_prompt"]
+    assert "Do not use verifier.reason as lexical material for RETRIEVE.query" in requests[0]["teacher_prompt"]
     assert "scope=full_memory" in requests[0]["teacher_prompt"]
     assert "optionally query as rewritten search text" in requests[0]["teacher_prompt"]
 
@@ -885,6 +949,65 @@ def test_online_xml_correction_requests_include_invalid_student_state() -> None:
         "</function>\n"
         "</tool_call>"
     )
+    assert correction["feedback"] == verifier_feedback
+
+
+def test_state_verifier_feedback_parser_accepts_wrapped_json_and_blocks_stop() -> None:
+    feedback = parse_state_verifier_feedback(
+        "```json\n"
+        '{"evidence_sufficient": false, "reason": "Need broader public evidence.", '
+        '"recommended_next_action": "STOP"}\n'
+        "```",
+        {"evidence_count": 3},
+    )
+
+    assert feedback["evidence_sufficient"] is False
+    assert feedback["recommended_next_action"] == "retrieve"
+    assert feedback["parse_error"] == ""
+
+
+def test_state_verifier_feedback_parser_falls_back_on_invalid_action() -> None:
+    feedback = parse_state_verifier_feedback(
+        '{"evidence_sufficient": true, "reason": "Looks enough.", "recommended_next_action": "jump"}',
+        {"evidence_count": 2},
+    )
+
+    # "jump" is intentionally not a verifier action; use the safe non-leaking fallback.
+    assert feedback["evidence_sufficient"] is False
+    assert feedback["recommended_next_action"] == "retrieve"
+    assert "invalid recommended_next_action" in feedback["parse_error"]
+
+
+def test_online_xml_correction_stop_gate_replaces_insufficient_teacher_stop() -> None:
+    request = {
+        "sample_id": "stop-gate",
+        "step_index": 0,
+        "query": "What dance styles were mentioned?",
+        "history": [],
+        "observation": {"evidence_count": 0, "trace": []},
+        "student_raw_response": "<tool_call><function=stop></function></tool_call>",
+        "student_prompt_ids": [7, 8, 9],
+        "allow_inspect_raw": True,
+        "tool_format": "qwen3_coder",
+        "verifier_raw_response": '{"evidence_sufficient": false, "reason": "Need list coverage.", '
+        '"recommended_next_action": "retrieve"}',
+        "verifier_feedback": {
+            "evidence_sufficient": False,
+            "reason": "Need list coverage.",
+            "recommended_next_action": "retrieve",
+            "parse_error": "",
+        },
+    }
+
+    correction = finalize_online_step_correction(
+        request,
+        teacher_raw_response="<tool_call>\n<function=stop>\n</function>\n</tool_call>",
+    )
+
+    assert correction is not None
+    assert correction["stop_gate_applied"] is True
+    assert correction["teacher_actions"][0]["tool"] == "RETRIEVE"
+    assert "<function=retrieve>" in correction["sft_target_xml"]
 
 
 def test_online_teacher_correction_dump_writes_jsonl(tmp_path, monkeypatch) -> None:

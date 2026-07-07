@@ -1033,9 +1033,11 @@ class AgentLoopWorker:
         if self.distillation_enabled:
             try:
                 from verl.experimental.opd_mm.online_self_distill import (
+                    build_teacher_correction_prompt,
                     build_online_step_correction_requests,
                     dump_online_step_correction,
                     finalize_online_step_correction,
+                    parse_state_verifier_feedback,
                 )
 
                 requests = build_online_step_correction_requests(
@@ -1048,16 +1050,53 @@ class AgentLoopWorker:
                 if routing_value is not None:
                     routing_key = routing_value.item() if hasattr(routing_value, "item") else routing_value
                 teacher_kwargs = {}
+                verifier_kwargs = {}
                 extra_info = sample_kwargs.get("extra_info") or {}
-                if isinstance(extra_info, dict):
-                    teacher_kwargs = extra_info.get("opd_mm_step_teacher_kwargs") or {}
+                if hasattr(extra_info, "get"):
+                    raw_teacher_kwargs = extra_info.get("opd_mm_step_teacher_kwargs") or {}
+                    if hasattr(raw_teacher_kwargs, "items"):
+                        teacher_kwargs = dict(raw_teacher_kwargs)
+                    raw_verifier_kwargs = extra_info.get("opd_mm_step_verifier_kwargs") or {}
+                    verifier_kwargs = dict(teacher_kwargs)
+                    if hasattr(raw_verifier_kwargs, "items"):
+                        verifier_kwargs.update(dict(raw_verifier_kwargs))
                 sampling_params = {
                     "max_tokens": int(teacher_kwargs.get("max_tokens", 128)),
                     "temperature": float(teacher_kwargs.get("temperature", 0.0)),
                     "top_p": float(teacher_kwargs.get("top_p", 1.0)),
                     "top_k": int(teacher_kwargs.get("top_k", -1)),
                 }
+                verifier_sampling_params = {
+                    "max_tokens": int(verifier_kwargs.get("max_tokens", 256)),
+                    "temperature": float(verifier_kwargs.get("temperature", 0.0)),
+                    "top_p": float(verifier_kwargs.get("top_p", 1.0)),
+                    "top_k": int(verifier_kwargs.get("top_k", -1)),
+                }
                 for request in requests:
+                    verifier_prompt_ids = self._encode_opd_mm_teacher_prompt(request["verifier_prompt"])
+                    verifier_response_ids = await self.teacher_server_manager.generate_teacher_response_single(
+                        prompt_ids=verifier_prompt_ids,
+                        sampling_params=verifier_sampling_params,
+                        multi_modal_data=output.multi_modal_data,
+                        mm_processor_kwargs=output.mm_processor_kwargs,
+                        routing_key=routing_key,
+                    )
+                    verifier_raw_response = self.tokenizer.decode(verifier_response_ids, skip_special_tokens=False)
+                    verifier_feedback = parse_state_verifier_feedback(
+                        verifier_raw_response,
+                        request.get("observation", {}),
+                    )
+                    request["verifier_raw_response"] = verifier_raw_response
+                    request["verifier_feedback"] = verifier_feedback
+                    request["teacher_prompt"] = build_teacher_correction_prompt(
+                        query=request.get("query", ""),
+                        history=request.get("history", []),
+                        observation=request.get("observation", {}),
+                        student_raw_response=request.get("student_raw_response", ""),
+                        verifier_feedback=verifier_feedback,
+                        allow_inspect_raw=bool(request.get("allow_inspect_raw", True)),
+                        tool_format=str(request.get("tool_format") or self.rollout_config.multi_turn.format),
+                    )
                     teacher_prompt_ids = self._encode_opd_mm_teacher_prompt(request["teacher_prompt"])
                     teacher_response_ids = await self.teacher_server_manager.generate_teacher_response_single(
                         prompt_ids=teacher_prompt_ids,

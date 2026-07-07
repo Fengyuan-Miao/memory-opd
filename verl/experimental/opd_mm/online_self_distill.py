@@ -49,6 +49,7 @@ _TOOL_CALL_NAME_BY_ACTION = {
     "INSPECT_RAW": "inspect_raw",
     "STOP": "stop",
 }
+_VERIFIER_ACTIONS = {"retrieve", "filter", "sort", "topk", "inspect_raw", "stop"}
 
 
 def _truncate_for_dump(value: Any, max_chars: int) -> Any:
@@ -82,13 +83,17 @@ def dump_online_step_correction(
             "observation": request.get("observation", {}),
             "student_next_action": request.get("student_next_action"),
             "student_raw_response": _truncate_for_dump(request.get("student_raw_response", ""), max_chars),
+            "verifier_raw_response": _truncate_for_dump(request.get("verifier_raw_response", ""), max_chars),
+            "verifier_feedback": request.get("verifier_feedback", {}),
             "teacher_raw_response": _truncate_for_dump(teacher_raw_response, max_chars),
             "parsed": correction is not None,
             "teacher_actions": correction.get("teacher_actions", []) if isinstance(correction, dict) else [],
             "teacher_xml_span": correction.get("teacher_xml_span", "") if isinstance(correction, dict) else "",
             "sft_target_xml": correction.get("sft_target_xml", "") if isinstance(correction, dict) else "",
+            "stop_gate_applied": correction.get("stop_gate_applied", False) if isinstance(correction, dict) else False,
         }
         if include_prompt:
+            record["verifier_prompt"] = _truncate_for_dump(request.get("verifier_prompt", ""), max_chars)
             record["teacher_prompt"] = _truncate_for_dump(request.get("teacher_prompt", ""), max_chars)
         os.makedirs(dump_dir, exist_ok=True)
         path = os.path.join(dump_dir, f"teacher_corrections_pid{os.getpid()}.jsonl")
@@ -101,6 +106,85 @@ def dump_online_step_correction(
 def _as_dict(value: Any) -> dict[str, Any]:
     value = to_plain(value)
     return value if isinstance(value, dict) else {}
+
+
+def _action_dicts(history: list[Any]) -> list[dict[str, Any]]:
+    actions: list[dict[str, Any]] = []
+    for action in history:
+        if isinstance(action, ToolAction):
+            actions.append(action.to_dict())
+        elif isinstance(action, dict):
+            actions.append(action)
+    return actions
+
+
+def _extract_json_object(raw_response: str) -> dict[str, Any]:
+    """Extract the first JSON object from strict JSON or lightly wrapped text."""
+    text = (raw_response or "").strip()
+    if not text:
+        raise ValueError("empty verifier response")
+    decoder = json.JSONDecoder()
+    for index, char in enumerate(text):
+        if char != "{":
+            continue
+        try:
+            parsed, _ = decoder.raw_decode(text[index:])
+        except json.JSONDecodeError:
+            continue
+        if isinstance(parsed, dict):
+            return parsed
+    raise ValueError("no JSON object found in verifier response")
+
+
+def _coerce_bool(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        lowered = value.strip().lower()
+        if lowered in {"true", "yes", "1"}:
+            return True
+        if lowered in {"false", "no", "0"}:
+            return False
+    return bool(value)
+
+
+def _normalize_verifier_action(value: Any) -> str | None:
+    if value is None:
+        return None
+    action = str(value).strip().lower().replace("-", "_").replace(" ", "_")
+    aliases = {
+        "retrieval": "retrieve",
+        "search": "retrieve",
+        "metadata_filter": "filter",
+        "inspect": "inspect_raw",
+        "inspectraw": "inspect_raw",
+        "raw_inspect": "inspect_raw",
+    }
+    action = aliases.get(action, action)
+    return action if action in _VERIFIER_ACTIONS else None
+
+
+def _observation_evidence_count(observation: dict[str, Any]) -> int:
+    if not isinstance(observation, dict):
+        return 0
+    value = observation.get("evidence_count")
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return int(value)
+    for key in ("evidence", "candidate_pool", "candidates", "current_pool", "pool"):
+        items = observation.get(key)
+        if isinstance(items, list):
+            return len(items)
+    return 0
+
+
+def _verifier_parse_fallback(error: Exception | str) -> dict[str, Any]:
+    message = str(error)
+    return {
+        "evidence_sufficient": False,
+        "reason": f"verifier_parse_error: {message[:240]}",
+        "recommended_next_action": "retrieve",
+        "parse_error": message,
+    }
 
 
 def _teacher_cache_key(class_path: str, kwargs: dict[str, Any]) -> tuple[str, str]:
@@ -321,18 +405,151 @@ def extract_canonical_tool_call_xml(
     return None
 
 
-def build_teacher_correction_prompt(
+def build_state_verifier_prompt(
     *,
     query: str,
     gold_answer: str,
-    history: list[ToolAction],
+    history: list[Any],
     observation: dict[str, Any],
     student_raw_response: str,
+    allow_inspect_raw: bool = True,
+) -> str:
+    """Build a non-leaking state verifier prompt.
+
+    The verifier may see the gold answer as a private rubric, but its JSON
+    output is later shown to the teacher and distilled into student behavior.
+    Therefore the feedback must describe missing evidence types, not answer
+    content.
+    """
+    allowed_actions = (
+        "retrieve|filter|sort|topk|inspect_raw|stop"
+        if allow_inspect_raw
+        else "retrieve|filter|sort|topk|stop"
+    )
+    inspect_rule = (
+        "- For image/name/ID questions, require visual or image-ID evidence; recommend inspect_raw when raw visual "
+        "details are needed and retrieved candidates already exist."
+        if allow_inspect_raw
+        else "- For image/name/ID questions, require visual or image-ID evidence from retrieval results."
+    )
+    return f"""You are the OPD-MM state verifier.
+
+Your job is to judge whether the current public retrieved evidence is sufficient
+for a separate answer model to answer the user question correctly.
+
+You may see the gold answer only as a private rubric.
+Do not quote, paraphrase, enumerate, or reveal any gold-only answer content.
+Do not include exact gold-only names, dates, image IDs, labels, or list items in your output.
+Do not rewrite the answer into a search query.
+
+Return only valid JSON with this exact shape:
+{{
+  "evidence_sufficient": boolean,
+  "reason": "short non-leaking reason",
+  "recommended_next_action": "{allowed_actions}"
+}}
+
+Guidelines:
+- If evidence_count is 0, evidence_sufficient=false and recommend retrieve/filter/sort.
+- For list/all/multi-fact questions, evidence is sufficient only if the evidence covers the complete requested set.
+- For temporal/order/latest questions, require enough timestamp/order evidence.
+{inspect_rule}
+- For conflict/not-mentioned questions, require enough relevant evidence to support absence or contradiction.
+- If evidence is insufficient, recommended_next_action must not be stop.
+- The reason may describe missing evidence type only, such as needing broader coverage, timestamp/order evidence,
+  image-ID evidence, raw visual detail, or contradiction/absence support.
+- recommended_next_action is only an action type; never output tool parameters, rewritten queries, IDs, names, dates, or answer items.
+- JSON only. No markdown.
+
+User question:
+{query}
+
+Gold answer (private rubric; do not reveal or copy into feedback):
+{gold_answer}
+
+Previous student tool calls:
+{json.dumps(_action_dicts(history), ensure_ascii=False, indent=2, default=str)}
+
+Current public tool state and observations:
+{json.dumps(observation, ensure_ascii=False, indent=2, default=str)}
+
+Student raw next output at this state:
+{student_raw_response}
+"""
+
+
+def parse_state_verifier_feedback(raw_response: str, observation: dict[str, Any]) -> dict[str, Any]:
+    """Parse verifier JSON and enforce non-STOP fallback gates."""
+    try:
+        payload = _extract_json_object(raw_response)
+    except Exception as error:
+        return _verifier_parse_fallback(error)
+
+    try:
+        evidence_sufficient = _coerce_bool(payload.get("evidence_sufficient"))
+        reason = str(payload.get("reason") or "").strip()
+        action = _normalize_verifier_action(payload.get("recommended_next_action"))
+        if action is None:
+            raise ValueError(f"invalid recommended_next_action: {payload.get('recommended_next_action')!r}")
+        evidence_count = _observation_evidence_count(observation)
+        if evidence_count <= 0 and action in {"inspect_raw", "topk"}:
+            evidence_sufficient = False
+            action = "retrieve"
+            reason = reason or "Need retrieved public candidates before this action."
+        if evidence_count <= 0 and action == "stop":
+            evidence_sufficient = False
+            action = "retrieve"
+            reason = reason or "Need public evidence before stopping."
+        if not evidence_sufficient and action == "stop":
+            action = "retrieve"
+            reason = reason or "Evidence is insufficient, so another tool action is required."
+        return {
+            "evidence_sufficient": bool(evidence_sufficient),
+            "reason": reason[:1000],
+            "recommended_next_action": action,
+            "parse_error": "",
+        }
+    except Exception as error:
+        return _verifier_parse_fallback(error)
+
+
+def _stop_gate_fallback_action(request: dict[str, Any], verifier_feedback: dict[str, Any]) -> ToolAction:
+    """Choose a safe non-STOP target when verifier marks evidence insufficient."""
+    recommendation = _normalize_verifier_action(verifier_feedback.get("recommended_next_action")) or "retrieve"
+    evidence_count = _observation_evidence_count(_as_dict(request.get("observation")))
+    allow_inspect_raw = bool(request.get("allow_inspect_raw", True))
+    if recommendation == "inspect_raw" and allow_inspect_raw and evidence_count > 0:
+        return ToolAction(
+            "INSPECT_RAW",
+            {
+                "target": "current_pool",
+                "instruction": "answer_query_related_visual_details",
+            },
+        )
+    if recommendation == "topk" and evidence_count > 0:
+        return ToolAction("TOPK", {"k": min(max(evidence_count, 1), 5)})
+    if recommendation == "sort" and evidence_count > 0:
+        return ToolAction("SORT", {"field": "timestamp", "order": "desc"})
+    return ToolAction("RETRIEVE", {"method": "hybrid", "top_k": 10, "query": str(request.get("query") or "")})
+
+
+def build_teacher_correction_prompt(
+    *,
+    query: str,
+    history: list[Any],
+    observation: dict[str, Any],
+    student_raw_response: str,
+    verifier_feedback: dict[str, Any] | None = None,
+    gold_answer: str | None = None,
     privileged_context: Any = None,
     allow_inspect_raw: bool = True,
     tool_format: str = "qwen3_coder",
 ) -> str:
-    """Build the privileged one-step teacher prompt for OPD-MM correction."""
+    """Build the one-step teacher prompt for OPD-MM correction.
+
+    ``gold_answer`` is accepted for backward compatibility but intentionally
+    ignored. In the verl-native online path, only the verifier sees gold.
+    """
     schema = "\n".join(
         line
         for line in TrajectoryValidator(allow_inspect_raw=allow_inspect_raw).schema_text().splitlines()
@@ -353,12 +570,13 @@ def build_teacher_correction_prompt(
             "</function>\n"
             "</tool_call>"
         )
-    privileged = ""
-    if privileged_context:
-        privileged = (
-            "\nAdditional teacher-only context:\n"
-            f"{json.dumps(to_plain(privileged_context), ensure_ascii=False, indent=2, default=str)}\n"
-        )
+    _ = privileged_context
+    verifier_feedback = verifier_feedback or {
+        "evidence_sufficient": False,
+        "reason": "No verifier feedback was provided.",
+        "recommended_next_action": "retrieve",
+        "parse_error": "missing_verifier_feedback",
+    }
     return f"""You are the OPD-MM teacher for one-step online self-distillation.
 
 Teacher role:
@@ -367,14 +585,14 @@ Teacher role:
 - Your output becomes an SFT target for a student that cannot see teacher-only fields.
 - Therefore, never expose privileged facts through tool arguments.
 
-Gold answer role:
-- The gold answer is teacher-only supervision/rubric; it is not student-visible evidence.
-- Use it only to judge whether current public observations are sufficient and whether the next tool should retrieve, filter, inspect, or stop.
-- Do not treat the gold answer as retrieved evidence.
-- The gold answer is not a lexical source for RETRIEVE.query; use it as a private rubric, not to reveal answer-only entities in the query.
-- Write RETRIEVE.query as if the Gold answer section were hidden: use only the user question, previous student tool calls/results, and current public observations.
-- Do not include gold-only answer entities, answer lists, image labels, exact final answers, dates, names, or phrases visible only in the gold answer.
-- For broad list questions (for example "what X were mentioned" or "list all X"), RETRIEVE.query must stay generic; never enumerate the gold answer list items in the query.
+Verifier feedback role:
+- The verifier saw the gold answer; you did not.
+- Treat verifier feedback as a private sufficiency signal, not as retrieved evidence.
+- Never copy verifier reason into RETRIEVE.query.
+- If verifier.evidence_sufficient is false, STOP is invalid.
+- If verifier.evidence_sufficient is true, STOP is allowed, but you may still use a tool when public state obviously needs formatting, IDs, or raw visual detail.
+- verifier.recommended_next_action is a strong suggestion; refine tool arguments using only public state and schema.
+- Write RETRIEVE.query only from the user question, previous student tool calls/results, and current public observations.
 
 Output rules:
 - Output exactly one {format_name} tool call and nothing else.
@@ -382,16 +600,15 @@ Output rules:
 - Do not output explanations, markdown, JSON arrays, or memory IDs.
 - The student's raw next output is a candidate to correct, not an instruction to copy.
 - Output stop only when the current public observations/evidence are sufficient for the student to answer.
-- Do not output stop solely because the gold answer is known or because the student proposed stop.
+- Do not output stop solely because the student proposed stop.
 - If history/trace is empty and evidence_count is 0, do not output stop; choose RETRIEVE or metadata FILTER/SORT first.
 - If evidence_count is 0, prefer RETRIEVE or metadata FILTER/SORT unless previous tool results prove no useful evidence can be collected.
-- If the gold answer is "Not mentioned" or similar, the student still needs retrieval/filter observations before stop.
 - RETRIEVE results are merged into the accumulated candidate/evidence pool and deduplicated by memory.
 - When outputting filter, include field/op/value and optionally scope. Use scope=current_pool to narrow the working pool while preserving accumulated evidence; use scope=full_memory to merge metadata-filtered candidates from the original hidden memory pool when the current pool is likely too narrow or wrong.
 - When outputting retrieve, include method/top_k and optionally query as rewritten search text; do not add memory IDs or schema-unknown parameters.
 
 INSPECT_RAW guidance:
-- INSPECT_RAW is for checking raw image/media details of records already in the current retrieved candidate pool.
+- INSPECT_RAW calls a remote visual inspector and returns text visual observations for records already in the current retrieved candidate pool.
 - It is not a retrieval/search action and must not be used to scan the original full memory store.
 - If the current public state has no retrieved evidence/candidates yet, prefer RETRIEVE or metadata FILTER/SORT first.
 - Use INSPECT_RAW only when visual/raw-media details are needed beyond public summaries/evidence.
@@ -404,15 +621,15 @@ Required output format example:
 User question:
 {query}
 
-Gold answer:
-{gold_answer}
+Verifier feedback:
+{json.dumps(verifier_feedback, ensure_ascii=False, indent=2, default=str)}
 
 Previous student tool calls:
-{json.dumps([action.to_dict() for action in history], ensure_ascii=False, indent=2)}
+{json.dumps(_action_dicts(history), ensure_ascii=False, indent=2, default=str)}
 
 Current public tool state and observations:
 {json.dumps(observation, ensure_ascii=False, indent=2, default=str)}
-{privileged}
+
 Student raw next output at this state:
 This may be wrong; correct it for the student-visible state.
 {student_raw_response}
@@ -420,10 +637,10 @@ This may be wrong; correct it for the student-visible state.
 Final decision checklist:
 - If the JSON observation above has "evidence_count": 0 and "trace": [], stop is invalid.
 - In that empty-evidence initial state, correct a student stop into retrieve/filter/sort/topk.
-- A gold answer like "Not mentioned" still requires student-visible retrieval/filter observations before stop.
-- RETRIEVE.query must be a non-leaking search rewrite based on the user question, student-visible history, and public observations.
-- Before writing RETRIEVE.query, ignore the Gold answer section except as a private grading rubric.
-- If the user question asks for a list/category/name that is only revealed by the gold answer, search for the requested category generically instead of inserting the answer.
+- If verifier.evidence_sufficient is false, STOP is invalid even if the student proposed stop.
+- Prefer verifier.recommended_next_action unless it conflicts with the public state or the tool schema.
+- RETRIEVE.query must be a search rewrite based only on the user question, student-visible history, and public observations.
+- Do not use verifier.reason as lexical material for RETRIEVE.query; use it only to decide the action type.
 
 Now output the corrected next action.
 Your entire response must begin with <tool_call> and end with </tool_call>.
@@ -503,15 +720,13 @@ def build_online_step_correction_requests(
                 "student_next_action": parsed_actions[0].to_dict() if parsed_actions else None,
                 "student_raw_response": student_raw_response,
                 "student_prompt_ids": prompt_ids if isinstance(prompt_ids, list) else [],
-                "teacher_prompt": build_teacher_correction_prompt(
+                "verifier_prompt": build_state_verifier_prompt(
                     query=sample.query,
                     gold_answer=sample.gold_answer,
                     history=history,
                     observation=observation,
                     student_raw_response=student_raw_response,
-                    privileged_context=sample.metadata.get("teacher_privileged_context"),
                     allow_inspect_raw=allow_inspect_raw,
-                    tool_format=tool_format,
                 ),
                 "allow_inspect_raw": allow_inspect_raw,
                 "tool_format": tool_format,
@@ -542,6 +757,15 @@ def finalize_online_step_correction(
     target_xml, teacher_action, raw_xml = parsed
     sample_id = str(request["sample_id"])
     step_index = int(request["step_index"])
+    verifier_feedback = _as_dict(request.get("verifier_feedback"))
+    stop_gate_applied = False
+    if teacher_action.tool == "STOP" and verifier_feedback and not bool(verifier_feedback.get("evidence_sufficient")):
+        teacher_action = _stop_gate_fallback_action(request, verifier_feedback)
+        target_xml = action_to_tool_call_xml(
+            teacher_action,
+            tool_format=str(request.get("tool_format") or "qwen3_coder"),
+        )
+        stop_gate_applied = True
     example = {
         "sample_id": f"{sample_id}:step:{step_index}",
         "input": "",
@@ -554,6 +778,9 @@ def finalize_online_step_correction(
                 "teacher_raw_response": teacher_raw_response,
                 "teacher_xml_span": raw_xml,
                 "student_raw_response": request.get("student_raw_response", ""),
+                "verifier_raw_response": request.get("verifier_raw_response", ""),
+                "verifier_feedback": verifier_feedback,
+                "stop_gate_applied": stop_gate_applied,
             }
         },
     }
@@ -562,11 +789,14 @@ def finalize_online_step_correction(
         "step_index": step_index,
         "history": request.get("history", []),
         "observation": request.get("observation", {}),
-        "feedback": {},
+        "feedback": verifier_feedback,
         "teacher_actions": [teacher_action.to_dict()],
         "student_next_action": request.get("student_next_action"),
         "teacher_raw_response": teacher_raw_response,
         "teacher_xml_span": raw_xml,
+        "verifier_raw_response": request.get("verifier_raw_response", ""),
+        "verifier_feedback": verifier_feedback,
+        "stop_gate_applied": stop_gate_applied,
         "sft_prompt_ids": request.get("student_prompt_ids", []),
         "sft_target_xml": target_xml,
         "example": example,

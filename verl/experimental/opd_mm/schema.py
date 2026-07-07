@@ -74,8 +74,8 @@ def build_tool_schema(allow_inspect_raw: bool = True) -> str:
         lines[stop_index:stop_index] = [
             "INSPECT_RAW(target=current_pool,",
             "            instruction=answer_query_related_visual_details)",
-            "# INSPECT_RAW opens raw media only for the current retrieved candidate pool;",
-            "# it is not a search over the original full memory store.",
+            "# INSPECT_RAW calls a visual inspector only for the current retrieved candidate pool;",
+            "# it returns text observations and is not a search over the original full memory store.",
         ]
     return "\n".join(lines)
 

@@ -75,9 +75,10 @@ Retrieval tools and when to use them:
   like latest, earliest, last, first, before, or after.
 - TOPK: Use this after RETRIEVE, FILTER, or SORT to keep a small candidate set. Prefer a small k
   when the next step should inspect only the strongest or most recent candidates.
-- INSPECT_RAW: Open the raw image/media for records in the current retrieved candidate pool when public
-  summaries/evidence are insufficient for visual details. It is not a search tool and does not inspect the
-  original full memory store; first retrieve/narrow candidates, then inspect raw content only if needed.
+- INSPECT_RAW: Call a remote visual inspector on raw image/media for records in the current retrieved candidate
+  pool when public summaries/evidence are insufficient for visual details. It returns text visual observations,
+  not memory IDs. It is not a search tool and does not inspect the original full memory store; first
+  retrieve/narrow candidates, then inspect raw content only if needed.
 - STOP: Use this when you have enough evidence to answer, when further retrieval is unlikely to help, or when
   the tool observations indicate an unrecoverable error.
 

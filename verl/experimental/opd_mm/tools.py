@@ -31,6 +31,7 @@ from typing import Any, Optional
 
 from verl.experimental.opd_mm.executor import ToolExecutor
 from verl.experimental.opd_mm.models import EvidenceItem, ExecutionStep, MemoryRecord, PoolItem, ToolAction
+from verl.experimental.opd_mm.raw_inspector import DEFAULT_RAW_INSPECTOR_URL, RemoteVLLMRawInspector
 from verl.experimental.opd_mm.retrieval import HiddenMemoryStore, TurnAwareHybridRetriever
 from verl.experimental.opd_mm.schema import (
     FILTER_FIELDS,
@@ -52,6 +53,8 @@ DEFAULT_VECTOR_STORE_DIR = "dataset/mem_gallery/opd_mm_store"
 DEFAULT_DENSE_MODEL_PATH = "/home/miaofy/data/pretrained_models/all-MiniLM-L6-v2"
 DEFAULT_VISION_MODEL_PATH = "/home/miaofy/data/pretrained_models/SigLIP-Base-Patch16-384"
 DEFAULT_HYBRID_MODEL_PATH = "/home/miaofy/data/pretrained_models/gme-Qwen2-VL-2B-Instruct"
+DEFAULT_RAW_INSPECTOR_TIMEOUT = 60.0
+DEFAULT_RAW_INSPECTOR_MAX_TOKENS = 256
 
 
 def _property(type_: str | list[str], description: str, enum: Optional[list[Any]] = None) -> dict[str, Any]:
@@ -80,6 +83,54 @@ def _schema(
                 },
             },
         }
+    )
+
+
+def _optional_str(value: Any) -> str:
+    if value is None:
+        return ""
+    text = str(value).strip()
+    return "" if text.lower() in {"", "none", "null", "false", "0"} else text
+
+
+@lru_cache(maxsize=16)
+def _cached_remote_raw_inspector(
+    base_url: str,
+    model: str,
+    api_key: str,
+    timeout: float,
+    max_tokens: int,
+    temperature: float,
+) -> RemoteVLLMRawInspector:
+    return RemoteVLLMRawInspector(
+        base_url=base_url,
+        model=model or None,
+        api_key=api_key or None,
+        timeout=timeout,
+        max_tokens=max_tokens,
+        temperature=temperature,
+    )
+
+
+def _raw_inspector_from_runtime(runtime: dict[str, Any]) -> Any:
+    if runtime.get("raw_inspector") is not None:
+        return runtime["raw_inspector"]
+    if not bool(runtime.get("allow_inspect_raw", True)):
+        return None
+    base_url = (
+        _optional_str(runtime.get("raw_inspector_url"))
+        or _optional_str(os.getenv("OPD_MM_RAW_INSPECTOR_URL"))
+        or DEFAULT_RAW_INSPECTOR_URL
+    )
+    if not base_url:
+        return None
+    return _cached_remote_raw_inspector(
+        base_url,
+        _optional_str(runtime.get("raw_inspector_model")) or _optional_str(os.getenv("OPD_MM_RAW_INSPECTOR_MODEL")),
+        _optional_str(runtime.get("raw_inspector_api_key")) or _optional_str(os.getenv("OPD_MM_RAW_INSPECTOR_API_KEY")),
+        float(runtime.get("raw_inspector_timeout") or os.getenv("OPD_MM_RAW_INSPECTOR_TIMEOUT") or DEFAULT_RAW_INSPECTOR_TIMEOUT),
+        int(runtime.get("raw_inspector_max_tokens") or os.getenv("OPD_MM_RAW_INSPECTOR_MAX_TOKENS") or DEFAULT_RAW_INSPECTOR_MAX_TOKENS),
+        float(runtime.get("raw_inspector_temperature") or os.getenv("OPD_MM_RAW_INSPECTOR_TEMPERATURE") or 0.0),
     )
 
 
@@ -547,7 +598,7 @@ class OPDBaseTool(BaseTool):
         session = OPDToolSession(
             executor=ToolExecutor(
                 retriever=runtime.get("retriever") or TurnAwareHybridRetriever(),
-                raw_inspector=runtime.get("raw_inspector"),
+                raw_inspector=_raw_inspector_from_runtime(runtime),
                 validator=runtime.get("validator") or TrajectoryValidator(
                     max_actions=int(runtime.get("max_actions", 8)),
                     max_top_k=int(runtime.get("max_top_k", 50)),
