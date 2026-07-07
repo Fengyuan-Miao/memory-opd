@@ -1085,6 +1085,8 @@ class AgentLoopWorker:
                     verifier_feedback = parse_state_verifier_feedback(
                         verifier_raw_response,
                         request.get("observation", {}),
+                        gold_answer=str(request.get("gold_answer", "")),
+                        query=str(request.get("query", "")),
                     )
                     request["verifier_raw_response"] = verifier_raw_response
                     request["verifier_feedback"] = verifier_feedback

@@ -893,7 +893,11 @@ def test_online_xml_correction_requests_include_invalid_student_state() -> None:
     assert requests[0]["student_next_action"] is None
     assert "teacher_prompt" not in requests[0]
     assert "You are the OPD-MM state verifier" in requests[0]["verifier_prompt"]
-    assert "Gold answer (private rubric" in requests[0]["verifier_prompt"]
+    assert "Private rubric:" in requests[0]["verifier_prompt"]
+    assert "Tool/action guide:" in requests[0]["verifier_prompt"]
+    assert "retrieve(method=bm25|dense|vision|hybrid" in requests[0]["verifier_prompt"]
+    assert "filter(field=modality|author|source_type|timestamp|status" in requests[0]["verifier_prompt"]
+    assert "inspect_raw(target=current_pool" in requests[0]["verifier_prompt"]
     assert "SECRET_GOLD_ANSWER" in requests[0]["verifier_prompt"]
 
     verifier_feedback = {
@@ -964,6 +968,23 @@ def test_state_verifier_feedback_parser_accepts_wrapped_json_and_blocks_stop() -
     assert feedback["evidence_sufficient"] is False
     assert feedback["recommended_next_action"] == "retrieve"
     assert feedback["parse_error"] == ""
+
+
+def test_state_verifier_feedback_sanitizes_gold_answer_leakage() -> None:
+    feedback = parse_state_verifier_feedback(
+        '{"evidence_sufficient": false, '
+        "\"reason\": \"No evidence found mentioning Lena's brother or a cat named Miso.\", "
+        '"recommended_next_action": "retrieve"}',
+        {"evidence_count": 0},
+        gold_answer="Miso",
+        query="What is the name of Lena’s brother’s cat?",
+    )
+
+    assert feedback["evidence_sufficient"] is False
+    assert feedback["recommended_next_action"] == "retrieve"
+    assert "Miso" not in feedback["reason"]
+    assert "gold answer" not in feedback["reason"].lower()
+    assert feedback["reason"] == "Current public evidence is insufficient; collect relevant evidence first."
 
 
 def test_state_verifier_feedback_parser_falls_back_on_invalid_action() -> None:

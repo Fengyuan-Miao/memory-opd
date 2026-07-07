@@ -187,6 +187,89 @@ def _verifier_parse_fallback(error: Exception | str) -> dict[str, Any]:
     }
 
 
+_GENERIC_GOLD_ANSWERS = {"yes", "no", "none", "unknown", "not mentioned", "no mention"}
+
+
+def _normalize_leak_text(value: Any) -> str:
+    text = re.sub(r"[^\w\s]", " ", str(value or "").casefold())
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def _gold_answer_fragments(gold_answer: str) -> list[str]:
+    fragments: list[str] = []
+    text = str(gold_answer or "").strip()
+    if text:
+        fragments.append(text)
+    fragments.extend(part.strip() for part in re.split(r"[,;|\n]+", text) if part.strip())
+    seen: set[str] = set()
+    result: list[str] = []
+    for fragment in fragments:
+        normalized = _normalize_leak_text(fragment)
+        if len(normalized) < 4 or normalized in _GENERIC_GOLD_ANSWERS or normalized in seen:
+            continue
+        seen.add(normalized)
+        result.append(fragment)
+    return result
+
+
+def _reason_leaks_private_answer(*, reason: str, gold_answer: str, query: str) -> bool:
+    reason_norm = _normalize_leak_text(reason)
+    query_norm = _normalize_leak_text(query)
+    if not reason_norm:
+        return False
+    if "gold answer" in reason_norm or "private rubric" in reason_norm:
+        return True
+    for fragment in _gold_answer_fragments(gold_answer):
+        fragment_norm = _normalize_leak_text(fragment)
+        if not fragment_norm or fragment_norm in query_norm:
+            continue
+        if fragment_norm in reason_norm:
+            return True
+        tokens = [token for token in fragment_norm.split() if len(token) > 3]
+        if len(tokens) >= 2 and all(token in reason_norm for token in tokens):
+            return True
+    return False
+
+
+def _generic_verifier_reason(*, evidence_sufficient: bool, action: str, evidence_count: int) -> str:
+    if evidence_sufficient:
+        return "Current public evidence appears sufficient for the answer model to answer."
+    if evidence_count <= 0:
+        return "Current public evidence is insufficient; collect relevant evidence first."
+    if action == "filter":
+        return "Current public evidence needs metadata narrowing before answering."
+    if action == "sort":
+        return "Current public evidence needs timestamp, order, or ranking evidence before answering."
+    if action == "topk":
+        return "Current public evidence needs a smaller focused candidate set before answering."
+    if action == "inspect_raw":
+        return "Current public evidence needs raw visual details from retrieved candidates."
+    return "Current public evidence is insufficient; retrieve more relevant evidence."
+
+
+def _sanitize_verifier_reason(
+    reason: str,
+    *,
+    gold_answer: str = "",
+    query: str = "",
+    evidence_sufficient: bool,
+    action: str,
+    evidence_count: int,
+) -> str:
+    reason = str(reason or "").strip()
+    if _reason_leaks_private_answer(reason=reason, gold_answer=gold_answer, query=query):
+        return _generic_verifier_reason(
+            evidence_sufficient=evidence_sufficient,
+            action=action,
+            evidence_count=evidence_count,
+        )
+    return (reason or _generic_verifier_reason(
+        evidence_sufficient=evidence_sufficient,
+        action=action,
+        evidence_count=evidence_count,
+    ))[:1000]
+
+
 def _teacher_cache_key(class_path: str, kwargs: dict[str, Any]) -> tuple[str, str]:
     return class_path, json.dumps(kwargs, sort_keys=True, default=str)
 
@@ -426,40 +509,47 @@ def build_state_verifier_prompt(
         if allow_inspect_raw
         else "retrieve|filter|sort|topk|stop"
     )
-    inspect_rule = (
-        "- For image/name/ID questions, require visual or image-ID evidence; recommend inspect_raw when raw visual "
-        "details are needed and retrieved candidates already exist."
+    inspect_tool_line = (
+        "- inspect_raw(target=current_pool, instruction=answer_query_related_visual_details): "
+        "use only after candidates exist and raw visual details are needed; it is not search."
         if allow_inspect_raw
-        else "- For image/name/ID questions, require visual or image-ID evidence from retrieval results."
+        else ""
     )
     return f"""You are the OPD-MM state verifier.
 
-Your job is to judge whether the current public retrieved evidence is sufficient
-for a separate answer model to answer the user question correctly.
+Goal: decide whether the current public evidence is enough for a separate answer
+model to answer the user question, then recommend exactly one next action type.
 
-You may see the gold answer only as a private rubric.
-Do not quote, paraphrase, enumerate, or reveal any gold-only answer content.
-Do not include exact gold-only names, dates, image IDs, labels, or list items in your output.
-Do not rewrite the answer into a search query.
+Private rubric: you may use the gold answer only to judge sufficiency. Your JSON
+will be shown to the teacher, so never mention gold answer content, gold-only
+entities, dates, IDs, labels, list items, or the phrase "gold answer".
 
-Return only valid JSON with this exact shape:
+Return JSON only:
 {{
   "evidence_sufficient": boolean,
   "reason": "short non-leaking reason",
   "recommended_next_action": "{allowed_actions}"
 }}
 
-Guidelines:
-- If evidence_count is 0, evidence_sufficient=false and recommend retrieve/filter/sort.
-- For list/all/multi-fact questions, evidence is sufficient only if the evidence covers the complete requested set.
-- For temporal/order/latest questions, require enough timestamp/order evidence.
-{inspect_rule}
-- For conflict/not-mentioned questions, require enough relevant evidence to support absence or contradiction.
-- If evidence is insufficient, recommended_next_action must not be stop.
-- The reason may describe missing evidence type only, such as needing broader coverage, timestamp/order evidence,
-  image-ID evidence, raw visual detail, or contradiction/absence support.
-- recommended_next_action is only an action type; never output tool parameters, rewritten queries, IDs, names, dates, or answer items.
-- JSON only. No markdown.
+Tool/action guide:
+- retrieve(method=bm25|dense|vision|hybrid, top_k, query): use to collect new evidence.
+  bm25 fits exact names, dates, IDs, quoted phrases; dense fits semantic text;
+  vision fits visual/question-image matching; hybrid fits mixed text+visual or uncertainty.
+- filter(field=modality|author|source_type|timestamp|status, op=..., value=..., scope=...):
+  use for explicit metadata constraints. scope=full_memory starts/expands from memory;
+  scope=current_pool narrows existing candidates.
+- sort(field=timestamp|turn_id|score, order=asc|desc): use for latest/earliest/order/ranking questions.
+- topk(k): use when candidates exist but need a smaller focused pool.
+{inspect_tool_line}
+- stop: use only when public evidence is sufficient.
+
+Decision rules:
+- If evidence_count is 0: evidence_sufficient=false; recommend retrieve/filter/sort, never stop/topk/inspect_raw.
+- List/all questions require complete set coverage.
+- Temporal/latest questions require timestamp/order evidence.
+- Visual identity/detail questions require visual evidence; use inspect_raw only after retrieval.
+- Absence/conflict questions require enough relevant evidence to support absence or contradiction.
+- recommended_next_action is only the action type; do not output parameters or query rewrites.
 
 User question:
 {query}
@@ -478,7 +568,13 @@ Student raw next output at this state:
 """
 
 
-def parse_state_verifier_feedback(raw_response: str, observation: dict[str, Any]) -> dict[str, Any]:
+def parse_state_verifier_feedback(
+    raw_response: str,
+    observation: dict[str, Any],
+    *,
+    gold_answer: str = "",
+    query: str = "",
+) -> dict[str, Any]:
     """Parse verifier JSON and enforce non-STOP fallback gates."""
     try:
         payload = _extract_json_object(raw_response)
@@ -503,6 +599,14 @@ def parse_state_verifier_feedback(raw_response: str, observation: dict[str, Any]
         if not evidence_sufficient and action == "stop":
             action = "retrieve"
             reason = reason or "Evidence is insufficient, so another tool action is required."
+        reason = _sanitize_verifier_reason(
+            reason,
+            gold_answer=gold_answer,
+            query=query,
+            evidence_sufficient=bool(evidence_sufficient),
+            action=action,
+            evidence_count=evidence_count,
+        )
         return {
             "evidence_sufficient": bool(evidence_sufficient),
             "reason": reason[:1000],
