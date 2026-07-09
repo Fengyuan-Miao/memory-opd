@@ -1184,6 +1184,94 @@ def test_teacher_xml_correction_recovers_unclosed_rewritten_retrieve_query() -> 
     assert target_xml.endswith("</tool_call>")
 
 
+def test_teacher_xml_correction_repairs_missing_parameter_closes_and_aliases() -> None:
+    parsed = extract_canonical_tool_call_xml(
+        "<tool_call>\n"
+        "<function=filter>\n"
+        "<parameter=field>\n"
+        "session_date\n"
+        "<parameter=op>\n"
+        "equals\n"
+        "<parameter=value>\n"
+        "2024-09-28\n"
+        "<parameter=scope>\n"
+        "current_pool\n"
+        "</parameter>\n"
+        "</function>\n"
+        "</tool_call><|im_end|>"
+    )
+
+    assert parsed is not None
+    target_xml, action, _ = parsed
+    assert action.tool == "FILTER"
+    assert action.arguments == {
+        "field": "timestamp",
+        "op": "eq",
+        "value": "2024-09-28",
+        "scope": "current_pool",
+    }
+    assert "<parameter=field>\ntimestamp\n</parameter>" in target_xml
+    assert "<parameter=op>\neq\n</parameter>" in target_xml
+
+
+def test_teacher_xml_correction_rejects_defaultable_empty_calls() -> None:
+    assert extract_canonical_tool_call_xml(
+        "<tool_call>\n<function=retrieve>\n</function>\n</tool_call>"
+    ) is None
+    assert extract_canonical_tool_call_xml(
+        "<tool_call>\n<function=inspect_raw>\n</function>\n</tool_call>"
+    ) is None
+
+
+def test_teacher_xml_correction_recovers_explicit_nonstandard_argument_lines() -> None:
+    retrieve = extract_canonical_tool_call_xml(
+        "<tool_call>\n"
+        "<function=retrieve>\n"
+        "method=hybrid,\n"
+        "top_k=10,\n"
+        "query=Maya baking alone child help conversation\n"
+        "</function>\n"
+        "</tool_call>"
+    )
+    inspect = extract_canonical_tool_call_xml(
+        "<tool_call>\n"
+        "<function=inspect_raw>\n"
+        'target="current_pool",\n'
+        'instruction="answer_query_related_visual_details"\n'
+        "</function>\n"
+        "</tool_call>"
+    )
+    mixed_filter = extract_canonical_tool_call_xml(
+        "<tool_call>\n"
+        "<function=filter>\n"
+        "<field=session_date>\n"
+        "op=eq\n"
+        "value=2024-09-28\n"
+        "scope=current_pool\n"
+        "</function>\n"
+        "</tool_call>"
+    )
+
+    assert retrieve is not None
+    assert retrieve[1].arguments == {
+        "method": "hybrid",
+        "top_k": 10,
+        "query": "Maya baking alone child help conversation",
+    }
+    assert inspect is not None
+    assert inspect[1].arguments == {
+        "target": "current_pool",
+        "instruction": "answer_query_related_visual_details",
+    }
+    assert mixed_filter is not None
+    assert mixed_filter[1].arguments == {
+        "field": "timestamp",
+        "op": "eq",
+        "value": "2024-09-28",
+        "scope": "current_pool",
+    }
+
+
 def test_live_online_state_request_uses_current_state_without_snapshot_replay() -> None:
     request = build_online_state_correction_request(
         sample_kwargs={

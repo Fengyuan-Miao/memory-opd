@@ -39,7 +39,15 @@ from verl.utils.import_utils import load_class_from_fqn
 _TEACHER_CACHE: dict[tuple[str, str], Any] = {}
 HERMES_TOOL_CALL_XML_RE = re.compile(r"<tool_call>(.*?)</tool_call>", re.DOTALL)
 QWEN3_FUNCTION_RE = re.compile(r"<function=(.*?)</function>|<function=(.*)$", re.DOTALL)
-QWEN3_PARAMETER_RE = re.compile(r"<parameter=(.*?)</parameter>|<parameter=(.*)$", re.DOTALL)
+QWEN3_PARAMETER_START_RE = re.compile(r"<parameter=([^>\n]+)>", re.DOTALL)
+QWEN3_INLINE_XML_ARG_RE = re.compile(
+    r"<(field|op|value|scope|method|top_k|query|target|instruction|window|k|order)=([^>\n]+)>",
+    re.IGNORECASE,
+)
+QWEN3_KEY_VALUE_ARG_RE = re.compile(
+    r'["\']?([A-Za-z_][\w]*)["\']?\s*(?:=|:)\s*("[^"]*"|\'[^\']*\'|[^,\n}\r]+)',
+    re.DOTALL,
+)
 _TOOL_CALL_NAME_BY_ACTION = {
     "FILTER": "filter",
     "SORT": "sort",
@@ -506,6 +514,109 @@ def _coerce_qwen3_parameter_value(value: str) -> Any:
     return value
 
 
+def _parse_qwen3_parameters_lenient(parameters: str) -> dict[str, Any]:
+    """Parse Qwen function XML parameters, including common missing-close cases.
+
+    Frozen teacher outputs often contain:
+
+    ``<parameter=field>\ntimestamp\n<parameter=op>\neq``
+
+    instead of closing every parameter.  Since OPD-MM tool arguments are scalar,
+    the next ``<parameter=...>`` marker is a reliable boundary.
+    """
+    matches = list(QWEN3_PARAMETER_START_RE.finditer(parameters or ""))
+    arguments: dict[str, Any] = {}
+    for index, match in enumerate(matches):
+        key = match.group(1).strip()
+        if not key:
+            continue
+        start = match.end()
+        end = matches[index + 1].start() if index + 1 < len(matches) else len(parameters)
+        value = parameters[start:end]
+        for marker in ("</parameter>", "</function>", "</tool_call>", "<|im_end|>"):
+            marker_index = value.find(marker)
+            if marker_index >= 0:
+                value = value[:marker_index]
+        value = re.sub(r"</\s*>?\s*$", "", value).strip()
+        if value:
+            arguments[key] = _coerce_qwen3_parameter_value(value)
+    if arguments:
+        return arguments
+
+    text = parameters or ""
+    for marker in ("</function>", "</tool_call>", "<|im_end|>"):
+        marker_index = text.find(marker)
+        if marker_index >= 0:
+            text = text[:marker_index]
+    text = re.sub(r"</\s*>?\s*$", "", text).strip()
+
+    for match in QWEN3_INLINE_XML_ARG_RE.finditer(text):
+        key = match.group(1).strip()
+        value = match.group(2).strip().strip("\"'")
+        if key and value:
+            arguments[key] = _coerce_qwen3_parameter_value(value)
+
+    for match in QWEN3_KEY_VALUE_ARG_RE.finditer(text):
+        key = match.group(1).strip()
+        value = match.group(2).strip().strip().strip(",").strip()
+        value = value.strip("\"'").rstrip(">").strip()
+        if key and value and key not in arguments:
+            arguments[key] = _coerce_qwen3_parameter_value(value)
+    return arguments
+
+
+def _normalize_teacher_tool_action(action: ToolAction) -> ToolAction:
+    """Normalize teacher tool calls before validation/canonical SFT export."""
+    tool = action.tool.upper()
+    args = dict(action.arguments)
+    if tool == "RETRIEVE":
+        if "method" in args:
+            method = str(args["method"]).strip().lower()
+            method_aliases = {"semantic": "dense", "visual": "vision", "dyne": "dense"}
+            args["method"] = method_aliases.get(method, method)
+    elif tool == "FILTER":
+        field = str(args.get("field") or "").strip().lower()
+        field_aliases = {
+            "date": "timestamp",
+            "session_date": "timestamp",
+            "time": "timestamp",
+            "speaker": "author",
+            "role": "author",
+            "type": "modality",
+        }
+        if field:
+            args["field"] = field_aliases.get(field, field)
+        op = str(args.get("op") or "").strip().lower()
+        op_aliases = {"=": "eq", "==": "eq", "equals": "eq", "equal": "eq", "not_equal": "neq", "!=": "neq"}
+        if op:
+            args["op"] = op_aliases.get(op, op)
+        if "scope" in args:
+            args["scope"] = str(args["scope"]).strip().lower()
+    elif tool == "SORT":
+        if "field" in args:
+            field = str(args["field"]).strip().lower()
+            args["field"] = "timestamp" if field in {"date", "session_date", "time"} else field
+        if "order" in args:
+            args["order"] = str(args["order"]).strip().lower()
+    elif tool == "INSPECT_RAW":
+        if "target" in args:
+            args["target"] = str(args["target"]).strip().lower()
+        if "instruction" in args:
+            args["instruction"] = str(args["instruction"]).strip()
+    return ToolAction(tool, args)
+
+
+def _has_explicit_teacher_sft_arguments(action: ToolAction) -> bool:
+    """Require teacher targets to spell out arguments we want the student to learn."""
+    tool = action.tool.upper()
+    args = action.arguments
+    if tool == "RETRIEVE":
+        return "method" in args and "top_k" in args
+    if tool == "INSPECT_RAW":
+        return "target" in args and "instruction" in args
+    return True
+
+
 def _parse_hermes_action_from_xml(raw_xml: str) -> ToolAction | None:
     match = HERMES_TOOL_CALL_XML_RE.search(raw_xml or "")
     if match is None:
@@ -536,15 +647,7 @@ def _parse_qwen3_action_from_xml(raw_xml: str) -> ToolAction | None:
         end_index = function_body.index(">")
         name = function_body[:end_index].strip()
         parameters = function_body[end_index + 1 :]
-        arguments: dict[str, Any] = {}
-        for parameter_match in QWEN3_PARAMETER_RE.findall(parameters):
-            parameter_body = parameter_match[0] or parameter_match[1]
-            if not parameter_body or ">" not in parameter_body:
-                continue
-            parameter_end = parameter_body.index(">")
-            key = parameter_body[:parameter_end].strip()
-            value = parameter_body[parameter_end + 1 :]
-            arguments[key] = _coerce_qwen3_parameter_value(value)
+        arguments = _parse_qwen3_parameters_lenient(parameters)
         return ToolAction(str(name).upper(), arguments)
     return None
 
@@ -566,9 +669,12 @@ def extract_canonical_tool_call_xml(
         action = _parse_qwen3_action_from_xml(raw_xml) or _parse_hermes_action_from_xml(raw_xml)
         if action is None:
             return None
+        action = _normalize_teacher_tool_action(action)
         try:
             validator._validate_action(action, 0)
         except Exception:
+            return None
+        if not _has_explicit_teacher_sft_arguments(action):
             return None
         return action_to_tool_call_xml(action, tool_format=tool_format), action, raw_xml
 
@@ -816,11 +922,17 @@ Output rules:
 - Use lower-case function names from the tool schema.
 - Function names must be one of: retrieve, filter, sort, topk, expand_neighbors, inspect_raw, stop.
 - Never output a function name or parameter name that is not listed in the tool schema.
+- For Qwen function XML, every parameter must have this exact closed form:
+  <parameter=name>
+  value
+  </parameter>
+- Never write partially closed tags like <parameter=field> value <parameter=op>, </, or </arg_value>.
 - Do not output explanations, markdown, JSON arrays, memory IDs, or private answer content.
 - The student's raw next output is a candidate to correct, not an instruction to copy.
 - RETRIEVE results are merged into the accumulated candidate/evidence pool and deduplicated by memory.
 - Do not use EXPAND_NEIGHBORS when there is no current candidate pool; retrieve or use metadata FILTER/SORT first.
 - When outputting filter, include field/op/value and optionally scope. Use scope=current_pool to narrow the working pool while preserving accumulated evidence; use scope=full_memory to merge metadata-filtered candidates from the original hidden memory pool when the current pool is likely too narrow or wrong.
+- Use field=timestamp for date/session-date constraints; do not invent field=session_date.
 - When outputting retrieve, include method/top_k and optionally query as rewritten search text; do not add memory IDs or schema-unknown parameters.
 - INSPECT_RAW reads raw media only from the current candidate pool; it is not search.
 
