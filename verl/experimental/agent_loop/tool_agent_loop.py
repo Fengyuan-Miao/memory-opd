@@ -217,7 +217,8 @@ class AgentData:
 
         # Temporary state for tool calls
         self.tool_calls: list[FunctionCall] = []
-        self.generation_snapshots: list[dict[str, Any]] = []
+        self.online_state_corrector: Any = None
+        self.teacher_raw_inspector: Any = None
 
         self.routed_experts = None
 
@@ -275,6 +276,8 @@ class ToolAgentLoop(AgentLoopBase):
             request_id=request_id,
             tools_kwargs=tools_kwargs,
         )
+        agent_data.online_state_corrector = kwargs.get("_opd_mm_online_state_corrector")
+        agent_data.teacher_raw_inspector = kwargs.get("_opd_mm_teacher_raw_inspector")
 
         # Per-sample tool selection: filter global tools by extra_info.tool_selection
         extra_info = kwargs.get("extra_info", {}) or {}
@@ -419,13 +422,11 @@ class ToolAgentLoop(AgentLoopBase):
         if output.routed_experts is not None:
             agent_data.routed_experts = output.routed_experts
 
-        # Check termination conditions
-        if not ignore_termination and len(agent_data.response_mask) >= self.response_length:
-            return AgentState.TERMINATED
-        if self.max_assistant_turns and agent_data.assistant_turns >= self.max_assistant_turns:
-            return AgentState.TERMINATED
-        if self.max_user_turns and agent_data.user_turns >= self.max_user_turns:
-            return AgentState.TERMINATED
+        terminate_after_generation = (
+            (not ignore_termination and len(agent_data.response_mask) >= self.response_length)
+            or (self.max_assistant_turns and agent_data.assistant_turns >= self.max_assistant_turns)
+            or (self.max_user_turns and agent_data.user_turns >= self.max_user_turns)
+        )
 
         # Extract tool calls (use per-sample tools if routed)
         active_tools = getattr(agent_data, "_active_tools", self.tools)
@@ -433,11 +434,10 @@ class ToolAgentLoop(AgentLoopBase):
         assistant_content, agent_data.tool_calls = await self.tool_parser.extract_tool_calls(
             agent_data.response_ids, tools
         )
-        self._append_generation_snapshot(
+        await self._collect_online_state_correction(
             agent_data=agent_data,
             state_prompt_ids=state_prompt_ids,
             response_ids=agent_data.response_ids,
-            distillation_mask=current_distillation_mask,
             assistant_content=assistant_content,
         )
         _dump_student_raw_output(
@@ -450,53 +450,80 @@ class ToolAgentLoop(AgentLoopBase):
         if self.enable_continuous_token:
             agent_data.messages.append(self._build_assistant_message(assistant_content, agent_data))
 
+        if terminate_after_generation:
+            return AgentState.TERMINATED
         if agent_data.tool_calls:
             return AgentState.PROCESSING_TOOLS
         else:
             return AgentState.TERMINATED
 
-    def _append_generation_snapshot(
+    async def _collect_online_state_correction(
         self,
         *,
         agent_data: AgentData,
         state_prompt_ids: list[int],
         response_ids: list[int],
-        distillation_mask: list[int],
         assistant_content: str,
     ) -> None:
-        """Save the student-visible decision state for online OPD-MM correction.
+        """Collect one teacher correction from the live student-visible state."""
+        corrector = agent_data.online_state_corrector
+        if corrector is None:
+            return
 
-        The final rollout tensor must keep one row per original prompt, so
-        state-level correction examples are carried through ``extra_fields`` and
-        expanded later in the trainer's actor-update path.
-        """
+        observation = agent_data.extra_fields.get("opd_mm")
+        if not isinstance(observation, dict):
+            observation = {
+                "pool_count": 0,
+                "evidence_count": 0,
+                "pool_preview": [],
+                "evidence": [],
+                "trace": [],
+                "stopped": False,
+                "error": "",
+                "raw_inspection_calls": 0,
+            }
+        else:
+            observation = dict(observation)
 
-        parsed_tool_calls = []
-        for tool_call in agent_data.tool_calls[: self.max_parallel_calls]:
+        student_next_action = None
+        if agent_data.tool_calls:
+            tool_call = agent_data.tool_calls[0]
             try:
                 arguments = json.loads(tool_call.arguments)
             except (TypeError, json.JSONDecodeError):
-                arguments = tool_call.arguments
-            parsed_tool_calls.append(
+                arguments = {"raw_arguments": tool_call.arguments}
+            if isinstance(arguments, dict):
+                student_next_action = {"tool": str(tool_call.name).upper(), **arguments}
+
+        multi_modal_data = {}
+        if agent_data.image_data is not None:
+            multi_modal_data["images"] = agent_data.image_data
+        if agent_data.video_data is not None:
+            multi_modal_data["videos"] = agent_data.video_data
+        if agent_data.audio_data is not None:
+            multi_modal_data["audios"] = agent_data.audio_data
+
+        try:
+            correction = await corrector(
                 {
-                    "name": tool_call.name,
-                    "arguments": arguments,
-                    "tool_call_id": tool_call.tool_call_id,
+                    "request_id": agent_data.request_id,
+                    "step_index": max(0, agent_data.assistant_turns - 1),
+                    "student_prompt_ids": list(state_prompt_ids),
+                    "student_raw_response": self.tokenizer.decode(response_ids, skip_special_tokens=False),
+                    "student_next_action": student_next_action,
+                    "history": observation.get("trace") or [],
+                    "observation": observation,
+                    "assistant_content": assistant_content,
+                    "multi_modal_data": multi_modal_data,
+                    "mm_processor_kwargs": agent_data.mm_processor_kwargs,
+                    "tool_format": self.tool_parser_name,
                 }
             )
-
-        response_text = self.tokenizer.decode(response_ids, skip_special_tokens=False)
-        snapshot = {
-            "assistant_turn": agent_data.assistant_turns,
-            "prompt_ids": state_prompt_ids,
-            "response_ids": response_ids,
-            "response_text": response_text,
-            "assistant_content": assistant_content,
-            "distillation_mask_tokens": int(sum(distillation_mask)) if distillation_mask else 0,
-            "parsed_tool_calls": parsed_tool_calls,
-        }
-        agent_data.generation_snapshots.append(snapshot)
-        agent_data.extra_fields["opd_mm_generation_snapshots"] = agent_data.generation_snapshots
+        except Exception as exc:
+            logger.warning("Failed to collect live OPD-MM state correction: %s", exc)
+            return
+        if isinstance(correction, dict):
+            agent_data.extra_fields.setdefault("opd_mm_step_corrections", []).append(correction)
 
     async def _handle_processing_tools_state(self, agent_data: AgentData) -> AgentState:
         """Handle the processing tools state: execute tool calls and prepare tool responses."""

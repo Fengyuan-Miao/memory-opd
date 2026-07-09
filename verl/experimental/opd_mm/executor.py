@@ -30,15 +30,11 @@ from .retrieval import HiddenMemoryStore, HybridRetriever
 from .schema import TrajectoryValidator
 
 PUBLIC_EVIDENCE_FIELDS = (
-    "summary",
     "content",
     "timestamp",
     "session_date",
-    "turn_id",
     "author",
     "modality",
-    "source_type",
-    "raw_pointer",
 )
 TIMESTAMP_DATE_PATTERN = re.compile(
     r"(?P<year>\d{4})[-/](?P<month>\d{1,2})[-/](?P<day>\d{1,2})"
@@ -128,6 +124,17 @@ class ToolExecutor:
                     pool = self._merge_pools(pool, retrieved) if pool_has_candidates else retrieved
                     pool_has_candidates = True
                     self._append_pool_evidence(evidence, retrieved, source="RETRIEVE")
+                elif action.tool == "EXPAND_NEIGHBORS":
+                    if not pool_has_candidates or not pool:
+                        raise ValueError("EXPAND_NEIGHBORS requires an existing candidate pool")
+                    expanded = self._expand_neighbors(
+                        pool,
+                        memory_store,
+                        action.arguments["window"],
+                    )
+                    pool = self._merge_pools(pool, expanded)
+                    pool_has_candidates = True
+                    self._append_pool_evidence(evidence, expanded, source="EXPAND_NEIGHBORS")
                 elif action.tool == "INSPECT_RAW":
                     remaining = max(0, self.max_raw_inspections - raw_calls)
                     inspected = self._inspect_raw(
@@ -155,7 +162,7 @@ class ToolExecutor:
             )
             if stopped or step_error:
                 break
-        if not evidence:
+        if not evidence and not error:
             evidence = self._pool_evidence(pool, source="FINAL_POOL")
 
         return ExecutionResult(
@@ -205,6 +212,99 @@ class ToolExecutor:
                 selected_turns.append(turn_id)
             selected.append(item)
         return selected
+
+    @staticmethod
+    def _expand_neighbors(
+        pool: List[PoolItem],
+        memory_store: HiddenMemoryStore,
+        window: int,
+    ) -> List[PoolItem]:
+        """Return records from turns neighboring the current candidate pool.
+
+        The unit of expansion is a dialogue turn identified by session plus a
+        turn index. Mem-Gallery records may store the index as ``turn_index``,
+        ``round_id`` or a trailing numeric component in ``turn_id``. Records
+        lacking a structured position cannot contribute neighbors, but existing
+        records in the selected pool are still preserved by the caller's merge.
+        """
+        selected_keys = {
+            key
+            for item in pool
+            if (key := ToolExecutor._memory_session_turn_key(item.memory)) is not None
+        }
+        expanded_keys = set(selected_keys)
+        for session_id, turn_index in selected_keys:
+            for distance in range(1, int(window) + 1):
+                expanded_keys.add((session_id, turn_index - distance))
+                expanded_keys.add((session_id, turn_index + distance))
+
+        score_by_turn = {item.memory.turn_id: item.score for item in pool}
+        expanded = []
+        for item in memory_store.initial_pool():
+            key = ToolExecutor._memory_session_turn_key(item.memory)
+            if key not in expanded_keys:
+                continue
+            expanded.append(
+                PoolItem(
+                    item.memory,
+                    score_by_turn.get(item.memory.turn_id, 0.0),
+                    retrieved=item.retrieved,
+                )
+            )
+
+        def sort_key(item: PoolItem) -> tuple[Any, ...]:
+            key = ToolExecutor._memory_session_turn_key(item.memory) or ("", 0)
+            return key[0], key[1], item.memory.timestamp, item.memory.memory_id
+
+        expanded.sort(key=sort_key)
+        return expanded
+
+    @staticmethod
+    def _memory_session_turn_key(memory: Any) -> tuple[str, int] | None:
+        metadata = getattr(memory, "metadata", {}) or {}
+        session_id = metadata.get("session_id") or metadata.get("dialogue_id") or metadata.get("conversation_id")
+        if not session_id:
+            turn_id = str(getattr(memory, "turn_id", "") or "")
+            parts = turn_id.split(":")
+            if len(parts) >= 2:
+                session_id = parts[-2]
+        if not session_id:
+            return None
+
+        scenario = str(metadata.get("scenario") or "").strip()
+        session_key = f"{scenario}:{session_id}" if scenario else str(session_id)
+        turn_index = None
+        for candidate in (
+            metadata.get("turn_index"),
+            metadata.get("round_index"),
+            metadata.get("turn_number"),
+            metadata.get("round_id"),
+            getattr(memory, "turn_id", ""),
+        ):
+            if candidate is None or str(candidate).strip() == "":
+                continue
+            turn_index = ToolExecutor._coerce_turn_index(candidate)
+            if turn_index is not None:
+                break
+        if turn_index is None:
+            return None
+        return session_key, turn_index
+
+    @staticmethod
+    def _coerce_turn_index(value: Any) -> int | None:
+        if isinstance(value, bool):
+            return None
+        if isinstance(value, int):
+            return value
+        if isinstance(value, float) and value.is_integer():
+            return int(value)
+        text = str(value or "").strip()
+        if text.isdigit():
+            return int(text)
+        match = re.search(r"(?:^|[:_-])(\d+)$", text)
+        if match:
+            return int(match.group(1))
+        return None
 
     @staticmethod
     def _filter_source_pool(
@@ -341,16 +441,22 @@ class ToolExecutor:
     ) -> List[EvidenceItem]:
         evidence = []
         for item in pool:
-            values = {
-                field: item.memory.field_value(field)
-                for field in fields
-            }
+            values = {}
+            for field in fields:
+                if field == "content":
+                    # Public observations expose one answer-useful text field.
+                    # Some image records store their caption in summary only,
+                    # so fall back to it without duplicating the same text.
+                    values[field] = item.memory.content or item.memory.summary
+                else:
+                    values[field] = item.memory.field_value(field)
             if "session_date" not in values:
                 values["session_date"] = item.memory.metadata.get(
                     "session_date"
                 )
             if item.score:
                 values["retrieval_score"] = item.score
+            values = {key: value for key, value in values.items() if value not in (None, "")}
             evidence.append(
                 EvidenceItem(
                     memory_id=item.memory.memory_id,
@@ -411,16 +517,11 @@ class ToolExecutor:
                     fields={
                         "visual_observation": observation,
                         "linked_text_context": context,
-                        "image_label": (
-                            f"turn={item.memory.turn_id}; "
-                            f"context={context[:220]}"
-                        ),
+                        "image_label": f"context={context[:220]}",
                         "session_date": item.memory.metadata.get(
                             "session_date"
                         ),
                         "timestamp": item.memory.timestamp,
-                        "turn_id": item.memory.turn_id,
-                        "raw_pointer": pointer,
                     },
                     source="INSPECT_RAW",
                 )

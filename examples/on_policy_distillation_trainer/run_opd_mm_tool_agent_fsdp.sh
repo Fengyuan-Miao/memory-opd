@@ -6,9 +6,9 @@ set -xeuo pipefail
 # ---- user-adjustable ----
 RUN_TIMESTAMP=${RUN_TIMESTAMP:-$(date +%Y%m%d_%H%M%S)}
 STUDENT_MODEL=${STUDENT_MODEL:-/home/guojr/data/pretrained_models/Qwen/Qwen3.5-4B}
-# Frozen-teacher OPD-MM path: by default use the same checkpoint as the student,
-# served by an independent vLLM teacher so the student weights can still update.
-TEACHER_MODEL=${TEACHER_MODEL:-$STUDENT_MODEL}
+# Frozen-teacher OPD-MM path. The same teacher vLLM service is also used by the
+# verifier and INSPECT_RAW when OPD_MM_RAW_INSPECTOR_BACKEND=teacher.
+TEACHER_MODEL=${TEACHER_MODEL:-/home/guojr/data/pretrained_models/Qwen/Qwen3.5-4B}
 
 OPD_MM_TRAIN_FILES=${OPD_MM_TRAIN_FILES:-"['/home/miaofy/memory-opd/dataset/mem_gallery/opd_mm_store/subsets/balanced_train_cap2/train.parquet']"}
 OPD_MM_VAL_FILES=${OPD_MM_VAL_FILES:-$OPD_MM_TRAIN_FILES}
@@ -30,6 +30,7 @@ ppo_mini_batch_size=${PPO_MINI_BATCH_SIZE:-$train_batch_size}
 max_prompt_length=${MAX_PROMPT_LENGTH:-2048}
 max_response_length=${MAX_RESPONSE_LENGTH:-2048}
 ppo_max_token_len_per_gpu=${PPO_MAX_TOKEN_LEN_PER_GPU:-8192}
+teacher_max_model_len=${TEACHER_MAX_MODEL_LEN:-16384}
 
 actor_lr=${ACTOR_LR:-1e-6}
 
@@ -43,7 +44,7 @@ save_freq=${SAVE_FREQ:-50}
 test_freq=${TEST_FREQ:--1}
 
 project_name=${PROJECT_NAME:-verl_distill_opd_mm}
-experiment_name=${EXPERIMENT_NAME:-opd_mm_qwen35_4b_frozen_teacher_verifierfeedback_sanitized_${RUN_TIMESTAMP}}
+experiment_name=${EXPERIMENT_NAME:-opd_mm_qwen35_4b_teacher4b_skipstage0_verifierfeedback_sanitized_${RUN_TIMESTAMP}}
 
 LOG_DIR=${LOG_DIR:-logs}
 TRAIN_LOG_PATH=${TRAIN_LOG_PATH:-${LOG_DIR}/${experiment_name}.log}
@@ -52,9 +53,7 @@ OPD_MM_STUDENT_ROLLOUT_DUMP_MAX_CHARS=${OPD_MM_STUDENT_ROLLOUT_DUMP_MAX_CHARS:-1
 OPD_MM_TEACHER_CORRECTION_DUMP_DIR=${OPD_MM_TEACHER_CORRECTION_DUMP_DIR:-${LOG_DIR}/opd_mm_teacher_corrections_verifierfeedback_sanitized_${RUN_TIMESTAMP}}
 OPD_MM_TEACHER_CORRECTION_DUMP_MAX_CHARS=${OPD_MM_TEACHER_CORRECTION_DUMP_MAX_CHARS:-12000}
 OPD_MM_TEACHER_CORRECTION_DUMP_INCLUDE_PROMPT=${OPD_MM_TEACHER_CORRECTION_DUMP_INCLUDE_PROMPT:-1}
-OPD_MM_RAW_INSPECTOR_URL=${OPD_MM_RAW_INSPECTOR_URL:-http://192.168.1.113:31208}
-OPD_MM_RAW_INSPECTOR_MODEL=${OPD_MM_RAW_INSPECTOR_MODEL:-Qwen3-VL-4B-Instruct}
-OPD_MM_RAW_INSPECTOR_TIMEOUT=${OPD_MM_RAW_INSPECTOR_TIMEOUT:-60}
+OPD_MM_RAW_INSPECTOR_BACKEND=${OPD_MM_RAW_INSPECTOR_BACKEND:-teacher}
 OPD_MM_RAW_INSPECTOR_MAX_TOKENS=${OPD_MM_RAW_INSPECTOR_MAX_TOKENS:-256}
 OPD_MM_RAW_INSPECTOR_TEMPERATURE=${OPD_MM_RAW_INSPECTOR_TEMPERATURE:-0.0}
 
@@ -73,7 +72,7 @@ export RAY_TMPDIR TMPDIR
 export OPD_MM_STUDENT_ROLLOUT_DUMP_DIR OPD_MM_STUDENT_ROLLOUT_DUMP_MAX_CHARS
 export OPD_MM_TEACHER_CORRECTION_DUMP_DIR OPD_MM_TEACHER_CORRECTION_DUMP_MAX_CHARS
 export OPD_MM_TEACHER_CORRECTION_DUMP_INCLUDE_PROMPT
-export OPD_MM_RAW_INSPECTOR_URL OPD_MM_RAW_INSPECTOR_MODEL OPD_MM_RAW_INSPECTOR_TIMEOUT
+export OPD_MM_RAW_INSPECTOR_BACKEND
 export OPD_MM_RAW_INSPECTOR_MAX_TOKENS OPD_MM_RAW_INSPECTOR_TEMPERATURE
 
 exec > >(tee -a "$TRAIN_LOG_PATH") 2>&1
@@ -83,8 +82,9 @@ echo "TRAIN_LOG_PATH=${TRAIN_LOG_PATH}"
 echo "RAY_TMPDIR=${RAY_TMPDIR}"
 echo "OPD_MM_STUDENT_ROLLOUT_DUMP_DIR=${OPD_MM_STUDENT_ROLLOUT_DUMP_DIR}"
 echo "OPD_MM_TEACHER_CORRECTION_DUMP_DIR=${OPD_MM_TEACHER_CORRECTION_DUMP_DIR}"
-echo "OPD_MM_RAW_INSPECTOR_URL=${OPD_MM_RAW_INSPECTOR_URL}"
-echo "OPD_MM_RAW_INSPECTOR_MODEL=${OPD_MM_RAW_INSPECTOR_MODEL}"
+echo "OPD_MM_RAW_INSPECTOR_BACKEND=${OPD_MM_RAW_INSPECTOR_BACKEND}"
+echo "TEACHER_MODEL=${TEACHER_MODEL}"
+echo "TEACHER_MAX_MODEL_LEN=${teacher_max_model_len}"
 
 max_num_tokens=$(( max_prompt_length + max_response_length + 1 ))
 
@@ -169,7 +169,7 @@ EXTRA=(
     +distillation.teacher_models.opd_mm.inference.tensor_model_parallel_size=${teacher_tp}
     +distillation.teacher_models.opd_mm.inference.name=vllm
     +distillation.teacher_models.opd_mm.inference.gpu_memory_utilization=${teacher_gpu_mem_util}
-    +distillation.teacher_models.opd_mm.inference.max_model_len=${max_num_tokens}
+    +distillation.teacher_models.opd_mm.inference.max_model_len=${teacher_max_model_len}
     distillation.teacher_key=data_source
     distillation.distillation_loss.loss_mode=${distillation_loss_mode}
     distillation.distillation_loss.topk=${distillation_topk}

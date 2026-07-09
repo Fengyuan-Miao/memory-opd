@@ -28,6 +28,7 @@ ALLOWED_TOOLS = {
     "SORT",
     "TOPK",
     "RETRIEVE",
+    "EXPAND_NEIGHBORS",
     "INSPECT_RAW",
     "STOP",
 }
@@ -37,6 +38,7 @@ FILTER_SCOPES = {"current_pool", "full_memory"}
 SORT_FIELDS = {"timestamp", "turn_id", "score"}
 SORT_ORDERS = {"asc", "desc"}
 RETRIEVAL_METHODS = {"bm25", "dense", "vision", "hybrid"}
+EXPAND_NEIGHBOR_WINDOWS = {1, 2, 3}
 INSPECT_TARGETS = {"current_pool"}
 INSPECT_INSTRUCTIONS = {"answer_query_related_visual_details"}
 FORBIDDEN_ARGUMENT_KEYS = {
@@ -55,6 +57,7 @@ FILTER(field=modality|author|source_type|timestamp|status,
 SORT(field=timestamp|turn_id|score, order=asc|desc)
 TOPK(k=positive integer)
 RETRIEVE(method=bm25|dense|vision|hybrid, top_k=positive integer, query=optional rewritten search text)
+EXPAND_NEIGHBORS(window=1|2|3)
 STOP()
 
 Return only a JSON array of tool calls. Do not emit memory IDs. RETRIEVE uses
@@ -64,7 +67,9 @@ merge new candidates into the accumulated pool and deduplicate by memory. For
 timestamp filters, date-only values such as YYYY-MM-DD match all memory
 timestamps from that date. FILTER scope defaults to current_pool; use
 scope=full_memory to collect metadata-filtered candidates from the original
-hidden memory pool without discarding existing candidates."""
+hidden memory pool without discarding existing candidates. EXPAND_NEIGHBORS
+adds nearby turns around the current candidate pool; use it only after a
+retrieve/filter step has selected relevant candidates."""
 
 
 def build_tool_schema(allow_inspect_raw: bool = True) -> str:
@@ -190,6 +195,12 @@ class TrajectoryValidator:
         self._validate_k(args.get("top_k", 5), index, "top_k")
         if "query" in args and (not isinstance(args["query"], str) or not args["query"].strip()):
             raise TrajectoryValidationError(f"action {index}: invalid RETRIEVE query")
+
+    def _validate_expand_neighbors(self, args: Dict[str, Any], index: int) -> None:
+        self._require_exact_keys(args, {"window"}, set(), index)
+        window = args["window"]
+        if not isinstance(window, int) or isinstance(window, bool) or window not in EXPAND_NEIGHBOR_WINDOWS:
+            raise TrajectoryValidationError(f"action {index}: window must be one of {sorted(EXPAND_NEIGHBOR_WINDOWS)}")
 
     def _validate_inspect_raw(self, args: Dict[str, Any], index: int) -> None:
         self._require_exact_keys(args, set(), {"target", "instruction"}, index)

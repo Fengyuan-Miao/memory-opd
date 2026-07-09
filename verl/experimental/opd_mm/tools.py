@@ -15,9 +15,9 @@
 """verl-native tool adapters for the OPD-MM hidden-memory executor.
 
 These tools keep per-trajectory state through the agent_data object supplied by
-ToolAgentLoop. That lets FILTER, SORT, TOPK, RETRIEVE, INSPECT_RAW, and
-STOP behave like the original OPD-MM sequential action space while still
-exposing OpenAI function schemas to verl.
+ToolAgentLoop. That lets FILTER, SORT, TOPK, RETRIEVE, EXPAND_NEIGHBORS,
+INSPECT_RAW, and STOP behave like the original OPD-MM sequential action space
+while still exposing OpenAI function schemas to verl.
 """
 
 from __future__ import annotations
@@ -37,6 +37,7 @@ from verl.experimental.opd_mm.schema import (
     FILTER_FIELDS,
     FILTER_OPS,
     FILTER_SCOPES,
+    EXPAND_NEIGHBOR_WINDOWS,
     INSPECT_INSTRUCTIONS,
     INSPECT_TARGETS,
     RETRIEVAL_METHODS,
@@ -115,6 +116,9 @@ def _cached_remote_raw_inspector(
 def _raw_inspector_from_runtime(runtime: dict[str, Any]) -> Any:
     if runtime.get("raw_inspector") is not None:
         return runtime["raw_inspector"]
+    backend = _optional_str(runtime.get("raw_inspector_backend") or os.getenv("OPD_MM_RAW_INSPECTOR_BACKEND"))
+    if backend.lower() == "teacher":
+        return None
     if not bool(runtime.get("allow_inspect_raw", True)):
         return None
     base_url = (
@@ -383,15 +387,12 @@ def _sanitize_pool_preview(items: list[PoolItem], max_items: int = 5) -> list[di
     preview = []
     for item in items[:max_items]:
         memory = item.memory
+        content = memory.content or memory.summary
         entry = {
-            "summary": memory.summary,
-            "content": memory.content[:360] if memory.content else None,
+            "content": content[:360] if content else None,
             "timestamp": memory.timestamp,
-            "turn_id": memory.turn_id,
             "author": memory.author,
             "modality": memory.modality,
-            "source_type": memory.source_type,
-            "raw_pointer": memory.raw_pointer,
             "session_date": memory.metadata.get("session_date"),
         }
         if item.score:
@@ -431,6 +432,8 @@ class OPDToolSession:
             return self._observation(action, [], "trajectory already stopped")
 
         try:
+            if len(self.trace) >= self.executor.validator.max_actions and action.tool != "STOP":
+                raise ValueError("maximum OPD-MM actions reached")
             self.executor.validator._validate_action(action, len(self.trace))
             if action.tool == "FILTER":
                 source_pool = self.executor._filter_source_pool(
@@ -479,6 +482,21 @@ class OPDToolSession:
                     retrieved,
                     source="RETRIEVE",
                 )
+            elif action.tool == "EXPAND_NEIGHBORS":
+                if not self.pool_has_candidates or not self.pool:
+                    raise ValueError("EXPAND_NEIGHBORS requires an existing candidate pool")
+                expanded = self.executor._expand_neighbors(
+                    self.pool,
+                    self.memory_store,
+                    action.arguments["window"],
+                )
+                self.pool = self.executor._merge_pools(self.pool, expanded)
+                self.pool_has_candidates = True
+                self.executor._append_pool_evidence(
+                    self.evidence,
+                    expanded,
+                    source="EXPAND_NEIGHBORS",
+                )
             elif action.tool == "INSPECT_RAW":
                 remaining = max(0, self.executor.max_raw_inspections - self.raw_calls)
                 inspected = self.executor._inspect_raw(
@@ -508,6 +526,70 @@ class OPDToolSession:
         )
         new_evidence = self.evidence[evidence_before:]
         return self._observation(action, new_evidence, step_error)
+
+    async def execute_inspect_raw_with_teacher(self, action: ToolAction, inspect_fn: Any) -> dict[str, Any]:
+        """Execute INSPECT_RAW using the async verl teacher service callback."""
+        before = len(self.pool)
+        evidence_before = len(self.evidence)
+        step_error = ""
+        inspected: list[EvidenceItem] = []
+
+        if self.stopped:
+            return self._observation(action, [], "trajectory already stopped")
+
+        try:
+            if len(self.trace) >= self.executor.validator.max_actions:
+                raise ValueError("maximum OPD-MM actions reached")
+            self.executor.validator._validate_action(action, len(self.trace))
+            remaining = max(0, self.executor.max_raw_inspections - self.raw_calls)
+            inspect_pool = [item for item in self.pool if item.retrieved]
+            text_by_turn = self.executor._text_context_by_turn(inspect_pool)
+            for item in inspect_pool:
+                if len(inspected) >= remaining:
+                    break
+                pointer = item.memory.raw_pointer
+                if not pointer:
+                    continue
+                context = text_by_turn.get(item.memory.turn_id, "")
+                visual_observation = await inspect_fn(
+                    {
+                        "raw_pointer": pointer,
+                        "query": self.query,
+                        "question_image": self.question_image,
+                        "text_context": context,
+                    }
+                )
+                inspected.append(
+                    EvidenceItem(
+                        memory_id=item.memory.memory_id,
+                        fields={
+                            "visual_observation": str(visual_observation or ""),
+                            "linked_text_context": context,
+                            "image_label": f"context={context[:220]}",
+                            "session_date": item.memory.metadata.get("session_date"),
+                            "timestamp": item.memory.timestamp,
+                        },
+                        source="INSPECT_RAW",
+                    )
+                )
+            self.raw_calls += len(inspected)
+            self.evidence.extend(inspected)
+        except Exception as exc:
+            step_error = str(exc)
+            self.error = step_error
+
+        self.trace.append(action)
+        self.steps.append(
+            ExecutionStep(
+                index=len(self.steps),
+                action=action,
+                pool_before=before,
+                pool_after=len(self.pool),
+                evidence_added=len(self.evidence) - evidence_before,
+                error=step_error,
+            )
+        )
+        return self._observation(action, inspected, step_error)
 
     def _observation(self, action: ToolAction, new_evidence: list[EvidenceItem], error: str) -> dict[str, Any]:
         return {
@@ -566,15 +648,19 @@ class OPDBaseTool(BaseTool):
     def _action(self, parameters: dict[str, Any]) -> ToolAction:
         return ToolAction(self.tool_name.upper(), dict(parameters))
 
-    def _session(self, agent_data: Any) -> OPDToolSession:
-        if agent_data is not None and hasattr(agent_data, _SESSION_ATTR):
-            return getattr(agent_data, _SESSION_ATTR)
-
+    def _runtime(self, agent_data: Any) -> dict[str, Any]:
         runtime = dict(self.config or {})
         if agent_data is not None:
             tools_kwargs = getattr(agent_data, "tools_kwargs", {}) or {}
             runtime.update(tools_kwargs.get("opd_mm", {}) or {})
             runtime.update(tools_kwargs.get(self.name, {}) or {})
+        return runtime
+
+    def _session(self, agent_data: Any) -> OPDToolSession:
+        if agent_data is not None and hasattr(agent_data, _SESSION_ATTR):
+            return getattr(agent_data, _SESSION_ATTR)
+
+        runtime = self._runtime(agent_data)
 
         store = runtime.get("memory_store")
         if store is None:
@@ -681,6 +767,22 @@ class OPDRetrieveTool(OPDBaseTool):
     required: list[str] = []
 
 
+class OPDExpandNeighborsTool(OPDBaseTool):
+    tool_name = "expand_neighbors"
+    description = (
+        "Expand the current candidate pool with neighboring turns from the same session. "
+        "Use only after retrieval/filtering has selected relevant candidates."
+    )
+    properties = {
+        "window": _property(
+            "integer",
+            "Neighbor distance in turns. Must be 1, 2, or 3.",
+            sorted(EXPAND_NEIGHBOR_WINDOWS),
+        ),
+    }
+    required = ["window"]
+
+
 class OPDInspectRawTool(OPDBaseTool):
     tool_name = "inspect_raw"
     description = (
@@ -692,6 +794,34 @@ class OPDInspectRawTool(OPDBaseTool):
         "instruction": _property("string", "Inspection instruction.", sorted(INSPECT_INSTRUCTIONS)),
     }
     required: list[str] = []
+
+    async def execute(self, instance_id: str, parameters: dict[str, Any], **kwargs) -> tuple[ToolResponse, float, dict]:
+        agent_data = kwargs.get("agent_data")
+        runtime = self._runtime(agent_data)
+        backend = _optional_str(
+            runtime.get("raw_inspector_backend") or os.getenv("OPD_MM_RAW_INSPECTOR_BACKEND")
+        ).lower()
+        if backend != "teacher":
+            return await super().execute(instance_id, parameters, **kwargs)
+
+        session = self._session(agent_data)
+        action = self._action(parameters)
+        inspect_fn = getattr(agent_data, "teacher_raw_inspector", None) if agent_data is not None else None
+        if inspect_fn is None:
+            async def unavailable(_: dict[str, Any]) -> str:
+                raise RuntimeError("teacher raw inspector is unavailable")
+
+            inspect_fn = unavailable
+        observation = await session.execute_inspect_raw_with_teacher(action, inspect_fn)
+        if agent_data is not None and hasattr(agent_data, "extra_fields"):
+            agent_data.extra_fields["opd_mm"] = session.public_state()
+        terminate_agent_loop = bool(observation["stopped"] or observation["error"])
+        return ToolResponse(text=json.dumps(observation, ensure_ascii=False)), 0.0, {
+            "opd_mm_pool_count": observation["pool_count"],
+            "opd_mm_evidence_count": observation["evidence_count"],
+            "opd_mm_terminate": terminate_agent_loop,
+            "agent_loop_terminate": terminate_agent_loop,
+        }
 
 
 class OPDStopTool(OPDBaseTool):
@@ -706,6 +836,7 @@ OPD_TOOL_CLASSES = [
     OPDSortTool,
     OPDTopKTool,
     OPDRetrieveTool,
+    OPDExpandNeighborsTool,
     OPDInspectRawTool,
     OPDStopTool,
 ]
@@ -728,6 +859,7 @@ def openai_tool_schemas(include_inspect_raw: bool = True) -> list[dict[str, Any]
 
 __all__ = [
     "OPDBaseTool",
+    "OPDExpandNeighborsTool",
     "OPDFilterTool",
     "OPDInspectRawTool",
     "OPDRetrieveTool",

@@ -5,8 +5,7 @@ opd_mm_common_config: &opd_mm_common_config
   vision_model_path: /home/miaofy/data/pretrained_models/SigLIP-Base-Patch16-384
   hybrid_model_path: /home/miaofy/data/pretrained_models/gme-Qwen2-VL-2B-Instruct
   vector_device: cuda:0
-  raw_inspector_url: http://192.168.1.113:31208
-  raw_inspector_timeout: 60
+  raw_inspector_backend: teacher
   raw_inspector_max_tokens: 256
   raw_inspector_temperature: 0.0
 
@@ -18,6 +17,8 @@ tools:
   - class_name: "verl.experimental.opd_mm.tools.OPDTopKTool"
     config: *opd_mm_common_config
   - class_name: "verl.experimental.opd_mm.tools.OPDRetrieveTool"
+    config: *opd_mm_common_config
+  - class_name: "verl.experimental.opd_mm.tools.OPDExpandNeighborsTool"
     config: *opd_mm_common_config
   - class_name: "verl.experimental.opd_mm.tools.OPDInspectRawTool"
     config: *opd_mm_common_config

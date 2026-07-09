@@ -12,12 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Online OPD-MM self-distillation hook for verl agent-loop rollouts.
+"""Online OPD-MM self-distillation helpers for verl agent-loop rollouts.
 
-This module is intentionally opt-in. A dataset row enables the hook by setting
-extra_info.opd_mm_online_self_distill to true and provides a fully-qualified
-teacher class in extra_info.opd_mm_step_teacher_class. AgentLoopWorker calls
-maybe_collect_online_step_corrections after the student rollout has executed.
+The verl-native path corrects each student-visible state while ToolAgentLoop is
+running. The student still executes its own action; verifier and teacher output
+are collected beside that state as an SFT example and never control rollout.
 """
 
 from __future__ import annotations
@@ -46,10 +45,22 @@ _TOOL_CALL_NAME_BY_ACTION = {
     "SORT": "sort",
     "TOPK": "topk",
     "RETRIEVE": "retrieve",
+    "EXPAND_NEIGHBORS": "expand_neighbors",
     "INSPECT_RAW": "inspect_raw",
     "STOP": "stop",
 }
-_VERIFIER_ACTIONS = {"retrieve", "filter", "sort", "topk", "inspect_raw", "stop"}
+_VERIFIER_MISSING_EVIDENCE_TYPES = {
+    "none",
+    "no_public_evidence",
+    "irrelevant_evidence",
+    "missing_metadata_constraint",
+    "candidate_set_too_broad",
+    "missing_neighbor_context",
+    "missing_temporal_order",
+    "missing_raw_visual_detail",
+    "incomplete_coverage",
+    "insufficient_absence_support",
+}
 
 
 def _truncate_for_dump(value: Any, max_chars: int) -> Any:
@@ -75,6 +86,7 @@ def dump_online_step_correction(
         record = {
             "time": time.time(),
             "pid": os.getpid(),
+            "request_id": request.get("request_id"),
             "sample_id": request.get("sample_id"),
             "step_index": request.get("step_index"),
             "query": request.get("query"),
@@ -148,20 +160,64 @@ def _coerce_bool(value: Any) -> bool:
     return bool(value)
 
 
-def _normalize_verifier_action(value: Any) -> str | None:
+def _coerce_bool_default(value: Any, default: bool) -> bool:
+    if value is None:
+        return bool(default)
+    return _coerce_bool(value)
+
+
+def _normalize_missing_evidence_type(value: Any) -> str | None:
     if value is None:
         return None
-    action = str(value).strip().lower().replace("-", "_").replace(" ", "_")
+    missing_type = str(value).strip().lower().replace("-", "_").replace(" ", "_")
     aliases = {
-        "retrieval": "retrieve",
-        "search": "retrieve",
-        "metadata_filter": "filter",
-        "inspect": "inspect_raw",
-        "inspectraw": "inspect_raw",
-        "raw_inspect": "inspect_raw",
+        "sufficient": "none",
+        "enough": "none",
+        "complete": "none",
+        "empty": "no_public_evidence",
+        "no_evidence": "no_public_evidence",
+        "missing_evidence": "no_public_evidence",
+        "no_candidates": "no_public_evidence",
+        "wrong_pool": "irrelevant_evidence",
+        "wrong_candidates": "irrelevant_evidence",
+        "wrong_candidate_set": "irrelevant_evidence",
+        "irrelevant_candidates": "irrelevant_evidence",
+        "metadata": "missing_metadata_constraint",
+        "metadata_constraint": "missing_metadata_constraint",
+        "metadata_filter": "missing_metadata_constraint",
+        "needs_metadata_filter": "missing_metadata_constraint",
+        "filter": "missing_metadata_constraint",
+        "too_broad": "candidate_set_too_broad",
+        "broad": "candidate_set_too_broad",
+        "narrow": "candidate_set_too_broad",
+        "needs_narrowing": "candidate_set_too_broad",
+        "needs_topk": "candidate_set_too_broad",
+        "neighbor_context": "missing_neighbor_context",
+        "neighbour_context": "missing_neighbor_context",
+        "needs_neighbor_context": "missing_neighbor_context",
+        "neighbors": "missing_neighbor_context",
+        "neighbours": "missing_neighbor_context",
+        "expand_neighbors": "missing_neighbor_context",
+        "temporal": "missing_temporal_order",
+        "time_order": "missing_temporal_order",
+        "needs_temporal_order": "missing_temporal_order",
+        "order": "missing_temporal_order",
+        "sort": "missing_temporal_order",
+        "visual_detail": "missing_raw_visual_detail",
+        "raw_visual": "missing_raw_visual_detail",
+        "needs_raw_visual_detail": "missing_raw_visual_detail",
+        "inspect_raw": "missing_raw_visual_detail",
+        "coverage": "incomplete_coverage",
+        "more_coverage": "incomplete_coverage",
+        "needs_more_coverage": "incomplete_coverage",
+        "list_coverage": "incomplete_coverage",
+        "absence": "insufficient_absence_support",
+        "contradiction": "insufficient_absence_support",
+        "negative_evidence": "insufficient_absence_support",
+        "needs_absence_support": "insufficient_absence_support",
     }
-    action = aliases.get(action, action)
-    return action if action in _VERIFIER_ACTIONS else None
+    missing_type = aliases.get(missing_type, missing_type)
+    return missing_type if missing_type in _VERIFIER_MISSING_EVIDENCE_TYPES else None
 
 
 def _observation_evidence_count(observation: dict[str, Any]) -> int:
@@ -177,12 +233,44 @@ def _observation_evidence_count(observation: dict[str, Any]) -> int:
     return 0
 
 
+def _observation_pool_count(observation: dict[str, Any]) -> int:
+    if not isinstance(observation, dict):
+        return 0
+    value = observation.get("pool_count")
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return int(value)
+    for key in ("pool_preview", "candidate_pool", "candidates", "current_pool", "pool"):
+        items = observation.get(key)
+        if isinstance(items, list):
+            return len(items)
+    return 0
+
+
+def _observation_has_candidate_context(observation: dict[str, Any]) -> bool:
+    if _observation_evidence_count(observation) > 0:
+        return True
+    if _observation_pool_count(observation) <= 0:
+        return False
+
+    def tool_name(value: Any) -> str:
+        if isinstance(value, dict):
+            return str(value.get("tool") or value.get("name") or "").upper()
+        return str(value or "").upper()
+
+    if tool_name(observation.get("tool")) in {"RETRIEVE", "FILTER"}:
+        return True
+    trace = observation.get("trace")
+    if isinstance(trace, list):
+        return any(tool_name(action) in {"RETRIEVE", "FILTER"} for action in trace)
+    return False
+
+
 def _verifier_parse_fallback(error: Exception | str) -> dict[str, Any]:
     message = str(error)
     return {
         "evidence_sufficient": False,
+        "missing_evidence_type": "no_public_evidence",
         "reason": f"verifier_parse_error: {message[:240]}",
-        "recommended_next_action": "retrieve",
         "parse_error": message,
     }
 
@@ -231,19 +319,25 @@ def _reason_leaks_private_answer(*, reason: str, gold_answer: str, query: str) -
     return False
 
 
-def _generic_verifier_reason(*, evidence_sufficient: bool, action: str, evidence_count: int) -> str:
+def _generic_verifier_reason(*, evidence_sufficient: bool, missing_type: str, evidence_count: int) -> str:
     if evidence_sufficient:
         return "Current public evidence appears sufficient for the answer model to answer."
     if evidence_count <= 0:
         return "Current public evidence is insufficient; collect relevant evidence first."
-    if action == "filter":
-        return "Current public evidence needs metadata narrowing before answering."
-    if action == "sort":
+    if missing_type == "missing_metadata_constraint":
+        return "Current public evidence does not isolate the requested metadata constraint."
+    if missing_type == "missing_temporal_order":
         return "Current public evidence needs timestamp, order, or ranking evidence before answering."
-    if action == "topk":
+    if missing_type == "candidate_set_too_broad":
         return "Current public evidence needs a smaller focused candidate set before answering."
-    if action == "inspect_raw":
+    if missing_type == "missing_neighbor_context":
+        return "Current public evidence needs neighboring dialogue context before answering."
+    if missing_type == "missing_raw_visual_detail":
         return "Current public evidence needs raw visual details from retrieved candidates."
+    if missing_type == "irrelevant_evidence":
+        return "Current public evidence appears off-target; collect a more relevant candidate set."
+    if missing_type == "insufficient_absence_support":
+        return "Current public evidence needs broader support for absence, conflict, or contradiction."
     return "Current public evidence is insufficient; retrieve more relevant evidence."
 
 
@@ -253,19 +347,19 @@ def _sanitize_verifier_reason(
     gold_answer: str = "",
     query: str = "",
     evidence_sufficient: bool,
-    action: str,
+    missing_type: str,
     evidence_count: int,
 ) -> str:
     reason = str(reason or "").strip()
     if _reason_leaks_private_answer(reason=reason, gold_answer=gold_answer, query=query):
         return _generic_verifier_reason(
             evidence_sufficient=evidence_sufficient,
-            action=action,
+            missing_type=missing_type,
             evidence_count=evidence_count,
         )
     return (reason or _generic_verifier_reason(
         evidence_sufficient=evidence_sufficient,
-        action=action,
+        missing_type=missing_type,
         evidence_count=evidence_count,
     ))[:1000]
 
@@ -504,21 +598,25 @@ def build_state_verifier_prompt(
     Therefore the feedback must describe missing evidence types, not answer
     content.
     """
-    allowed_actions = (
-        "retrieve|filter|sort|topk|inspect_raw|stop"
+    missing_types = (
+        "none|no_public_evidence|irrelevant_evidence|missing_metadata_constraint|"
+        "candidate_set_too_broad|missing_neighbor_context|missing_temporal_order|"
+        "missing_raw_visual_detail|incomplete_coverage|insufficient_absence_support"
         if allow_inspect_raw
-        else "retrieve|filter|sort|topk|stop"
+        else "none|no_public_evidence|irrelevant_evidence|missing_metadata_constraint|"
+        "candidate_set_too_broad|missing_neighbor_context|missing_temporal_order|"
+        "incomplete_coverage|insufficient_absence_support"
     )
-    inspect_tool_line = (
-        "- inspect_raw(target=current_pool, instruction=answer_query_related_visual_details): "
-        "use only after candidates exist and raw visual details are needed; it is not search."
+    visual_decision_line = (
+        "- missing_raw_visual_detail: candidate evidence exists, but raw visual/media details are still needed."
         if allow_inspect_raw
         else ""
     )
     return f"""You are the OPD-MM state verifier.
 
-Goal: decide whether the current public evidence is enough for a separate answer
-model to answer the user question, then recommend exactly one next action type.
+Task: compare the user question, current public evidence, and private gold
+answer. Decide whether the public evidence is sufficient for a separate answer
+model to answer correctly. If not, classify the missing evidence type.
 
 Private rubric: you may use the gold answer only to judge sufficiency. Your JSON
 will be shown to the teacher, so never mention gold answer content, gold-only
@@ -527,29 +625,31 @@ entities, dates, IDs, labels, list items, or the phrase "gold answer".
 Return JSON only:
 {{
   "evidence_sufficient": boolean,
-  "reason": "short non-leaking reason",
-  "recommended_next_action": "{allowed_actions}"
+  "missing_evidence_type": "{missing_types}",
+  "reason": "short non-leaking evidence diagnostic"
 }}
 
-Tool/action guide:
-- retrieve(method=bm25|dense|vision|hybrid, top_k, query): use to collect new evidence.
-  bm25 fits exact names, dates, IDs, quoted phrases; dense fits semantic text;
-  vision fits visual/question-image matching; hybrid fits mixed text+visual or uncertainty.
-- filter(field=modality|author|source_type|timestamp|status, op=..., value=..., scope=...):
-  use for explicit metadata constraints. scope=full_memory starts/expands from memory;
-  scope=current_pool narrows existing candidates.
-- sort(field=timestamp|turn_id|score, order=asc|desc): use for latest/earliest/order/ranking questions.
-- topk(k): use when candidates exist but need a smaller focused pool.
-{inspect_tool_line}
-- stop: use only when public evidence is sufficient.
+Missing evidence types:
+- none: public evidence is sufficient.
+- no_public_evidence: no usable public evidence/candidates are present.
+- irrelevant_evidence: evidence is off-topic, wrong entity, wrong event, or wrong modality.
+- missing_metadata_constraint: explicit date/time/author/source/status/modality constraint is not isolated.
+- candidate_set_too_broad: evidence is relevant but too broad/noisy to answer confidently.
+- missing_neighbor_context: a relevant turn appears present but adjacent dialogue/event context is missing.
+- missing_temporal_order: latest/earliest/before/after/order/ranking relation is not supported.
+{visual_decision_line}
+- incomplete_coverage: list/all/count/multi-fact evidence does not cover the full requested set.
+- insufficient_absence_support: absence/conflict/not-mentioned claims lack enough supporting scope.
 
 Decision rules:
-- If evidence_count is 0: evidence_sufficient=false; recommend retrieve/filter/sort, never stop/topk/inspect_raw.
-- List/all questions require complete set coverage.
-- Temporal/latest questions require timestamp/order evidence.
-- Visual identity/detail questions require visual evidence; use inspect_raw only after retrieval.
-- Absence/conflict questions require enough relevant evidence to support absence or contradiction.
-- recommended_next_action is only the action type; do not output parameters or query rewrites.
+- If evidence_count is 0: evidence_sufficient=false and missing_evidence_type=no_public_evidence.
+- If evidence_sufficient=true, missing_evidence_type must be none.
+- If evidence_sufficient=false, missing_evidence_type must not be none.
+- For list/all/count/multi-fact questions, require complete coverage.
+- For temporal/order questions, require timestamp/order support.
+- For visual-detail questions, require visual evidence, not text guesswork.
+- For absence/conflict questions, require enough relevant scope to support absence or contradiction.
+- Do not output action recommendations, operation names, parameters, query rewrites, or answer content.
 
 User question:
 {query}
@@ -557,14 +657,8 @@ User question:
 Gold answer (private rubric; do not reveal or copy into feedback):
 {gold_answer}
 
-Previous student tool calls:
-{json.dumps(_action_dicts(history), ensure_ascii=False, indent=2, default=str)}
-
-Current public tool state and observations:
+Current public evidence state and observations:
 {json.dumps(observation, ensure_ascii=False, indent=2, default=str)}
-
-Student raw next output at this state:
-{student_raw_response}
 """
 
 
@@ -575,42 +669,60 @@ def parse_state_verifier_feedback(
     gold_answer: str = "",
     query: str = "",
 ) -> dict[str, Any]:
-    """Parse verifier JSON and enforce non-STOP fallback gates."""
+    """Parse verifier JSON into a non-leaking evidence-gap diagnostic."""
     try:
         payload = _extract_json_object(raw_response)
     except Exception as error:
         return _verifier_parse_fallback(error)
 
     try:
+        observation = _as_dict(observation)
+        evidence_count = _observation_evidence_count(observation)
+        has_candidate_context = _observation_has_candidate_context(observation)
         evidence_sufficient = _coerce_bool(payload.get("evidence_sufficient"))
         reason = str(payload.get("reason") or "").strip()
-        action = _normalize_verifier_action(payload.get("recommended_next_action"))
-        if action is None:
-            raise ValueError(f"invalid recommended_next_action: {payload.get('recommended_next_action')!r}")
-        evidence_count = _observation_evidence_count(observation)
-        if evidence_count <= 0 and action in {"inspect_raw", "topk"}:
+        missing_type = _normalize_missing_evidence_type(
+            payload.get("missing_evidence_type")
+            if "missing_evidence_type" in payload
+            else payload.get("missing_type")
+        )
+        if missing_type is None:
+            if payload.get("missing_evidence_type") is not None or payload.get("missing_type") is not None:
+                raise ValueError(
+                    f"invalid missing_evidence_type: "
+                    f"{payload.get('missing_evidence_type', payload.get('missing_type'))!r}"
+                )
+            missing_type = "none" if evidence_sufficient else ("no_public_evidence" if evidence_count <= 0 else "incomplete_coverage")
+
+        if evidence_count <= 0:
             evidence_sufficient = False
-            action = "retrieve"
-            reason = reason or "Need retrieved public candidates before this action."
-        if evidence_count <= 0 and action == "stop":
+            missing_type = "no_public_evidence"
+            reason = reason or "Need public evidence before answering."
+        elif missing_type == "missing_neighbor_context" and not has_candidate_context:
             evidence_sufficient = False
-            action = "retrieve"
-            reason = reason or "Need public evidence before stopping."
-        if not evidence_sufficient and action == "stop":
-            action = "retrieve"
+            missing_type = "incomplete_coverage"
+            reason = reason or "Need a relevant public candidate before neighboring context can help."
+        elif evidence_sufficient and missing_type != "none":
+            evidence_sufficient = False
+            reason = reason or "The diagnostic says additional public evidence is still missing."
+        elif not evidence_sufficient and missing_type == "none":
+            missing_type = "incomplete_coverage"
             reason = reason or "Evidence is insufficient, so another tool action is required."
+        elif evidence_sufficient:
+            missing_type = "none"
+
         reason = _sanitize_verifier_reason(
             reason,
             gold_answer=gold_answer,
             query=query,
             evidence_sufficient=bool(evidence_sufficient),
-            action=action,
+            missing_type=missing_type,
             evidence_count=evidence_count,
         )
         return {
             "evidence_sufficient": bool(evidence_sufficient),
+            "missing_evidence_type": missing_type,
             "reason": reason[:1000],
-            "recommended_next_action": action,
             "parse_error": "",
         }
     except Exception as error:
@@ -619,10 +731,13 @@ def parse_state_verifier_feedback(
 
 def _stop_gate_fallback_action(request: dict[str, Any], verifier_feedback: dict[str, Any]) -> ToolAction:
     """Choose a safe non-STOP target when verifier marks evidence insufficient."""
-    recommendation = _normalize_verifier_action(verifier_feedback.get("recommended_next_action")) or "retrieve"
-    evidence_count = _observation_evidence_count(_as_dict(request.get("observation")))
+    missing_type = _normalize_missing_evidence_type(verifier_feedback.get("missing_evidence_type")) or "no_public_evidence"
+    observation = _as_dict(request.get("observation"))
+    evidence_count = _observation_evidence_count(observation)
     allow_inspect_raw = bool(request.get("allow_inspect_raw", True))
-    if recommendation == "inspect_raw" and allow_inspect_raw and evidence_count > 0:
+    if missing_type == "missing_neighbor_context" and _observation_has_candidate_context(observation):
+        return ToolAction("EXPAND_NEIGHBORS", {"window": 1})
+    if missing_type == "missing_raw_visual_detail" and allow_inspect_raw and evidence_count > 0:
         return ToolAction(
             "INSPECT_RAW",
             {
@@ -630,9 +745,9 @@ def _stop_gate_fallback_action(request: dict[str, Any], verifier_feedback: dict[
                 "instruction": "answer_query_related_visual_details",
             },
         )
-    if recommendation == "topk" and evidence_count > 0:
+    if missing_type == "candidate_set_too_broad" and evidence_count > 0:
         return ToolAction("TOPK", {"k": min(max(evidence_count, 1), 5)})
-    if recommendation == "sort" and evidence_count > 0:
+    if missing_type == "missing_temporal_order" and evidence_count > 0:
         return ToolAction("SORT", {"field": "timestamp", "order": "desc"})
     return ToolAction("RETRIEVE", {"method": "hybrid", "top_k": 10, "query": str(request.get("query") or "")})
 
@@ -663,22 +778,13 @@ def build_teacher_correction_prompt(
     )
     if tool_format == "hermes":
         format_name = "Hermes JSON XML"
-        example = '<tool_call>{"name":"retrieve","arguments":{"method":"hybrid","top_k":5}}</tool_call>'
     else:
         format_name = "Qwen function XML"
-        example = (
-            "<tool_call>\n"
-            "<function=retrieve>\n"
-            "<parameter=method>\nhybrid\n</parameter>\n"
-            "<parameter=top_k>\n5\n</parameter>\n"
-            "</function>\n"
-            "</tool_call>"
-        )
     _ = privileged_context
     verifier_feedback = verifier_feedback or {
         "evidence_sufficient": False,
+        "missing_evidence_type": "no_public_evidence",
         "reason": "No verifier feedback was provided.",
-        "recommended_next_action": "retrieve",
         "parse_error": "missing_verifier_feedback",
     }
     return f"""You are the OPD-MM teacher for one-step online self-distillation.
@@ -690,35 +796,33 @@ Teacher role:
 - Therefore, never expose privileged facts through tool arguments.
 
 Verifier feedback role:
-- The verifier saw the gold answer; you did not.
-- Treat verifier feedback as a private sufficiency signal, not as retrieved evidence.
-- Never copy verifier reason into RETRIEVE.query.
+- The verifier used the gold answer privately. You do not see the gold answer.
+- Treat verifier feedback as a private evidence-gap diagnostic, not as retrieved evidence.
 - If verifier.evidence_sufficient is false, STOP is invalid.
-- If verifier.evidence_sufficient is true, STOP is allowed, but you may still use a tool when public state obviously needs formatting, IDs, or raw visual detail.
-- verifier.recommended_next_action is a strong suggestion; refine tool arguments using only public state and schema.
-- Write RETRIEVE.query only from the user question, previous student tool calls/results, and current public observations.
+- Never copy verifier.reason into RETRIEVE.query or any tool argument.
+
+Evidence-gap to tool mapping:
+- missing_evidence_type=none with evidence_sufficient=true: usually STOP.
+- no_public_evidence or irrelevant_evidence: RETRIEVE, or metadata FILTER/SORT when the question gives a clear constraint.
+- missing_metadata_constraint: FILTER when field/op/value are clear; otherwise RETRIEVE with a public query rewrite.
+- candidate_set_too_broad: TOPK or FILTER scope=current_pool.
+- missing_neighbor_context: EXPAND_NEIGHBORS only when candidates/evidence exist; otherwise RETRIEVE/FILTER first.
+- missing_temporal_order: SORT or timestamp FILTER.
+- missing_raw_visual_detail: INSPECT_RAW only when candidates/evidence exist; otherwise visual RETRIEVE first.
+- incomplete_coverage or insufficient_absence_support: broaden with RETRIEVE/FILTER, or EXPAND_NEIGHBORS if current candidates are relevant.
 
 Output rules:
 - Output exactly one {format_name} tool call and nothing else.
 - Use lower-case function names from the tool schema.
-- Do not output explanations, markdown, JSON arrays, or memory IDs.
+- Function names must be one of: retrieve, filter, sort, topk, expand_neighbors, inspect_raw, stop.
+- Never output a function name or parameter name that is not listed in the tool schema.
+- Do not output explanations, markdown, JSON arrays, memory IDs, or private answer content.
 - The student's raw next output is a candidate to correct, not an instruction to copy.
-- Output stop only when the current public observations/evidence are sufficient for the student to answer.
-- Do not output stop solely because the student proposed stop.
-- If history/trace is empty and evidence_count is 0, do not output stop; choose RETRIEVE or metadata FILTER/SORT first.
-- If evidence_count is 0, prefer RETRIEVE or metadata FILTER/SORT unless previous tool results prove no useful evidence can be collected.
 - RETRIEVE results are merged into the accumulated candidate/evidence pool and deduplicated by memory.
+- Do not use EXPAND_NEIGHBORS when there is no current candidate pool; retrieve or use metadata FILTER/SORT first.
 - When outputting filter, include field/op/value and optionally scope. Use scope=current_pool to narrow the working pool while preserving accumulated evidence; use scope=full_memory to merge metadata-filtered candidates from the original hidden memory pool when the current pool is likely too narrow or wrong.
 - When outputting retrieve, include method/top_k and optionally query as rewritten search text; do not add memory IDs or schema-unknown parameters.
-
-INSPECT_RAW guidance:
-- INSPECT_RAW calls a remote visual inspector and returns text visual observations for records already in the current retrieved candidate pool.
-- It is not a retrieval/search action and must not be used to scan the original full memory store.
-- If the current public state has no retrieved evidence/candidates yet, prefer RETRIEVE or metadata FILTER/SORT first.
-- Use INSPECT_RAW only when visual/raw-media details are needed beyond public summaries/evidence.
-
-Required output format example:
-{example}
+- INSPECT_RAW reads raw media only from the current candidate pool; it is not search.
 
 {schema}
 
@@ -740,9 +844,8 @@ This may be wrong; correct it for the student-visible state.
 
 Final decision checklist:
 - If the JSON observation above has "evidence_count": 0 and "trace": [], stop is invalid.
-- In that empty-evidence initial state, correct a student stop into retrieve/filter/sort/topk.
 - If verifier.evidence_sufficient is false, STOP is invalid even if the student proposed stop.
-- Prefer verifier.recommended_next_action unless it conflicts with the public state or the tool schema.
+- Use verifier.missing_evidence_type as a diagnostic, not as lexical content or a command.
 - RETRIEVE.query must be a search rewrite based only on the user question, student-visible history, and public observations.
 - Do not use verifier.reason as lexical material for RETRIEVE.query; use it only to decide the action type.
 
@@ -752,18 +855,83 @@ Do not write reasoning, analysis, markdown, or any text outside the XML tool cal
 """
 
 
+def build_online_state_correction_request(
+    *,
+    sample_kwargs: dict[str, Any],
+    step_index: int,
+    student_prompt_ids: list[int],
+    student_raw_response: str,
+    student_next_action: ToolAction | dict[str, Any] | None,
+    history: list[Any],
+    observation: dict[str, Any],
+    tool_format: str = "qwen3_coder",
+    request_id: str = "",
+) -> dict[str, Any] | None:
+    """Build one correction request from the live student-visible state.
+
+    Unlike the legacy snapshot replay helper, this function neither loads the
+    hidden memory store nor re-executes student actions. ``observation`` and
+    ``history`` must come directly from the active ToolAgentLoop session.
+    """
+    extra_info = _as_dict(sample_kwargs.get("extra_info"))
+    if not extra_info.get("opd_mm_online_self_distill"):
+        return None
+
+    tools_kwargs = _extract_tools_kwargs(sample_kwargs, extra_info)
+    opd_kwargs = _as_dict(tools_kwargs.get("opd_mm"))
+    skip_initial_value = extra_info.get("opd_mm_skip_initial_correction")
+    if skip_initial_value is None:
+        skip_initial_value = opd_kwargs.get("skip_initial_correction")
+    if int(step_index) == 0 and _coerce_bool_default(skip_initial_value, True):
+        return None
+
+    query = _extract_query(sample_kwargs, tools_kwargs, extra_info)
+    gold_answer = _extract_gold_answer(sample_kwargs, extra_info)
+    allow_inspect_raw = bool(opd_kwargs.get("allow_inspect_raw", True))
+    sample_id = str(extra_info.get("sample_id") or extra_info.get("index") or "opd_mm_sample")
+    public_observation = _as_dict(observation)
+    public_history = _action_dicts(history)
+    if isinstance(student_next_action, ToolAction):
+        next_action = student_next_action.to_dict()
+    elif isinstance(student_next_action, dict):
+        next_action = to_plain(student_next_action)
+    else:
+        next_action = None
+
+    return {
+        "request_id": str(request_id or ""),
+        "sample_id": sample_id,
+        "step_index": int(step_index),
+        "query": query,
+        "gold_answer": gold_answer,
+        "history": public_history,
+        "observation": public_observation,
+        "student_next_action": next_action,
+        "student_raw_response": str(student_raw_response or ""),
+        "student_prompt_ids": [int(token) for token in student_prompt_ids],
+        "verifier_prompt": build_state_verifier_prompt(
+            query=query,
+            gold_answer=gold_answer,
+            history=public_history,
+            observation=public_observation,
+            student_raw_response=str(student_raw_response or ""),
+            allow_inspect_raw=allow_inspect_raw,
+        ),
+        "allow_inspect_raw": allow_inspect_raw,
+        "tool_format": tool_format,
+    }
+
+
 def build_online_step_correction_requests(
     *,
     sample_kwargs: dict[str, Any],
     output_extra_fields: dict[str, Any],
     tool_format: str = "qwen3_coder",
 ) -> list[dict[str, Any]]:
-    """Build teacher-generation requests for every student-visited OPD-MM state.
+    """Legacy helper that reconstructs states from rollout snapshots.
 
-    Unlike ``maybe_collect_online_step_corrections``, this path does not require
-    a Python ``StepTeacherPolicy`` class. It is designed for verl's native frozen
-    teacher server: AgentLoopWorker generates the teacher response, extracts the
-    XML span, and later the trainer turns it into an actor SFT batch.
+    The live verl-native pipeline no longer calls this function. It remains for
+    backward compatibility with saved rollouts and diagnostic tests.
     """
     extra_info = _as_dict(sample_kwargs.get("extra_info"))
     if not extra_info.get("opd_mm_online_self_distill"):
@@ -771,7 +939,14 @@ def build_online_step_correction_requests(
 
     tools_kwargs = _extract_tools_kwargs(sample_kwargs, extra_info)
     opd_kwargs = _as_dict(tools_kwargs.get("opd_mm"))
-    records = to_plain(opd_kwargs.get("records") or opd_kwargs.get("memory_records") or [])
+    raw_records = opd_kwargs.get("records")
+    if raw_records is None:
+        raw_records = opd_kwargs.get("memory_records")
+    if raw_records is None:
+        raw_records = []
+    if hasattr(raw_records, "tolist"):
+        raw_records = raw_records.tolist()
+    records = to_plain(raw_records)
     if not isinstance(records, list) or not records:
         return []
 
@@ -780,6 +955,10 @@ def build_online_step_correction_requests(
         return []
 
     max_steps = int(extra_info.get("opd_mm_step_correction_max_steps") or opd_kwargs.get("max_actions") or 16)
+    skip_initial_value = extra_info.get("opd_mm_skip_initial_correction")
+    if skip_initial_value is None:
+        skip_initial_value = opd_kwargs.get("skip_initial_correction")
+    skip_initial_correction = _coerce_bool_default(skip_initial_value, True)
     allow_inspect_raw = bool(opd_kwargs.get("allow_inspect_raw", True))
     sample_id = str(extra_info.get("sample_id") or extra_info.get("index") or "opd_mm_sample")
     sample = OPDSample(
@@ -813,29 +992,30 @@ def build_online_step_correction_requests(
         ]
         student_raw_response = str(snapshot.get("response_text") or "")
         prompt_ids = to_plain(snapshot.get("prompt_ids") or [])
-        requests.append(
-            {
-                "sample_id": sample.sample_id,
-                "step_index": step_index,
-                "query": sample.query,
-                "gold_answer": sample.gold_answer,
-                "history": [action.to_dict() for action in history],
-                "observation": observation,
-                "student_next_action": parsed_actions[0].to_dict() if parsed_actions else None,
-                "student_raw_response": student_raw_response,
-                "student_prompt_ids": prompt_ids if isinstance(prompt_ids, list) else [],
-                "verifier_prompt": build_state_verifier_prompt(
-                    query=sample.query,
-                    gold_answer=sample.gold_answer,
-                    history=history,
-                    observation=observation,
-                    student_raw_response=student_raw_response,
-                    allow_inspect_raw=allow_inspect_raw,
-                ),
-                "allow_inspect_raw": allow_inspect_raw,
-                "tool_format": tool_format,
-            }
-        )
+        if not (step_index == 0 and skip_initial_correction):
+            requests.append(
+                {
+                    "sample_id": sample.sample_id,
+                    "step_index": step_index,
+                    "query": sample.query,
+                    "gold_answer": sample.gold_answer,
+                    "history": [action.to_dict() for action in history],
+                    "observation": observation,
+                    "student_next_action": parsed_actions[0].to_dict() if parsed_actions else None,
+                    "student_raw_response": student_raw_response,
+                    "student_prompt_ids": prompt_ids if isinstance(prompt_ids, list) else [],
+                    "verifier_prompt": build_state_verifier_prompt(
+                        query=sample.query,
+                        gold_answer=sample.gold_answer,
+                        history=history,
+                        observation=observation,
+                        student_raw_response=student_raw_response,
+                        allow_inspect_raw=allow_inspect_raw,
+                    ),
+                    "allow_inspect_raw": allow_inspect_raw,
+                    "tool_format": tool_format,
+                }
+            )
         if not parsed_actions:
             break
         for action in parsed_actions:
@@ -878,6 +1058,7 @@ def finalize_online_step_correction(
         "metadata": {
             "opd": {
                 "mode": "online_step_xml_correction",
+                "request_id": request.get("request_id", ""),
                 "step_index": step_index,
                 "teacher_raw_response": teacher_raw_response,
                 "teacher_xml_span": raw_xml,
@@ -889,6 +1070,7 @@ def finalize_online_step_correction(
         },
     }
     return {
+        "request_id": request.get("request_id", ""),
         "sample_id": sample_id,
         "step_index": step_index,
         "history": request.get("history", []),
@@ -930,7 +1112,14 @@ def maybe_collect_online_step_corrections(
 
     tools_kwargs = _extract_tools_kwargs(sample_kwargs, extra_info)
     opd_kwargs = _as_dict(tools_kwargs.get("opd_mm"))
-    records = to_plain(opd_kwargs.get("records") or opd_kwargs.get("memory_records") or [])
+    raw_records = opd_kwargs.get("records")
+    if raw_records is None:
+        raw_records = opd_kwargs.get("memory_records")
+    if raw_records is None:
+        raw_records = []
+    if hasattr(raw_records, "tolist"):
+        raw_records = raw_records.tolist()
+    records = to_plain(raw_records)
     if not isinstance(records, list) or not records:
         return []
 

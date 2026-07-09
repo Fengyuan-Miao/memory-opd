@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass, field
+from types import SimpleNamespace
 from typing import Any
 
 import numpy as np
@@ -24,9 +25,13 @@ import torch
 from tensordict import TensorDict
 
 from verl import DataProto
+from verl.experimental.agent_loop.agent_loop import AgentLoopWorker
+from verl.experimental.agent_loop.tool_agent_loop import ToolAgentLoop
+from verl.experimental.agent_loop.tool_parser import FunctionCall
 from verl.experimental.opd_mm import MemoryRecord, OPDSample, OnPolicyDistiller, PolicyOutput, ToolAction, ToolExecutor
 from verl.experimental.opd_mm.dataset import OPD_MM_SYSTEM_PROMPT, opd_messages_for_query, opd_sample_to_rlhf_record
 from verl.experimental.opd_mm.online_self_distill import (
+    build_online_state_correction_request,
     build_teacher_correction_prompt,
     build_online_step_correction_requests,
     dump_online_step_correction,
@@ -46,7 +51,9 @@ from verl.experimental.opd_mm.teacher_privilege import (
     build_teacher_privileged_prompt,
 )
 from verl.experimental.opd_mm.tools import (
+    OPDExpandNeighborsTool,
     OPDFilterTool,
+    OPDInspectRawTool,
     OPDRetrieveTool,
     OPDStopTool,
     hidden_store_from_records,
@@ -102,6 +109,64 @@ def _records() -> list[MemoryRecord]:
             source_type="generated_image",
             summary="An assistant-generated chart.",
             raw_pointer="images/chart.png",
+        ),
+    ]
+
+
+def _neighbor_records() -> list[MemoryRecord]:
+    return [
+        MemoryRecord(
+            memory_id="n_prev",
+            turn_id="scenario_a:D1:1",
+            timestamp="2026-02-01T09:00:00",
+            author="user",
+            modality="text",
+            source_type="conversation",
+            summary="The previous turn contains setup context.",
+            content="Previous context before the middle clue.",
+            metadata={"scenario": "scenario_a", "session_id": "D1", "round_id": "D1:1"},
+        ),
+        MemoryRecord(
+            memory_id="n_mid",
+            turn_id="scenario_a:D1:2",
+            timestamp="2026-02-01T09:01:00",
+            author="user",
+            modality="text",
+            source_type="conversation",
+            summary="The middle turn mentions the unique middle clue.",
+            content="The unique middle clue is here.",
+            metadata={"scenario": "scenario_a", "session_id": "D1", "round_id": "D1:2"},
+        ),
+        MemoryRecord(
+            memory_id="n_next",
+            turn_id="scenario_a:D1:3",
+            timestamp="2026-02-01T09:02:00",
+            author="assistant",
+            modality="text",
+            source_type="conversation",
+            summary="The next turn contains follow-up context.",
+            content="Follow-up context after the middle clue.",
+            metadata={"scenario": "scenario_a", "session_id": "D1", "round_id": "D1:3"},
+        ),
+        MemoryRecord(
+            memory_id="n_far",
+            turn_id="scenario_a:D1:5",
+            timestamp="2026-02-01T09:04:00",
+            author="assistant",
+            modality="text",
+            source_type="conversation",
+            summary="A farther turn should not be added with window one.",
+            metadata={"scenario": "scenario_a", "session_id": "D1", "round_id": "D1:5"},
+        ),
+        MemoryRecord(
+            memory_id="n_other_scenario",
+            turn_id="scenario_b:D1:3",
+            timestamp="2026-02-01T09:02:00",
+            author="assistant",
+            modality="text",
+            source_type="conversation",
+            summary="Same session label but different scenario.",
+            metadata={"scenario": "scenario_b", "session_id": "D1", "round_id": "D1:3"},
         ),
     ]
 
@@ -223,6 +288,24 @@ def test_validator_rejects_memory_ids_and_accepts_rewritten_retrieve_query() -> 
         validator.validate([{"tool": "RETRIEVE", "query": "look up m_001", "top_k": 3}])
 
 
+def test_validator_accepts_expand_neighbors_and_rejects_invalid_arguments() -> None:
+    validator = TrajectoryValidator(max_actions=4)
+
+    validated = validator.validate([{"tool": "EXPAND_NEIGHBORS", "window": 2}])
+    assert validated[0].tool == "EXPAND_NEIGHBORS"
+    assert validated[0].arguments == {"window": 2}
+
+    for bad_window in (0, 4, "1", True):
+        with pytest.raises(TrajectoryValidationError, match="window must be one of"):
+            validator.validate([{"tool": "EXPAND_NEIGHBORS", "window": bad_window}])
+
+    with pytest.raises(TrajectoryValidationError, match="unknown arguments"):
+        validator.validate([{"tool": "EXPAND_NEIGHBORS", "window": 1, "extra": "nope"}])
+
+    with pytest.raises(TrajectoryValidationError, match="forbidden arguments"):
+        validator.validate([{"tool": "EXPAND_NEIGHBORS", "window": 1, "memory_id": "safe"}])
+
+
 def test_executor_uses_rewritten_retrieve_query_when_provided() -> None:
     retriever = RecordingRetriever()
     ToolExecutor(retriever=retriever).run(
@@ -294,7 +377,9 @@ def test_executor_composes_generic_tools_to_latest_user_image() -> None:
     assert not result.error
     assert result.stopped
     assert result.final_memory_ids == ["m_cat_image"]
-    assert result.evidence[0].fields["raw_pointer"] == "images/cat.png"
+    assert result.evidence[0].fields["content"] == "A tabby cat sitting on a sofa."
+    assert "raw_pointer" not in result.evidence[0].fields
+    assert "summary" not in result.evidence[0].fields
     assert result.evidence[0].fields["session_date"] == "2026-01-01"
 
 
@@ -365,6 +450,39 @@ def test_turn_aware_retrieval_returns_text_and_image_from_same_turn() -> None:
     assert result.steps[0].evidence_added == 2
 
 
+def test_expand_neighbors_merges_same_session_neighbor_turns_without_replacing_evidence() -> None:
+    store = HiddenMemoryStore(_neighbor_records())
+    result = ToolExecutor(retriever=TurnAwareHybridRetriever(context_window=0)).run(
+        [
+            {"tool": "RETRIEVE", "method": "bm25", "top_k": 1, "query": "unique middle clue"},
+            {"tool": "EXPAND_NEIGHBORS", "window": 1},
+        ],
+        query="Need surrounding context for the middle clue.",
+        memory_store=store,
+    )
+
+    assert not result.error
+    assert {item.memory_id for item in result.evidence} == {"n_prev", "n_mid", "n_next"}
+    assert "n_far" not in {item.memory_id for item in result.evidence}
+    assert "n_other_scenario" not in {item.memory_id for item in result.evidence}
+    assert result.evidence[0].memory_id == "n_mid"
+    assert result.evidence[0].source == "RETRIEVE"
+    assert {item.source for item in result.evidence[1:]} == {"EXPAND_NEIGHBORS"}
+    assert result.steps[1].evidence_added == 2
+
+
+def test_expand_neighbors_requires_existing_candidate_pool_and_does_not_expose_full_memory_on_error() -> None:
+    result = ToolExecutor().run(
+        [{"tool": "EXPAND_NEIGHBORS", "window": 1}],
+        query="Expand before any search.",
+        memory_store=HiddenMemoryStore(_neighbor_records()),
+    )
+
+    assert "EXPAND_NEIGHBORS requires an existing candidate pool" in result.error
+    assert result.evidence == []
+    assert result.steps[0].error
+
+
 def test_inspect_raw_only_reads_retrieved_candidate_pool() -> None:
     store = HiddenMemoryStore(_records())
     inspector = FakeRawInspector()
@@ -425,7 +543,11 @@ async def test_verl_native_opd_tools_share_hidden_state_and_hide_ids() -> None:
 
     observation = json.loads(response.text)
     assert observation["pool_count"] == 1
-    assert observation["pool_preview"][0]["raw_pointer"] == "images/cat.png"
+    assert observation["pool_preview"][0]["content"] == "A tabby cat sitting on a sofa."
+    assert "raw_pointer" not in observation["pool_preview"][0]
+    assert "summary" not in observation["pool_preview"][0]
+    assert "source_type" not in observation["pool_preview"][0]
+    assert "turn_id" not in observation["pool_preview"][0]
     assert metrics["opd_mm_evidence_count"] == 2
     assert "memory_id" not in json.dumps(observation)
     assert agent_data.extra_fields["opd_mm"]["pool_count"] == 1
@@ -481,6 +603,179 @@ async def test_retrieve_tool_adds_public_evidence_before_inspect_raw() -> None:
 
 
 @pytest.mark.asyncio
+async def test_inspect_raw_can_use_async_teacher_service_callback() -> None:
+    records = [record.to_dict() for record in _records()]
+    calls: list[dict[str, Any]] = []
+
+    async def teacher_inspect(payload: dict[str, Any]) -> str:
+        calls.append(payload)
+        return "Teacher sees a tabby cat sitting on a sofa."
+
+    agent_data = FakeAgentData(
+        messages=[{"role": "user", "content": "What is in the cat image?"}],
+        tools_kwargs={
+            "opd_mm": {
+                "query": "What is in the cat image?",
+                "records": records,
+                "vector_store_dir": None,
+                "raw_inspector_backend": "teacher",
+            }
+        },
+    )
+    agent_data.teacher_raw_inspector = teacher_inspect
+    retrieve_tool = OPDRetrieveTool(config={"type": "native", "raw_inspector_backend": "teacher"}, tool_schema=None)
+    inspect_tool = OPDInspectRawTool(config={"type": "native", "raw_inspector_backend": "teacher"}, tool_schema=None)
+
+    await retrieve_tool.execute(
+        "instance",
+        {"method": "bm25", "top_k": 1, "query": "tabby cat sofa"},
+        agent_data=agent_data,
+    )
+    response, _, metrics = await inspect_tool.execute(
+        "instance",
+        {
+            "target": "current_pool",
+            "instruction": "answer_query_related_visual_details",
+        },
+        agent_data=agent_data,
+    )
+
+    observation = json.loads(response.text)
+    assert len(calls) == 1
+    assert calls[0]["raw_pointer"] == "images/cat.png"
+    assert calls[0]["query"] == "What is in the cat image?"
+    assert observation["error"] == ""
+    assert observation["new_evidence"][0]["source"] == "INSPECT_RAW"
+    assert observation["new_evidence"][0]["visual_observation"] == "Teacher sees a tabby cat sitting on a sofa."
+    assert metrics["agent_loop_terminate"] is False
+
+
+@pytest.mark.asyncio
+async def test_verl_native_expand_neighbors_observation_is_visible_next_step() -> None:
+    records = [record.to_dict() for record in _neighbor_records()]
+    agent_data = FakeAgentData(
+        messages=[{"role": "user", "content": "Find context around the unique middle clue."}],
+        tools_kwargs={
+            "opd_mm": {
+                "query": "Find context around the unique middle clue.",
+                "records": records,
+                "vector_store_dir": None,
+            }
+        },
+    )
+    retrieve_tool = OPDRetrieveTool(config={"type": "native"}, tool_schema=None)
+    expand_tool = OPDExpandNeighborsTool(config={"type": "native"}, tool_schema=None)
+
+    await retrieve_tool.execute("instance", {"method": "bm25", "top_k": 1, "query": "unique middle clue"}, agent_data=agent_data)
+    response, _, metrics = await expand_tool.execute("instance", {"window": 1}, agent_data=agent_data)
+
+    observation = json.loads(response.text)
+    assert observation["tool"] == "EXPAND_NEIGHBORS"
+    assert observation["pool_count"] == 3
+    assert observation["evidence_count"] == 3
+    assert {item["source"] for item in observation["new_evidence"]} == {"EXPAND_NEIGHBORS"}
+    assert {item["content"] for item in observation["new_evidence"]} == {
+        "Previous context before the middle clue.",
+        "Follow-up context after the middle clue.",
+    }
+    assert metrics["opd_mm_terminate"] is False
+    assert [item["tool"] for item in agent_data.extra_fields["opd_mm"]["trace"]] == [
+        "RETRIEVE",
+        "EXPAND_NEIGHBORS",
+    ]
+    assert "memory_id" not in json.dumps(observation)
+
+
+@pytest.mark.asyncio
+async def test_verl_native_expand_neighbors_without_candidates_errors_and_terminates() -> None:
+    records = [record.to_dict() for record in _neighbor_records()]
+    agent_data = FakeAgentData(
+        messages=[{"role": "user", "content": "Expand immediately."}],
+        tools_kwargs={"opd_mm": {"query": "Expand immediately.", "records": records, "vector_store_dir": None}},
+    )
+    expand_tool = OPDExpandNeighborsTool(config={"type": "native"}, tool_schema=None)
+
+    response, _, metrics = await expand_tool.execute("instance", {"window": 1}, agent_data=agent_data)
+
+    observation = json.loads(response.text)
+    assert "EXPAND_NEIGHBORS requires an existing candidate pool" in observation["error"]
+    assert observation["evidence_count"] == 0
+    assert metrics["agent_loop_terminate"] is True
+
+
+@pytest.mark.asyncio
+async def test_tool_agent_loop_collects_correction_from_each_live_state() -> None:
+    payloads: list[dict[str, Any]] = []
+
+    async def corrector(payload: dict[str, Any]) -> dict[str, Any]:
+        payloads.append(payload)
+        return {
+            "step_index": payload["step_index"],
+            "sft_prompt_ids": payload["student_prompt_ids"],
+            "sft_target_xml": "<tool_call><function=stop></function></tool_call>",
+        }
+
+    loop = SimpleNamespace(
+        tokenizer=SimpleNamespace(decode=lambda ids, skip_special_tokens=False: f"response-{ids[-1]}"),
+        tool_parser_name="qwen3_coder",
+    )
+    agent_data = SimpleNamespace(
+        online_state_corrector=corrector,
+        extra_fields={
+            "opd_mm": {
+                "pool_count": 1,
+                "evidence_count": 1,
+                "trace": [{"tool": "RETRIEVE", "method": "bm25", "top_k": 1}],
+                "evidence": [{"source": "RETRIEVE", "summary": "first evidence"}],
+            }
+        },
+        tool_calls=[FunctionCall(name="stop", arguments="{}")],
+        request_id="live-request",
+        assistant_turns=2,
+        image_data=None,
+        video_data=None,
+        audio_data=None,
+        mm_processor_kwargs={},
+    )
+
+    await ToolAgentLoop._collect_online_state_correction(
+        loop,
+        agent_data=agent_data,
+        state_prompt_ids=[1, 2, 3],
+        response_ids=[4],
+        assistant_content="",
+    )
+    agent_data.extra_fields["opd_mm"] = {
+        "pool_count": 3,
+        "evidence_count": 3,
+        "trace": [
+            {"tool": "RETRIEVE", "method": "bm25", "top_k": 1},
+            {"tool": "EXPAND_NEIGHBORS", "window": 1},
+        ],
+        "evidence": [{"source": "EXPAND_NEIGHBORS", "summary": "neighbor evidence"}],
+    }
+    agent_data.tool_calls = [FunctionCall(name="expand_neighbors", arguments='{"window": 1}')]
+    agent_data.assistant_turns = 3
+    await ToolAgentLoop._collect_online_state_correction(
+        loop,
+        agent_data=agent_data,
+        state_prompt_ids=[1, 2, 3, 4, 5],
+        response_ids=[6],
+        assistant_content="",
+    )
+
+    assert len(payloads) == 2
+    assert payloads[0]["step_index"] == 1
+    assert payloads[0]["observation"]["evidence_count"] == 1
+    assert payloads[0]["student_next_action"] == {"tool": "STOP"}
+    assert payloads[1]["step_index"] == 2
+    assert payloads[1]["observation"]["evidence_count"] == 3
+    assert payloads[1]["history"][-1]["tool"] == "EXPAND_NEIGHBORS"
+    assert payloads[1]["student_prompt_ids"] == [1, 2, 3, 4, 5]
+    assert len(agent_data.extra_fields["opd_mm_step_corrections"]) == 2
+
+
+@pytest.mark.asyncio
 async def test_opd_stop_tool_requests_agent_loop_termination() -> None:
     records = [record.to_dict() for record in _records()]
     agent_data = FakeAgentData(
@@ -503,7 +798,18 @@ def test_tool_config_loads_verl_native_opd_tools() -> None:
         tool_config_path="examples/opd_mm_baseline/opd_mm_tool_config.yaml",
         function_tool_path=None,
     )
-    assert [tool.name for tool in tools] == ["filter", "sort", "topk", "retrieve", "inspect_raw", "stop"]
+    assert [tool.name for tool in tools] == [
+        "filter",
+        "sort",
+        "topk",
+        "retrieve",
+        "expand_neighbors",
+        "inspect_raw",
+        "stop",
+    ]
+    inspect_tool = next(tool for tool in tools if tool.name == "inspect_raw")
+    assert inspect_tool.config["raw_inspector_backend"] == "teacher"
+    assert "raw_inspector_url" not in inspect_tool.config
 
 
 def test_sft_converter_can_emit_native_tool_call_records() -> None:
@@ -528,6 +834,7 @@ def test_sft_converter_can_emit_native_tool_call_records() -> None:
         "sort",
         "topk",
         "retrieve",
+        "expand_neighbors",
         "inspect_raw",
         "stop",
     ]
@@ -553,7 +860,7 @@ def test_opd_sample_converts_to_on_policy_distillation_row() -> None:
         {"role": "system", "content": OPD_MM_SYSTEM_PROMPT},
         {"role": "user", "content": sample.query},
     ]
-    for tool_name in ("RETRIEVE", "FILTER", "SORT", "TOPK", "INSPECT_RAW", "STOP"):
+    for tool_name in ("RETRIEVE", "FILTER", "SORT", "TOPK", "EXPAND_NEIGHBORS", "INSPECT_RAW", "STOP"):
         assert tool_name in row["prompt"][0]["content"]
     assert "scope=full_memory" in row["prompt"][0]["content"]
     assert "READ" not in row["prompt"][0]["content"]
@@ -704,7 +1011,7 @@ class FakeTeacher:
 
 class FakeAnswerModel:
     def answer(self, query: str, evidence: list[Any], question_image=None) -> str:
-        return " ".join(str(item.fields.get("summary", "")) for item in evidence)
+        return " ".join(str(item.fields.get("content") or item.fields.get("summary", "")) for item in evidence)
 
 
 class FakeJudge:
@@ -845,6 +1152,22 @@ def test_teacher_xml_correction_accepts_rewritten_retrieve_query() -> None:
     assert "<parameter=query>\npark walk dog YYYY-MM-DD\n</parameter>" in target_xml
 
 
+def test_teacher_xml_correction_accepts_expand_neighbors_tool_call() -> None:
+    parsed = extract_canonical_tool_call_xml(
+        "<tool_call>\n"
+        "<function=expand_neighbors>\n"
+        "<parameter=window>\n1\n</parameter>\n"
+        "</function>\n"
+        "</tool_call>"
+    )
+
+    assert parsed is not None
+    target_xml, action, _ = parsed
+    assert action.tool == "EXPAND_NEIGHBORS"
+    assert action.arguments == {"window": 1}
+    assert "<function=expand_neighbors>" in target_xml
+
+
 def test_teacher_xml_correction_recovers_unclosed_rewritten_retrieve_query() -> None:
     parsed = extract_canonical_tool_call_xml(
         "<tool_call>\n"
@@ -861,6 +1184,198 @@ def test_teacher_xml_correction_recovers_unclosed_rewritten_retrieve_query() -> 
     assert target_xml.endswith("</tool_call>")
 
 
+def test_live_online_state_request_uses_current_state_without_snapshot_replay() -> None:
+    request = build_online_state_correction_request(
+        sample_kwargs={
+            "raw_prompt": [{"role": "user", "content": "What happened after the relevant turn?"}],
+            "tools_kwargs": {
+                "opd_mm": {
+                    "query": "What happened after the relevant turn?",
+                    "allow_inspect_raw": True,
+                }
+            },
+            "extra_info": {
+                "gold_answer": "SECRET_GOLD_ANSWER",
+                "opd_mm_online_self_distill": True,
+                "sample_id": "live-state-sample",
+            },
+        },
+        request_id="request-live",
+        step_index=1,
+        student_prompt_ids=[11, 22, 33],
+        student_raw_response="<tool_call><function=stop></function></tool_call>",
+        student_next_action=ToolAction("STOP"),
+        history=[ToolAction("RETRIEVE", {"method": "bm25", "top_k": 1})],
+        observation={
+            "pool_count": 1,
+            "evidence_count": 1,
+            "trace": [{"tool": "RETRIEVE", "method": "bm25", "top_k": 1}],
+            "evidence": [{"source": "RETRIEVE", "summary": "Public evidence."}],
+        },
+    )
+
+    assert request is not None
+    assert request["request_id"] == "request-live"
+    assert request["step_index"] == 1
+    assert request["student_prompt_ids"] == [11, 22, 33]
+    assert request["history"] == [{"tool": "RETRIEVE", "method": "bm25", "top_k": 1}]
+    assert request["observation"]["evidence_count"] == 1
+    assert request["student_next_action"] == {"tool": "STOP"}
+    assert "SECRET_GOLD_ANSWER" in request["verifier_prompt"]
+
+
+def test_live_online_state_request_skips_initial_state_by_default() -> None:
+    request = build_online_state_correction_request(
+        sample_kwargs={
+            "raw_prompt": [{"role": "user", "content": "Find the relevant memory."}],
+            "tools_kwargs": {"opd_mm": {"query": "Find the relevant memory."}},
+            "extra_info": {
+                "gold_answer": "SECRET_GOLD_ANSWER",
+                "opd_mm_online_self_distill": True,
+                "sample_id": "skip-stage0-sample",
+            },
+        },
+        request_id="request-stage0",
+        step_index=0,
+        student_prompt_ids=[11, 22, 33],
+        student_raw_response="<tool_call><function=retrieve></function></tool_call>",
+        student_next_action=ToolAction("RETRIEVE", {"method": "hybrid", "top_k": 5}),
+        history=[],
+        observation={"pool_count": 0, "evidence_count": 0, "trace": []},
+    )
+
+    assert request is None
+
+
+@pytest.mark.asyncio
+async def test_agent_loop_worker_generates_verifier_and_teacher_for_one_live_state() -> None:
+    class FakeTeacherServer:
+        def __init__(self) -> None:
+            self.calls: list[dict[str, Any]] = []
+
+        async def generate_teacher_response_single(self, **kwargs: Any) -> list[int]:
+            self.calls.append(kwargs)
+            return [101] if len(self.calls) == 1 else [202]
+
+    teacher_server = FakeTeacherServer()
+
+    def decode(token_ids: list[int], skip_special_tokens: bool = False) -> str:
+        del skip_special_tokens
+        if token_ids == [101]:
+            return json.dumps(
+                {
+                    "evidence_sufficient": False,
+                    "reason": "Current public evidence needs neighboring dialogue context before answering.",
+                    "missing_evidence_type": "missing_neighbor_context",
+                }
+            )
+        return (
+            "<tool_call>\n"
+            "<function=expand_neighbors>\n"
+            "<parameter=window>\n1\n</parameter>\n"
+            "</function>\n"
+            "</tool_call>"
+        )
+
+    worker = SimpleNamespace(
+        teacher_key="data_source",
+        teacher_server_manager=teacher_server,
+        tokenizer=SimpleNamespace(decode=decode),
+        rollout_config=SimpleNamespace(multi_turn=SimpleNamespace(format="qwen3_coder")),
+        _encode_opd_mm_teacher_prompt=lambda prompt: [len(prompt)],
+    )
+    correction = await AgentLoopWorker._generate_opd_mm_online_state_correction(
+        worker,
+        sample_kwargs={
+            "data_source": "opd_mm",
+            "raw_prompt": [{"role": "user", "content": "What happened next?"}],
+            "tools_kwargs": {"opd_mm": {"query": "What happened next?"}},
+            "extra_info": {
+                "gold_answer": "private answer",
+                "opd_mm_online_self_distill": True,
+                "sample_id": "live-worker-sample",
+            },
+        },
+        state_payload={
+            "request_id": "live-worker-request",
+            "step_index": 1,
+            "student_prompt_ids": [7, 8, 9],
+            "student_raw_response": "<tool_call><function=stop></function></tool_call>",
+            "student_next_action": {"tool": "STOP"},
+            "history": [{"tool": "RETRIEVE", "method": "bm25", "top_k": 1}],
+            "observation": {
+                "pool_count": 1,
+                "evidence_count": 1,
+                "trace": [{"tool": "RETRIEVE", "method": "bm25", "top_k": 1}],
+                "evidence": [{"source": "RETRIEVE", "summary": "public evidence"}],
+            },
+            "tool_format": "qwen3_coder",
+            "multi_modal_data": {},
+            "mm_processor_kwargs": {},
+        },
+    )
+
+    assert correction is not None
+    assert len(teacher_server.calls) == 2
+    assert correction["step_index"] == 1
+    assert correction["sft_prompt_ids"] == [7, 8, 9]
+    assert correction["teacher_actions"] == [{"tool": "EXPAND_NEIGHBORS", "window": 1}]
+    assert correction["feedback"]["missing_evidence_type"] == "missing_neighbor_context"
+
+
+@pytest.mark.asyncio
+async def test_agent_loop_worker_raw_inspection_uses_teacher_vllm(tmp_path, monkeypatch) -> None:
+    image_path = tmp_path / "memory.png"
+    from PIL import Image
+
+    Image.new("RGB", (4, 4), color="red").save(image_path)
+
+    class FakeTeacherServer:
+        def __init__(self) -> None:
+            self.calls: list[dict[str, Any]] = []
+
+        async def generate_teacher_response_single(self, **kwargs: Any) -> list[int]:
+            self.calls.append(kwargs)
+            return [303]
+
+    teacher_server = FakeTeacherServer()
+    monkeypatch.setattr(
+        "verl.experimental.agent_loop.agent_loop.apply_chat_template",
+        lambda *args, **kwargs: "formatted multimodal prompt",
+    )
+    monkeypatch.setattr(
+        "verl.experimental.agent_loop.agent_loop.build_multimodal_processor_inputs",
+        lambda *args, **kwargs: {"input_ids": [[11, 22, 33]]},
+    )
+    worker = SimpleNamespace(
+        processor=object(),
+        teacher_key="data_source",
+        teacher_server_manager=teacher_server,
+        tokenizer=SimpleNamespace(
+            decode=lambda token_ids, skip_special_tokens=True: "A red square is visible."
+        ),
+        _get_mm_processor_kwargs=lambda: {},
+    )
+
+    observation = await AgentLoopWorker._generate_opd_mm_teacher_raw_inspection(
+        worker,
+        sample_kwargs={"data_source": "opd_mm"},
+        payload={
+            "raw_pointer": str(image_path),
+            "query": "What color is visible?",
+            "question_image": None,
+            "text_context": "A color sample.",
+        },
+        inspector_config={"raw_inspector_max_tokens": 64, "raw_inspector_temperature": 0.0},
+    )
+
+    assert observation == "A red square is visible."
+    assert len(teacher_server.calls) == 1
+    assert teacher_server.calls[0]["prompt_ids"] == [11, 22, 33]
+    assert len(teacher_server.calls[0]["multi_modal_data"]["images"]) == 1
+    assert teacher_server.calls[0]["sampling_params"]["max_tokens"] == 64
+
+
 def test_online_xml_correction_requests_include_invalid_student_state() -> None:
     requests = build_online_step_correction_requests(
         sample_kwargs={
@@ -871,11 +1386,12 @@ def test_online_xml_correction_requests_include_invalid_student_state() -> None:
                     "records": [record.to_dict(include_internal_id=True) for record in _records()],
                 }
             },
-            "extra_info": {
-                "gold_answer": "SECRET_GOLD_ANSWER",
-                "opd_mm_online_self_distill": True,
-                "sample_id": "online-xml-sample",
-            },
+                "extra_info": {
+                    "gold_answer": "SECRET_GOLD_ANSWER",
+                    "opd_mm_online_self_distill": True,
+                    "opd_mm_skip_initial_correction": False,
+                    "sample_id": "online-xml-sample",
+                },
         },
         output_extra_fields={
             "opd_mm_generation_snapshots": [
@@ -894,16 +1410,18 @@ def test_online_xml_correction_requests_include_invalid_student_state() -> None:
     assert "teacher_prompt" not in requests[0]
     assert "You are the OPD-MM state verifier" in requests[0]["verifier_prompt"]
     assert "Private rubric:" in requests[0]["verifier_prompt"]
-    assert "Tool/action guide:" in requests[0]["verifier_prompt"]
-    assert "retrieve(method=bm25|dense|vision|hybrid" in requests[0]["verifier_prompt"]
-    assert "filter(field=modality|author|source_type|timestamp|status" in requests[0]["verifier_prompt"]
-    assert "inspect_raw(target=current_pool" in requests[0]["verifier_prompt"]
+    assert "Current public evidence state and observations" in requests[0]["verifier_prompt"]
+    assert "Tool semantics to consider" not in requests[0]["verifier_prompt"]
+    assert "retrieve(method=bm25|dense|vision|hybrid" not in requests[0]["verifier_prompt"]
+    assert "filter(field=modality|author|source_type|timestamp|status" not in requests[0]["verifier_prompt"]
+    assert "expand_neighbors(window=1|2|3" not in requests[0]["verifier_prompt"]
+    assert "inspect_raw(target=current_pool" not in requests[0]["verifier_prompt"]
     assert "SECRET_GOLD_ANSWER" in requests[0]["verifier_prompt"]
 
     verifier_feedback = {
         "evidence_sufficient": False,
+        "missing_evidence_type": "no_public_evidence",
         "reason": "Need public retrieval evidence before answering.",
-        "recommended_next_action": "retrieve",
         "parse_error": "",
     }
     requests[0]["verifier_feedback"] = verifier_feedback
@@ -920,12 +1438,11 @@ def test_online_xml_correction_requests_include_invalid_student_state() -> None:
     assert "Teacher role:" in requests[0]["teacher_prompt"]
     assert "Correct exactly one next tool action" in requests[0]["teacher_prompt"]
     assert "Verifier feedback role:" in requests[0]["teacher_prompt"]
-    assert "The verifier saw the gold answer; you did not." in requests[0]["teacher_prompt"]
+    assert "The verifier used the gold answer privately. You do not see the gold answer." in requests[0]["teacher_prompt"]
     assert "Gold answer:" not in requests[0]["teacher_prompt"]
     assert "SECRET_GOLD_ANSWER" not in requests[0]["teacher_prompt"]
-    assert "Never copy verifier reason into RETRIEVE.query" in requests[0]["teacher_prompt"]
+    assert "Never copy verifier.reason into RETRIEVE.query" in requests[0]["teacher_prompt"]
     assert "not an instruction to copy" in requests[0]["teacher_prompt"]
-    assert "history/trace is empty and evidence_count is 0, do not output stop" in requests[0]["teacher_prompt"]
     assert 'If the JSON observation above has "evidence_count": 0 and "trace": [], stop is invalid' in requests[
         0
     ]["teacher_prompt"]
@@ -933,6 +1450,7 @@ def test_online_xml_correction_requests_include_invalid_student_state() -> None:
     assert "Do not use verifier.reason as lexical material for RETRIEVE.query" in requests[0]["teacher_prompt"]
     assert "scope=full_memory" in requests[0]["teacher_prompt"]
     assert "optionally query as rewritten search text" in requests[0]["teacher_prompt"]
+    assert "EXPAND_NEIGHBORS(window=1|2|3)" in requests[0]["teacher_prompt"]
 
     correction = finalize_online_step_correction(
         requests[0],
@@ -960,13 +1478,13 @@ def test_state_verifier_feedback_parser_accepts_wrapped_json_and_blocks_stop() -
     feedback = parse_state_verifier_feedback(
         "```json\n"
         '{"evidence_sufficient": false, "reason": "Need broader public evidence.", '
-        '"recommended_next_action": "STOP"}\n'
+        '"missing_evidence_type": "none"}\n'
         "```",
         {"evidence_count": 3},
     )
 
     assert feedback["evidence_sufficient"] is False
-    assert feedback["recommended_next_action"] == "retrieve"
+    assert feedback["missing_evidence_type"] == "incomplete_coverage"
     assert feedback["parse_error"] == ""
 
 
@@ -974,29 +1492,53 @@ def test_state_verifier_feedback_sanitizes_gold_answer_leakage() -> None:
     feedback = parse_state_verifier_feedback(
         '{"evidence_sufficient": false, '
         "\"reason\": \"No evidence found mentioning Lena's brother or a cat named Miso.\", "
-        '"recommended_next_action": "retrieve"}',
+        '"missing_evidence_type": "no_public_evidence"}',
         {"evidence_count": 0},
         gold_answer="Miso",
         query="What is the name of Lena’s brother’s cat?",
     )
 
     assert feedback["evidence_sufficient"] is False
-    assert feedback["recommended_next_action"] == "retrieve"
+    assert feedback["missing_evidence_type"] == "no_public_evidence"
     assert "Miso" not in feedback["reason"]
     assert "gold answer" not in feedback["reason"].lower()
     assert feedback["reason"] == "Current public evidence is insufficient; collect relevant evidence first."
 
 
-def test_state_verifier_feedback_parser_falls_back_on_invalid_action() -> None:
+def test_state_verifier_feedback_parser_falls_back_on_invalid_missing_evidence_type() -> None:
     feedback = parse_state_verifier_feedback(
-        '{"evidence_sufficient": true, "reason": "Looks enough.", "recommended_next_action": "jump"}',
+        '{"evidence_sufficient": true, "reason": "Looks enough.", "missing_evidence_type": "jump"}',
         {"evidence_count": 2},
     )
 
-    # "jump" is intentionally not a verifier action; use the safe non-leaking fallback.
+    # "jump" is intentionally not a verifier missing-evidence type; use the safe non-leaking fallback.
     assert feedback["evidence_sufficient"] is False
-    assert feedback["recommended_next_action"] == "retrieve"
-    assert "invalid recommended_next_action" in feedback["parse_error"]
+    assert feedback["missing_evidence_type"] == "no_public_evidence"
+    assert "invalid missing_evidence_type" in feedback["parse_error"]
+
+
+def test_state_verifier_feedback_parser_accepts_expand_neighbors_when_candidates_exist() -> None:
+    feedback = parse_state_verifier_feedback(
+        '{"evidence_sufficient": false, "reason": "Need neighboring dialogue context.", '
+        '"missing_evidence_type": "missing_neighbor_context"}',
+        {"evidence_count": 1, "pool_count": 1},
+    )
+
+    assert feedback["evidence_sufficient"] is False
+    assert feedback["missing_evidence_type"] == "missing_neighbor_context"
+    assert feedback["parse_error"] == ""
+
+
+def test_state_verifier_feedback_parser_falls_back_from_expand_neighbors_on_empty_state() -> None:
+    feedback = parse_state_verifier_feedback(
+        '{"evidence_sufficient": false, "reason": "Need neighboring dialogue context.", '
+        '"missing_evidence_type": "missing_neighbor_context"}',
+        {"evidence_count": 0, "pool_count": 5, "trace": [{"tool": "SORT"}]},
+    )
+
+    assert feedback["evidence_sufficient"] is False
+    assert feedback["missing_evidence_type"] == "no_public_evidence"
+    assert feedback["parse_error"] == ""
 
 
 def test_online_xml_correction_stop_gate_replaces_insufficient_teacher_stop() -> None:
@@ -1011,11 +1553,11 @@ def test_online_xml_correction_stop_gate_replaces_insufficient_teacher_stop() ->
         "allow_inspect_raw": True,
         "tool_format": "qwen3_coder",
         "verifier_raw_response": '{"evidence_sufficient": false, "reason": "Need list coverage.", '
-        '"recommended_next_action": "retrieve"}',
+        '"missing_evidence_type": "incomplete_coverage"}',
         "verifier_feedback": {
             "evidence_sufficient": False,
+            "missing_evidence_type": "incomplete_coverage",
             "reason": "Need list coverage.",
-            "recommended_next_action": "retrieve",
             "parse_error": "",
         },
     }
@@ -1029,6 +1571,37 @@ def test_online_xml_correction_stop_gate_replaces_insufficient_teacher_stop() ->
     assert correction["stop_gate_applied"] is True
     assert correction["teacher_actions"][0]["tool"] == "RETRIEVE"
     assert "<function=retrieve>" in correction["sft_target_xml"]
+
+
+def test_online_xml_correction_stop_gate_can_fallback_to_expand_neighbors() -> None:
+    request = {
+        "sample_id": "stop-gate-expand",
+        "step_index": 1,
+        "query": "What happened around the relevant turn?",
+        "history": [{"tool": "RETRIEVE", "method": "bm25", "top_k": 1}],
+        "observation": {"evidence_count": 1, "pool_count": 1, "trace": [{"tool": "RETRIEVE"}]},
+        "student_raw_response": "<tool_call><function=stop></function></tool_call>",
+        "student_prompt_ids": [7, 8, 9],
+        "allow_inspect_raw": True,
+        "tool_format": "qwen3_coder",
+        "verifier_feedback": {
+            "evidence_sufficient": False,
+            "missing_evidence_type": "missing_neighbor_context",
+            "reason": "Need neighboring dialogue context.",
+            "parse_error": "",
+        },
+    }
+
+    correction = finalize_online_step_correction(
+        request,
+        teacher_raw_response="<tool_call>\n<function=stop>\n</function>\n</tool_call>",
+    )
+
+    assert correction is not None
+    assert correction["stop_gate_applied"] is True
+    assert correction["teacher_actions"][0]["tool"] == "EXPAND_NEIGHBORS"
+    assert correction["teacher_actions"][0]["window"] == 1
+    assert "<function=expand_neighbors>" in correction["sft_target_xml"]
 
 
 def test_online_teacher_correction_dump_writes_jsonl(tmp_path, monkeypatch) -> None:
@@ -1117,6 +1690,7 @@ def test_helpers_build_hidden_store_from_dicts_and_schemas() -> None:
         "sort",
         "topk",
         "retrieve",
+        "expand_neighbors",
         "stop",
     ]
     filter_scope = schemas[0]["function"]["parameters"]["properties"]["scope"]

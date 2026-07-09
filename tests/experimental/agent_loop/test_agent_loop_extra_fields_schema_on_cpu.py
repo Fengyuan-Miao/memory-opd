@@ -421,9 +421,6 @@ async def test_agent_loop_postprocess_accepts_read_only_routed_experts_on_cpu():
             self.mm_processor_kwargs = {}
             self.reward_loop_worker_handles = None
 
-        async def _collect_opd_mm_online_step_corrections(self, output, validate, sample_kwargs=None):
-            del output, validate, sample_kwargs
-
     routed_experts = np.arange(8, dtype=np.int64).reshape(4, 2, 1)
     routed_experts.setflags(write=False)
     assert not routed_experts.flags.writeable

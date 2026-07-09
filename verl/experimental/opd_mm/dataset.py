@@ -75,18 +75,23 @@ Retrieval tools and when to use them:
   like latest, earliest, last, first, before, or after.
 - TOPK: Use this after RETRIEVE, FILTER, or SORT to keep a small candidate set. Prefer a small k
   when the next step should inspect only the strongest or most recent candidates.
+- EXPAND_NEIGHBORS: Use this after RETRIEVE/FILTER has selected plausible turns but the evidence is missing
+  nearby dialogue context, temporal order, speaker/person relation, or adjacent event details. It adds
+  same-session neighboring turns around the current candidate pool and merges them into accumulated evidence.
+  Do not call it when there is no current candidate pool; retrieve or use FILTER scope=full_memory first.
 - INSPECT_RAW: Call a remote visual inspector on raw image/media for records in the current retrieved candidate
   pool when public summaries/evidence are insufficient for visual details. It returns text visual observations,
   not memory IDs. It is not a search tool and does not inspect the original full memory store; first
   retrieve/narrow candidates, then inspect raw content only if needed.
-- STOP: Use this when you have enough evidence to answer, when further retrieval is unlikely to help, or when
-  the tool observations indicate an unrecoverable error.
+- STOP: Use this only when the retrieved public evidence is sufficient to answer, or when tool observations
+  indicate an unrecoverable error. During inference there is no gold-aware validator to rescue an early STOP.
 
 Good retrieval behavior:
 - Analyze the query before choosing RETRIEVE or another tool.
 - Work step by step. After each tool result, decide whether to narrow, inspect raw content, or stop.
-- Prefer SORT/TOPK when the pool is broad. Use FILTER scope=full_memory when you need to add candidates from
-  the original memory pool using a reliable metadata constraint.
+- Prefer SORT/TOPK when the pool is broad. Use EXPAND_NEIGHBORS when a plausible turn needs surrounding
+  context. Use FILTER scope=full_memory when you need to add candidates from the original memory pool using
+  a reliable metadata constraint.
 - Prefer ordinary retrieval observations before INSPECT_RAW; use raw inspection to verify visual details of
   retrieved candidates, not to search the whole memory store.
 - Base the final answer only on retrieved evidence and public tool observations.
@@ -149,7 +154,13 @@ def opd_sample_to_rlhf_record(
             "teacher_privilege_mode": "opd_mm",
         }
     )
-    for key in ("opd_mm_online_self_distill", "opd_mm_step_teacher_class", "opd_mm_step_teacher_kwargs"):
+    for key in (
+        "opd_mm_online_self_distill",
+        "opd_mm_step_teacher_class",
+        "opd_mm_step_teacher_kwargs",
+        "opd_mm_step_verifier_kwargs",
+        "opd_mm_skip_initial_correction",
+    ):
         if key in sample.metadata:
             extra_info[key] = sample.metadata[key]
     system_prompt = sample.metadata.get("opd_mm_system_prompt", OPD_MM_SYSTEM_PROMPT)

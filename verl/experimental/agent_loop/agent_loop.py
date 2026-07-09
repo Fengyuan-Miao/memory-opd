@@ -32,6 +32,7 @@ import logging
 import os
 import random
 from abc import ABC, abstractmethod
+from pathlib import Path
 from typing import Any, Optional
 from uuid import uuid4
 
@@ -691,8 +692,275 @@ class AgentLoopWorker:
                 data_config=DictConfigWrap(self.config.data),
                 tools=ToolListWrap(self.tools),
             )
-            output: AgentLoopOutput = await agent_loop.run(sampling_params, **kwargs)
+            run_kwargs = dict(kwargs)
+            inline_corrector = self._make_opd_mm_online_state_corrector(
+                validate=trajectory["validate"],
+                sample_kwargs=kwargs,
+            )
+            if inline_corrector is not None and agent_name == "tool_agent":
+                run_kwargs["_opd_mm_online_state_corrector"] = inline_corrector
+            teacher_raw_inspector = self._make_opd_mm_teacher_raw_inspector(sample_kwargs=kwargs)
+            if teacher_raw_inspector is not None and agent_name == "tool_agent":
+                run_kwargs["_opd_mm_teacher_raw_inspector"] = teacher_raw_inspector
+            output: AgentLoopOutput = await agent_loop.run(sampling_params, **run_kwargs)
             return await self._agent_loop_postprocess(output, trajectory["validate"], **kwargs)
+
+    def _make_opd_mm_online_state_corrector(
+        self,
+        *,
+        validate: bool,
+        sample_kwargs: dict[str, Any],
+    ) -> Optional[Any]:
+        """Create an async callback that corrects each live OPD-MM state."""
+        if validate or not self.distillation_enabled or not self._is_opd_mm_online_self_distill(sample_kwargs):
+            return None
+
+        async def correct(state_payload: dict[str, Any]) -> Optional[dict[str, Any]]:
+            return await self._generate_opd_mm_online_state_correction(
+                sample_kwargs=sample_kwargs,
+                state_payload=state_payload,
+            )
+
+        return correct
+
+    def _opd_mm_raw_inspector_config(self) -> dict[str, Any]:
+        config: dict[str, Any] = {}
+        for tool in self.tools:
+            if getattr(tool, "name", "") != "inspect_raw":
+                continue
+            raw_config = getattr(tool, "config", {}) or {}
+            if hasattr(raw_config, "items"):
+                config.update(dict(raw_config))
+            break
+        backend = os.getenv("OPD_MM_RAW_INSPECTOR_BACKEND") or config.get("raw_inspector_backend")
+        if backend:
+            config["raw_inspector_backend"] = str(backend)
+        return config
+
+    def _make_opd_mm_teacher_raw_inspector(
+        self,
+        *,
+        sample_kwargs: dict[str, Any],
+    ) -> Optional[Any]:
+        """Create an async INSPECT_RAW callback routed to the frozen teacher."""
+        config = self._opd_mm_raw_inspector_config()
+        if (
+            not self.distillation_enabled
+            or not self._is_opd_mm_online_self_distill(sample_kwargs)
+            or str(config.get("raw_inspector_backend") or "").lower() != "teacher"
+        ):
+            return None
+
+        async def inspect(payload: dict[str, Any]) -> str:
+            return await self._generate_opd_mm_teacher_raw_inspection(
+                sample_kwargs=sample_kwargs,
+                payload=payload,
+                inspector_config=config,
+            )
+
+        return inspect
+
+    async def _generate_opd_mm_teacher_raw_inspection(
+        self,
+        *,
+        sample_kwargs: dict[str, Any],
+        payload: dict[str, Any],
+        inspector_config: dict[str, Any],
+    ) -> str:
+        """Inspect raw images through the same verl teacher vLLM service."""
+        from verl.experimental.opd_mm.raw_inspector import RemoteVLLMRawInspector
+
+        try:
+            if self.processor is None:
+                raise RuntimeError("teacher raw inspection requires a multimodal processor")
+            raw_pointer = Path(str(payload.get("raw_pointer") or ""))
+            if not raw_pointer.exists():
+                raise FileNotFoundError(f"image path does not exist: {raw_pointer}")
+
+            images: list[Image.Image] = []
+            with Image.open(raw_pointer) as image:
+                images.append(image.convert("RGB").copy())
+            question_image = payload.get("question_image")
+            if question_image:
+                question_path = Path(str(question_image))
+                if question_path.exists():
+                    with Image.open(question_path) as image:
+                        images.append(image.convert("RGB").copy())
+
+            content: list[dict[str, Any]] = [{"type": "image"} for _ in images]
+            content.append(
+                {
+                    "type": "text",
+                    "text": RemoteVLLMRawInspector._prompt(
+                        query=str(payload.get("query") or ""),
+                        text_context=str(payload.get("text_context") or ""),
+                    ),
+                }
+            )
+            messages = [
+                {
+                    "role": "system",
+                    "content": (
+                        "You are an OPD-MM raw visual inspector. Inspect the provided image directly and "
+                        "return only concise, query-relevant visual facts. Do not invent hidden memory IDs."
+                    ),
+                },
+                {"role": "user", "content": content},
+            ]
+            loop = asyncio.get_running_loop()
+            raw_prompt = await loop.run_in_executor(
+                None,
+                lambda: apply_chat_template(
+                    self.processor,
+                    messages,
+                    add_generation_prompt=True,
+                    tokenize=False,
+                ),
+            )
+            mm_processor_kwargs = self._get_mm_processor_kwargs()
+            model_inputs = await loop.run_in_executor(
+                None,
+                lambda: build_multimodal_processor_inputs(
+                    self.processor,
+                    text=[raw_prompt],
+                    images=images,
+                    mm_processor_kwargs=mm_processor_kwargs,
+                ),
+            )
+            prompt_ids = normalize_token_ids(model_inputs.pop("input_ids"))
+
+            routing_key = None
+            routing_value = sample_kwargs.get(self.teacher_key)
+            if routing_value is not None:
+                routing_key = routing_value.item() if hasattr(routing_value, "item") else routing_value
+            sampling_params = {
+                "max_tokens": int(
+                    os.getenv("OPD_MM_RAW_INSPECTOR_MAX_TOKENS")
+                    or inspector_config.get("raw_inspector_max_tokens")
+                    or 256
+                ),
+                "temperature": float(
+                    os.getenv("OPD_MM_RAW_INSPECTOR_TEMPERATURE")
+                    or inspector_config.get("raw_inspector_temperature")
+                    or 0.0
+                ),
+                "top_p": 1.0,
+                "top_k": -1,
+            }
+            response_ids = await self.teacher_server_manager.generate_teacher_response_single(
+                prompt_ids=prompt_ids,
+                sampling_params=sampling_params,
+                multi_modal_data={"images": images},
+                mm_processor_kwargs=mm_processor_kwargs,
+                routing_key=routing_key,
+            )
+            observation = self.tokenizer.decode(response_ids, skip_special_tokens=True).strip()
+            return observation or "RAW_INSPECT_ERROR: empty response from teacher service"
+        except Exception as exc:
+            return f"RAW_INSPECT_ERROR: {type(exc).__name__}: {exc}"
+
+    async def _generate_opd_mm_online_state_correction(
+        self,
+        *,
+        sample_kwargs: dict[str, Any],
+        state_payload: dict[str, Any],
+    ) -> Optional[dict[str, Any]]:
+        """Run verifier and teacher once for the current live student state."""
+        from verl.experimental.opd_mm.online_self_distill import (
+            build_online_state_correction_request,
+            build_teacher_correction_prompt,
+            dump_online_step_correction,
+            finalize_online_step_correction,
+            parse_state_verifier_feedback,
+        )
+
+        request = build_online_state_correction_request(
+            sample_kwargs=sample_kwargs,
+            step_index=int(state_payload.get("step_index") or 0),
+            student_prompt_ids=list(state_payload.get("student_prompt_ids") or []),
+            student_raw_response=str(state_payload.get("student_raw_response") or ""),
+            student_next_action=state_payload.get("student_next_action"),
+            history=list(state_payload.get("history") or []),
+            observation=state_payload.get("observation") or {},
+            tool_format=str(state_payload.get("tool_format") or self.rollout_config.multi_turn.format),
+            request_id=str(state_payload.get("request_id") or ""),
+        )
+        if request is None:
+            return None
+
+        routing_key = None
+        routing_value = sample_kwargs.get(self.teacher_key)
+        if routing_value is not None:
+            routing_key = routing_value.item() if hasattr(routing_value, "item") else routing_value
+
+        teacher_kwargs = {}
+        verifier_kwargs = {}
+        extra_info = sample_kwargs.get("extra_info") or {}
+        if hasattr(extra_info, "get"):
+            raw_teacher_kwargs = extra_info.get("opd_mm_step_teacher_kwargs") or {}
+            if hasattr(raw_teacher_kwargs, "items"):
+                teacher_kwargs = dict(raw_teacher_kwargs)
+            raw_verifier_kwargs = extra_info.get("opd_mm_step_verifier_kwargs") or {}
+            verifier_kwargs = dict(teacher_kwargs)
+            if hasattr(raw_verifier_kwargs, "items"):
+                verifier_kwargs.update(dict(raw_verifier_kwargs))
+        teacher_sampling_params = {
+            "max_tokens": int(teacher_kwargs.get("max_tokens", 128)),
+            "temperature": float(teacher_kwargs.get("temperature", 0.0)),
+            "top_p": float(teacher_kwargs.get("top_p", 1.0)),
+            "top_k": int(teacher_kwargs.get("top_k", -1)),
+        }
+        verifier_sampling_params = {
+            "max_tokens": int(verifier_kwargs.get("max_tokens", 256)),
+            "temperature": float(verifier_kwargs.get("temperature", 0.0)),
+            "top_p": float(verifier_kwargs.get("top_p", 1.0)),
+            "top_k": int(verifier_kwargs.get("top_k", -1)),
+        }
+        multi_modal_data = state_payload.get("multi_modal_data") or {}
+        mm_processor_kwargs = state_payload.get("mm_processor_kwargs") or {}
+
+        verifier_prompt_ids = self._encode_opd_mm_teacher_prompt(request["verifier_prompt"])
+        verifier_response_ids = await self.teacher_server_manager.generate_teacher_response_single(
+            prompt_ids=verifier_prompt_ids,
+            sampling_params=verifier_sampling_params,
+            multi_modal_data=multi_modal_data,
+            mm_processor_kwargs=mm_processor_kwargs,
+            routing_key=routing_key,
+        )
+        verifier_raw_response = self.tokenizer.decode(verifier_response_ids, skip_special_tokens=False)
+        verifier_feedback = parse_state_verifier_feedback(
+            verifier_raw_response,
+            request.get("observation", {}),
+            gold_answer=str(request.get("gold_answer", "")),
+            query=str(request.get("query", "")),
+        )
+        request["verifier_raw_response"] = verifier_raw_response
+        request["verifier_feedback"] = verifier_feedback
+        request["teacher_prompt"] = build_teacher_correction_prompt(
+            query=request.get("query", ""),
+            history=request.get("history", []),
+            observation=request.get("observation", {}),
+            student_raw_response=request.get("student_raw_response", ""),
+            verifier_feedback=verifier_feedback,
+            allow_inspect_raw=bool(request.get("allow_inspect_raw", True)),
+            tool_format=str(request.get("tool_format") or self.rollout_config.multi_turn.format),
+        )
+        teacher_prompt_ids = self._encode_opd_mm_teacher_prompt(request["teacher_prompt"])
+        teacher_response_ids = await self.teacher_server_manager.generate_teacher_response_single(
+            prompt_ids=teacher_prompt_ids,
+            sampling_params=teacher_sampling_params,
+            multi_modal_data=multi_modal_data,
+            mm_processor_kwargs=mm_processor_kwargs,
+            routing_key=routing_key,
+        )
+        teacher_raw_response = self.tokenizer.decode(teacher_response_ids, skip_special_tokens=False)
+        correction = finalize_online_step_correction(request, teacher_raw_response=teacher_raw_response)
+        dump_online_step_correction(
+            request,
+            teacher_raw_response=teacher_raw_response,
+            correction=correction,
+        )
+        return correction
 
     def _pad_token_ids(
         self,
@@ -829,7 +1097,6 @@ class AgentLoopWorker:
             ),
         )
         await self._compute_score([output], kwargs=kwargs)
-        await self._collect_opd_mm_online_step_corrections(output, validate=validate, sample_kwargs=kwargs)
         if (
             not AgentLoopWorker._is_opd_mm_online_self_distill(kwargs)
             and "opd_mm_step_corrections" not in output.extra_fields
@@ -1019,124 +1286,6 @@ class AgentLoopWorker:
                 final_output.reward_score = result["reward_score"]
                 final_output.extra_fields["reward_extra_info"] = result["reward_extra_info"]
             final_output.metrics.compute_score = timing["compute_score"]
-
-    async def _collect_opd_mm_online_step_corrections(
-        self,
-        output: AgentLoopOutput,
-        validate: bool,
-        sample_kwargs: Optional[dict[str, Any]] = None,
-    ) -> None:
-        """Collect opt-in OPD-MM online step corrections for one rollout."""
-        if validate or sample_kwargs is None:
-            return
-        corrections = []
-        if self.distillation_enabled:
-            try:
-                from verl.experimental.opd_mm.online_self_distill import (
-                    build_teacher_correction_prompt,
-                    build_online_step_correction_requests,
-                    dump_online_step_correction,
-                    finalize_online_step_correction,
-                    parse_state_verifier_feedback,
-                )
-
-                requests = build_online_step_correction_requests(
-                    sample_kwargs=sample_kwargs,
-                    output_extra_fields=output.extra_fields,
-                    tool_format=self.rollout_config.multi_turn.format,
-                )
-                routing_key = None
-                routing_value = sample_kwargs.get(self.teacher_key)
-                if routing_value is not None:
-                    routing_key = routing_value.item() if hasattr(routing_value, "item") else routing_value
-                teacher_kwargs = {}
-                verifier_kwargs = {}
-                extra_info = sample_kwargs.get("extra_info") or {}
-                if hasattr(extra_info, "get"):
-                    raw_teacher_kwargs = extra_info.get("opd_mm_step_teacher_kwargs") or {}
-                    if hasattr(raw_teacher_kwargs, "items"):
-                        teacher_kwargs = dict(raw_teacher_kwargs)
-                    raw_verifier_kwargs = extra_info.get("opd_mm_step_verifier_kwargs") or {}
-                    verifier_kwargs = dict(teacher_kwargs)
-                    if hasattr(raw_verifier_kwargs, "items"):
-                        verifier_kwargs.update(dict(raw_verifier_kwargs))
-                sampling_params = {
-                    "max_tokens": int(teacher_kwargs.get("max_tokens", 128)),
-                    "temperature": float(teacher_kwargs.get("temperature", 0.0)),
-                    "top_p": float(teacher_kwargs.get("top_p", 1.0)),
-                    "top_k": int(teacher_kwargs.get("top_k", -1)),
-                }
-                verifier_sampling_params = {
-                    "max_tokens": int(verifier_kwargs.get("max_tokens", 256)),
-                    "temperature": float(verifier_kwargs.get("temperature", 0.0)),
-                    "top_p": float(verifier_kwargs.get("top_p", 1.0)),
-                    "top_k": int(verifier_kwargs.get("top_k", -1)),
-                }
-                for request in requests:
-                    verifier_prompt_ids = self._encode_opd_mm_teacher_prompt(request["verifier_prompt"])
-                    verifier_response_ids = await self.teacher_server_manager.generate_teacher_response_single(
-                        prompt_ids=verifier_prompt_ids,
-                        sampling_params=verifier_sampling_params,
-                        multi_modal_data=output.multi_modal_data,
-                        mm_processor_kwargs=output.mm_processor_kwargs,
-                        routing_key=routing_key,
-                    )
-                    verifier_raw_response = self.tokenizer.decode(verifier_response_ids, skip_special_tokens=False)
-                    verifier_feedback = parse_state_verifier_feedback(
-                        verifier_raw_response,
-                        request.get("observation", {}),
-                        gold_answer=str(request.get("gold_answer", "")),
-                        query=str(request.get("query", "")),
-                    )
-                    request["verifier_raw_response"] = verifier_raw_response
-                    request["verifier_feedback"] = verifier_feedback
-                    request["teacher_prompt"] = build_teacher_correction_prompt(
-                        query=request.get("query", ""),
-                        history=request.get("history", []),
-                        observation=request.get("observation", {}),
-                        student_raw_response=request.get("student_raw_response", ""),
-                        verifier_feedback=verifier_feedback,
-                        allow_inspect_raw=bool(request.get("allow_inspect_raw", True)),
-                        tool_format=str(request.get("tool_format") or self.rollout_config.multi_turn.format),
-                    )
-                    teacher_prompt_ids = self._encode_opd_mm_teacher_prompt(request["teacher_prompt"])
-                    teacher_response_ids = await self.teacher_server_manager.generate_teacher_response_single(
-                        prompt_ids=teacher_prompt_ids,
-                        sampling_params=sampling_params,
-                        multi_modal_data=output.multi_modal_data,
-                        mm_processor_kwargs=output.mm_processor_kwargs,
-                        routing_key=routing_key,
-                    )
-                    teacher_raw_response = self.tokenizer.decode(teacher_response_ids, skip_special_tokens=False)
-                    correction = finalize_online_step_correction(
-                        request,
-                        teacher_raw_response=teacher_raw_response,
-                    )
-                    dump_online_step_correction(
-                        request,
-                        teacher_raw_response=teacher_raw_response,
-                        correction=correction,
-                    )
-                    if correction is not None:
-                        corrections.append(correction)
-            except Exception as e:
-                logger.warning("Failed to collect OPD-MM teacher XML step corrections: %s", e)
-        if corrections:
-            output.extra_fields["opd_mm_step_corrections"] = corrections
-            output.metrics.tool_calls += 0.0
-            return
-        try:
-            from verl.experimental.opd_mm.online_self_distill import maybe_collect_online_step_corrections
-
-            corrections = maybe_collect_online_step_corrections(
-                sample_kwargs=sample_kwargs,
-                output_extra_fields=output.extra_fields,
-            )
-        except Exception as e:
-            logger.warning("Failed to collect OPD-MM online step corrections: %s", e)
-            return
-        if corrections:
-            output.extra_fields["opd_mm_step_corrections"] = corrections
 
     def _encode_opd_mm_teacher_prompt(self, prompt: str) -> list[int]:
         messages = [
