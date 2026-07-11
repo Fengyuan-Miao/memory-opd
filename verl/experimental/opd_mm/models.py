@@ -46,6 +46,12 @@ class MemoryRecord:
             return getattr(self, field_name)
         return self.metadata.get(field_name)
 
+    def public_image_id(self) -> Any:
+        """Return the public image identifier for image records, if available."""
+        if str(self.modality).lower() != "image":
+            return None
+        return self.metadata.get("image_id")
+
     def to_dict(self, include_internal_id: bool = True) -> Dict[str, Any]:
         data = {
             "turn_id": self.turn_id,

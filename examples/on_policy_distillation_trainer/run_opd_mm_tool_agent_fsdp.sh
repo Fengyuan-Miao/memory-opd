@@ -102,6 +102,7 @@ DATA=(
     data.shuffle=False
     data.tool_config_path="$OPD_MM_TOOL_CONFIG"
     data.trust_remote_code=True
+    data.continuous_token.enable=False
     +data.apply_chat_template_kwargs.enable_thinking=False
 )
 

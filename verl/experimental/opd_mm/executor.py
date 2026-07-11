@@ -86,14 +86,14 @@ class ToolExecutor:
 
         for index, action in enumerate(actions):
             before = len(pool)
-            evidence_before = len(evidence)
             step_error = ""
+            evidence_added = 0
             try:
                 if action.tool == "FILTER":
                     source_pool = self._filter_source_pool(
                         pool,
                         memory_store,
-                        action.arguments.get("scope", "current_pool"),
+                        action.arguments["scope"],
                     )
                     filtered = self._filter(
                         source_pool,
@@ -101,29 +101,30 @@ class ToolExecutor:
                         op=action.arguments["op"],
                         value=action.arguments["value"],
                     )
-                    if pool_has_candidates and action.arguments.get("scope") == "full_memory":
-                        pool = self._merge_pools(pool, filtered)
-                    else:
-                        pool = filtered
+                    pool = filtered
                     pool_has_candidates = True
-                    self._append_pool_evidence(evidence, filtered, source="FILTER")
+                    evidence_added = len(self._refresh_evidence_from_pool(evidence, pool, source="FILTER"))
                 elif action.tool == "SORT":
                     pool = self._sort(pool, **action.arguments)
+                    if pool_has_candidates:
+                        evidence_added = len(self._refresh_evidence_from_pool(evidence, pool, source="SORT"))
                 elif action.tool == "TOPK":
                     pool = self._topk_turns(pool, action.arguments["k"])
+                    if pool_has_candidates:
+                        evidence_added = len(self._refresh_evidence_from_pool(evidence, pool, source="TOPK"))
                 elif action.tool == "RETRIEVE":
                     retrieve_query = action.arguments.get("query") or query
                     retrieved = self.retriever.retrieve(
-                        pool,
+                        memory_store.initial_pool(),
                         query=retrieve_query,
                         store=memory_store,
                         method=action.arguments.get("method", "hybrid"),
                         top_k=action.arguments.get("top_k", 5),
                         question_image=question_image,
                     )
-                    pool = self._merge_pools(pool, retrieved) if pool_has_candidates else retrieved
+                    pool = retrieved
                     pool_has_candidates = True
-                    self._append_pool_evidence(evidence, retrieved, source="RETRIEVE")
+                    evidence_added = len(self._refresh_evidence_from_pool(evidence, pool, source="RETRIEVE"))
                 elif action.tool == "EXPAND_NEIGHBORS":
                     if not pool_has_candidates or not pool:
                         raise ValueError("EXPAND_NEIGHBORS requires an existing candidate pool")
@@ -134,7 +135,7 @@ class ToolExecutor:
                     )
                     pool = self._merge_pools(pool, expanded)
                     pool_has_candidates = True
-                    self._append_pool_evidence(evidence, expanded, source="EXPAND_NEIGHBORS")
+                    evidence_added = len(self._refresh_evidence_from_pool(evidence, pool, source="EXPAND_NEIGHBORS"))
                 elif action.tool == "INSPECT_RAW":
                     remaining = max(0, self.max_raw_inspections - raw_calls)
                     inspected = self._inspect_raw(
@@ -145,6 +146,7 @@ class ToolExecutor:
                     )
                     raw_calls += len(inspected)
                     evidence.extend(inspected)
+                    evidence_added = len(inspected)
                 elif action.tool == "STOP":
                     stopped = True
             except Exception as exc:
@@ -156,7 +158,7 @@ class ToolExecutor:
                     action=action,
                     pool_before=before,
                     pool_after=len(pool),
-                    evidence_added=len(evidence) - evidence_before,
+                    evidence_added=evidence_added,
                     error=step_error,
                 )
             )
@@ -454,6 +456,9 @@ class ToolExecutor:
                 values["session_date"] = item.memory.metadata.get(
                     "session_date"
                 )
+            image_id = item.memory.public_image_id()
+            if image_id:
+                values["image_id"] = image_id
             if item.score:
                 values["retrieval_score"] = item.score
             values = {key: value for key, value in values.items() if value not in (None, "")}
@@ -484,6 +489,43 @@ class ToolExecutor:
             existing.add(item.memory_id)
         return added
 
+    @classmethod
+    def _refresh_evidence_from_pool(
+        cls,
+        evidence: List[EvidenceItem],
+        pool: List[PoolItem],
+        source: str,
+    ) -> List[EvidenceItem]:
+        """Refresh answer evidence from the current candidate pool.
+
+        Pool-mutating tools should expose the latest candidate view instead of
+        an ever-growing union of stale candidates. Preserve raw visual
+        inspection evidence only for memories that remain in the current pool.
+        """
+        pool_ids = {item.memory.memory_id for item in pool}
+        preserved_raw = [
+            item
+            for item in evidence
+            if item.source == "INSPECT_RAW" and item.memory_id in pool_ids
+        ]
+        old_signatures = {
+            (item.memory_id, item.source, tuple(sorted(item.fields.items())))
+            for item in evidence
+        }
+        del source
+        refreshed = cls._pool_evidence(pool, source="MEMORY")
+        existing_ids = {item.memory_id for item in refreshed}
+        for item in preserved_raw:
+            if item.memory_id in existing_ids:
+                refreshed.append(item)
+        evidence[:] = refreshed
+        return [
+            item
+            for item in refreshed
+            if (item.memory_id, item.source, tuple(sorted(item.fields.items())))
+            not in old_signatures
+        ]
+
     def _inspect_raw(
         self,
         pool: List[PoolItem],
@@ -511,18 +553,22 @@ class ToolExecutor:
                 question_image=question_image,
                 text_context=context,
             )
+            fields = {
+                "visual_observation": observation,
+                "linked_text_context": context,
+                "image_label": f"context={context[:220]}",
+                "session_date": item.memory.metadata.get(
+                    "session_date"
+                ),
+                "timestamp": item.memory.timestamp,
+            }
+            image_id = item.memory.public_image_id()
+            if image_id:
+                fields["image_id"] = image_id
             evidence.append(
                 EvidenceItem(
                     memory_id=item.memory.memory_id,
-                    fields={
-                        "visual_observation": observation,
-                        "linked_text_context": context,
-                        "image_label": f"context={context[:220]}",
-                        "session_date": item.memory.metadata.get(
-                            "session_date"
-                        ),
-                        "timestamp": item.memory.timestamp,
-                    },
+                    fields=fields,
                     source="INSPECT_RAW",
                 )
             )

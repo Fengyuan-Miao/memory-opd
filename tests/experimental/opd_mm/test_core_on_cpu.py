@@ -26,10 +26,15 @@ from tensordict import TensorDict
 
 from verl import DataProto
 from verl.experimental.agent_loop.agent_loop import AgentLoopWorker
-from verl.experimental.agent_loop.tool_agent_loop import ToolAgentLoop
+from verl.experimental.agent_loop.tool_agent_loop import AgentState, ToolAgentLoop
 from verl.experimental.agent_loop.tool_parser import FunctionCall
 from verl.experimental.opd_mm import MemoryRecord, OPDSample, OnPolicyDistiller, PolicyOutput, ToolAction, ToolExecutor
-from verl.experimental.opd_mm.dataset import OPD_MM_SYSTEM_PROMPT, opd_messages_for_query, opd_sample_to_rlhf_record
+from verl.experimental.opd_mm.dataset import (
+    OPD_MM_SYSTEM_PROMPT,
+    opd_messages_for_query,
+    opd_messages_for_state,
+    opd_sample_to_rlhf_record,
+)
 from verl.experimental.opd_mm.online_self_distill import (
     build_online_state_correction_request,
     build_teacher_correction_prompt,
@@ -60,6 +65,7 @@ from verl.experimental.opd_mm.tools import (
     openai_tool_schemas,
 )
 from verl.trainer.distillation.losses import distillation_ppo_loss
+from verl.tools.schemas import ToolResponse
 from verl.utils import tensordict_utils as tu
 from verl.tools.tool_registry import load_all_tools
 from verl.workers.config import ActorConfig, DistillationConfig
@@ -98,7 +104,7 @@ def _records() -> list[MemoryRecord]:
             source_type="uploaded_image",
             summary="A tabby cat sitting on a sofa.",
             raw_pointer="images/cat.png",
-            metadata={"session_date": "2026-01-01"},
+            metadata={"session_date": "2026-01-01", "image_id": "D1:IMG_001"},
         ),
         MemoryRecord(
             memory_id="m_assistant_image",
@@ -109,6 +115,7 @@ def _records() -> list[MemoryRecord]:
             source_type="generated_image",
             summary="An assistant-generated chart.",
             raw_pointer="images/chart.png",
+            metadata={"image_id": "D1:IMG_002"},
         ),
     ]
 
@@ -267,6 +274,25 @@ class QuerySwitchRetriever:
         return [records["m_cat_text"]]
 
 
+class PoolAwareRetriever:
+    def __init__(self) -> None:
+        self.source_pool_ids: list[list[str]] = []
+
+    def retrieve(
+        self,
+        pool: list[Any],
+        query: str,
+        store: HiddenMemoryStore,
+        method: str = "hybrid",
+        top_k: int = 5,
+        question_image: str | None = None,
+    ) -> list[Any]:
+        del query, method, top_k, question_image
+        self.source_pool_ids.append([item.memory.memory_id for item in pool])
+        records = {item.memory.memory_id: item for item in store.initial_pool()}
+        return [records["m_cat_text"]] if len(self.source_pool_ids) == 1 else list(pool[:1])
+
+
 def test_validator_rejects_memory_ids_and_accepts_rewritten_retrieve_query() -> None:
     validator = TrajectoryValidator(max_actions=4)
 
@@ -274,18 +300,26 @@ def test_validator_rejects_memory_ids_and_accepts_rewritten_retrieve_query() -> 
         validator.validate([{"tool": "FILTER", "field": "status", "op": "eq", "value": "m_001"}])
 
     validated_filter = validator.validate(
-        [{"tool": "FILTER", "field": "author", "op": "eq", "value": "user", "scope": "full_memory"}]
+        [{"tool": "FILTER", "field": "modality", "op": "eq", "value": "image", "scope": "full_memory"}]
     )
     assert validated_filter[0].arguments["scope"] == "full_memory"
 
+    with pytest.raises(TrajectoryValidationError, match="invalid FILTER field"):
+        validator.validate(
+            [{"tool": "FILTER", "field": "author", "op": "eq", "value": "user", "scope": "full_memory"}]
+        )
+
     with pytest.raises(TrajectoryValidationError, match="invalid FILTER scope"):
-        validator.validate([{"tool": "FILTER", "field": "author", "op": "eq", "value": "user", "scope": "all"}])
+        validator.validate([{"tool": "FILTER", "field": "modality", "op": "eq", "value": "image", "scope": "all"}])
 
     validated = validator.validate([{"tool": "RETRIEVE", "query": "custom query", "top_k": 3}])
     assert validated[0].arguments["query"] == "custom query"
 
     with pytest.raises(TrajectoryValidationError, match="memory IDs"):
         validator.validate([{"tool": "RETRIEVE", "query": "look up m_001", "top_k": 3}])
+
+    with pytest.raises(TrajectoryValidationError, match="unknown arguments"):
+        validator.validate([{"tool": "RETRIEVE", "query": "custom query", "top_k": 3, "scope": "full_memory"}])
 
 
 def test_validator_accepts_expand_neighbors_and_rejects_invalid_arguments() -> None:
@@ -306,6 +340,30 @@ def test_validator_accepts_expand_neighbors_and_rejects_invalid_arguments() -> N
         validator.validate([{"tool": "EXPAND_NEIGHBORS", "window": 1, "memory_id": "safe"}])
 
 
+def test_opd_state_prompt_keeps_action_history_and_only_latest_observation() -> None:
+    base = opd_messages_for_query("Where did Maya travel?")
+    first = opd_messages_for_state(
+        base,
+        [{"tool": "RETRIEVE", "method": "bm25", "top_k": 5}],
+        {"pool_count": 5, "evidence_preview": [{"content": "old retrieval result"}]},
+    )
+    second = opd_messages_for_state(
+        base,
+        [
+            {"tool": "RETRIEVE", "method": "bm25", "top_k": 5},
+            {"tool": "FILTER", "field": "timestamp", "op": "eq", "value": "2024-09-01", "scope": "full_memory"},
+        ],
+        {"pool_count": 2, "evidence_preview": [{"content": "latest refreshed result"}]},
+    )
+
+    assert "old retrieval result" in first[-1]["content"]
+    assert "old retrieval result" not in second[-1]["content"]
+    assert "latest refreshed result" in second[-1]["content"]
+    assert '"tool":"RETRIEVE"' in second[-1]["content"]
+    assert '"tool":"FILTER"' in second[-1]["content"]
+    assert len(second) == len(base)
+
+
 def test_executor_uses_rewritten_retrieve_query_when_provided() -> None:
     retriever = RecordingRetriever()
     ToolExecutor(retriever=retriever).run(
@@ -322,9 +380,21 @@ def test_filter_scope_can_restart_from_full_memory_pool() -> None:
 
     narrowed_result = ToolExecutor().run(
         [
-            {"tool": "FILTER", "field": "modality", "op": "eq", "value": "image"},
-            {"tool": "FILTER", "field": "author", "op": "eq", "value": "assistant"},
-            {"tool": "FILTER", "field": "author", "op": "eq", "value": "user"},
+            {"tool": "FILTER", "field": "modality", "op": "eq", "value": "image", "scope": "full_memory"},
+            {
+                "tool": "FILTER",
+                "field": "source_type",
+                "op": "eq",
+                "value": "generated_image",
+                "scope": "current_pool",
+            },
+            {
+                "tool": "FILTER",
+                "field": "source_type",
+                "op": "eq",
+                "value": "uploaded_image",
+                "scope": "current_pool",
+            },
         ],
         query="Show user memories after a wrong narrow filter.",
         memory_store=store,
@@ -333,20 +403,26 @@ def test_filter_scope_can_restart_from_full_memory_pool() -> None:
 
     reset_result = ToolExecutor().run(
         [
-            {"tool": "FILTER", "field": "modality", "op": "eq", "value": "image"},
-            {"tool": "FILTER", "field": "author", "op": "eq", "value": "assistant"},
-            {"tool": "FILTER", "field": "author", "op": "eq", "value": "user", "scope": "full_memory"},
+            {"tool": "FILTER", "field": "modality", "op": "eq", "value": "image", "scope": "full_memory"},
+            {
+                "tool": "FILTER",
+                "field": "source_type",
+                "op": "eq",
+                "value": "generated_image",
+                "scope": "current_pool",
+            },
+            {"tool": "FILTER", "field": "source_type", "op": "eq", "value": "uploaded_image", "scope": "full_memory"},
         ],
         query="Show user memories after resetting the filter scope.",
         memory_store=store,
     )
-    assert reset_result.final_memory_ids == ["m_assistant_image", "m_text_old", "m_cat_text", "m_cat_image"]
+    assert reset_result.final_memory_ids == ["m_cat_image"]
     assert reset_result.steps[2].pool_before == 1
-    assert reset_result.steps[2].pool_after == 4
+    assert reset_result.steps[2].pool_after == 1
     assert len({item.memory_id for item in reset_result.evidence}) == len(reset_result.evidence)
 
 
-def test_repeated_retrieve_merges_and_deduplicates_candidates() -> None:
+def test_repeated_retrieve_replaces_pool_by_default() -> None:
     result = ToolExecutor(retriever=QuerySwitchRetriever()).run(
         [
             {"tool": "RETRIEVE", "method": "hybrid", "top_k": 1, "query": "cat"},
@@ -357,16 +433,39 @@ def test_repeated_retrieve_merges_and_deduplicates_candidates() -> None:
         memory_store=HiddenMemoryStore(_records()),
     )
 
-    assert result.final_memory_ids == ["m_cat_text", "m_assistant_image"]
-    assert [item.memory_id for item in result.evidence] == ["m_cat_text", "m_assistant_image"]
+    assert result.final_memory_ids == ["m_assistant_image"]
+    assert [item.memory_id for item in result.evidence] == ["m_assistant_image"]
+
+
+def test_repeated_retrieve_always_searches_original_memory_store() -> None:
+    retriever = PoolAwareRetriever()
+    result = ToolExecutor(retriever=retriever).run(
+        [
+            {"tool": "RETRIEVE", "method": "hybrid", "top_k": 1, "query": "first"},
+            {"tool": "RETRIEVE", "method": "hybrid", "top_k": 1, "query": "second"},
+        ],
+        query="Find multiple memories.",
+        memory_store=HiddenMemoryStore(_records()),
+    )
+
+    assert not result.error
+    assert retriever.source_pool_ids[0] == ["m_text_old", "m_cat_text", "m_cat_image", "m_assistant_image"]
+    assert retriever.source_pool_ids[1] == ["m_text_old", "m_cat_text", "m_cat_image", "m_assistant_image"]
+    assert result.final_memory_ids == ["m_text_old"]
 
 
 def test_executor_composes_generic_tools_to_latest_user_image() -> None:
     store = HiddenMemoryStore(_records())
     result = ToolExecutor().run(
         [
-            {"tool": "FILTER", "field": "modality", "op": "eq", "value": "image"},
-            {"tool": "FILTER", "field": "author", "op": "eq", "value": "user"},
+            {"tool": "FILTER", "field": "modality", "op": "eq", "value": "image", "scope": "full_memory"},
+            {
+                "tool": "FILTER",
+                "field": "source_type",
+                "op": "eq",
+                "value": "uploaded_image",
+                "scope": "current_pool",
+            },
             {"tool": "SORT", "field": "timestamp", "order": "desc"},
             {"tool": "TOPK", "k": 1},
         ],
@@ -378,8 +477,10 @@ def test_executor_composes_generic_tools_to_latest_user_image() -> None:
     assert result.stopped
     assert result.final_memory_ids == ["m_cat_image"]
     assert result.evidence[0].fields["content"] == "A tabby cat sitting on a sofa."
+    assert result.evidence[0].fields["image_id"] == "D1:IMG_001"
     assert "raw_pointer" not in result.evidence[0].fields
     assert "summary" not in result.evidence[0].fields
+    assert "turn_id" not in result.evidence[0].fields
     assert result.evidence[0].fields["session_date"] == "2026-01-01"
 
 
@@ -399,7 +500,7 @@ def test_timestamp_filter_accepts_date_only_model_values() -> None:
     store = HiddenMemoryStore(records)
 
     eq_result = ToolExecutor().run(
-        [{"tool": "FILTER", "field": "timestamp", "op": "eq", "value": "2026-01-01"}],
+        [{"tool": "FILTER", "field": "timestamp", "op": "eq", "value": "2026-01-01", "scope": "full_memory"}],
         query="Which memories are from 2026-01-01?",
         memory_store=store,
     )
@@ -411,21 +512,29 @@ def test_timestamp_filter_accepts_date_only_model_values() -> None:
     }
 
     contains_result = ToolExecutor().run(
-        [{"tool": "FILTER", "field": "timestamp", "op": "contains", "value": "2026/1/1"}],
+        [
+            {
+                "tool": "FILTER",
+                "field": "timestamp",
+                "op": "contains",
+                "value": "2026/1/1",
+                "scope": "full_memory",
+            }
+        ],
         query="Which memories are from 2026-01-01?",
         memory_store=store,
     )
     assert set(contains_result.final_memory_ids) == set(eq_result.final_memory_ids)
 
     before_result = ToolExecutor().run(
-        [{"tool": "FILTER", "field": "timestamp", "op": "before", "value": "2026-01-02"}],
+        [{"tool": "FILTER", "field": "timestamp", "op": "before", "value": "2026-01-02", "scope": "full_memory"}],
         query="Which memories are before 2026-01-02?",
         memory_store=store,
     )
     assert set(before_result.final_memory_ids) == set(eq_result.final_memory_ids)
 
     after_result = ToolExecutor().run(
-        [{"tool": "FILTER", "field": "timestamp", "op": "after", "value": "2026-01-01"}],
+        [{"tool": "FILTER", "field": "timestamp", "op": "after", "value": "2026-01-01", "scope": "full_memory"}],
         query="Which memories are after 2026-01-01?",
         memory_store=store,
     )
@@ -446,11 +555,11 @@ def test_turn_aware_retrieval_returns_text_and_image_from_same_turn() -> None:
     modalities = {item.fields["modality"] for item in result.evidence}
     assert modalities == {"text", "image"}
     assert {item.memory_id for item in result.evidence} == {"m_cat_text", "m_cat_image"}
-    assert {item.source for item in result.evidence} == {"RETRIEVE"}
+    assert {item.source for item in result.evidence} == {"MEMORY"}
     assert result.steps[0].evidence_added == 2
 
 
-def test_expand_neighbors_merges_same_session_neighbor_turns_without_replacing_evidence() -> None:
+def test_expand_neighbors_refreshes_evidence_from_expanded_pool() -> None:
     store = HiddenMemoryStore(_neighbor_records())
     result = ToolExecutor(retriever=TurnAwareHybridRetriever(context_window=0)).run(
         [
@@ -466,8 +575,7 @@ def test_expand_neighbors_merges_same_session_neighbor_turns_without_replacing_e
     assert "n_far" not in {item.memory_id for item in result.evidence}
     assert "n_other_scenario" not in {item.memory_id for item in result.evidence}
     assert result.evidence[0].memory_id == "n_mid"
-    assert result.evidence[0].source == "RETRIEVE"
-    assert {item.source for item in result.evidence[1:]} == {"EXPAND_NEIGHBORS"}
+    assert {item.source for item in result.evidence} == {"MEMORY"}
     assert result.steps[1].evidence_added == 2
 
 
@@ -489,7 +597,7 @@ def test_inspect_raw_only_reads_retrieved_candidate_pool() -> None:
 
     filtered_result = ToolExecutor(raw_inspector=inspector).run(
         [
-            {"tool": "FILTER", "field": "modality", "op": "eq", "value": "image"},
+            {"tool": "FILTER", "field": "modality", "op": "eq", "value": "image", "scope": "full_memory"},
             {"tool": "INSPECT_RAW"},
         ],
         query="What is in the cat image?",
@@ -526,6 +634,66 @@ class FakeAgentData:
 
 
 @pytest.mark.asyncio
+async def test_tool_agent_loop_rebuilds_opd_prompt_without_old_observations() -> None:
+    loop = object.__new__(ToolAgentLoop)
+    loop.max_parallel_calls = 1
+    loop.enable_continuous_token = False
+    loop.tool_parser_name = "qwen3_coder"
+    loop.response_length = 2048
+    loop.tool_schemas = []
+    captured: dict[str, Any] = {}
+
+    async def fake_call_tool(tool_call: Any, tools_kwargs: dict[str, Any], agent_data: Any) -> tuple[Any, ...]:
+        del tool_call, tools_kwargs, agent_data
+        return ToolResponse(text="latest tool response"), 0.0, {}
+
+    async def fake_apply_chat_template(messages: list[dict[str, Any]], **kwargs: Any) -> list[int]:
+        captured["messages"] = messages
+        captured["kwargs"] = kwargs
+        return [101, 102, 103]
+
+    loop._call_tool = fake_call_tool
+    loop.apply_chat_template = fake_apply_chat_template
+    base_messages = [
+        {"role": "system", "content": "system"},
+        {"role": "user", "content": "Find Maya's trip."},
+    ]
+    agent_data = SimpleNamespace(
+        tool_calls=[SimpleNamespace(name="retrieve", tool_call_id=None)],
+        tools_kwargs={},
+        metrics={},
+        messages=[*base_messages, {"role": "tool", "content": "stale retrieval observation"}],
+        base_messages=base_messages,
+        extra_fields={
+            "opd_mm_prompt_state": {
+                "action_history": [{"tool": "RETRIEVE", "method": "bm25", "top_k": 5}],
+                "observation": {"pool_count": 2, "evidence_preview": [{"content": "latest result"}]},
+            }
+        },
+        image_data=None,
+        video_data=None,
+        audio_data=None,
+        mm_processor_kwargs={},
+        tool_rewards=[],
+        user_turns=0,
+        prompt_ids=[1, 2],
+        response_mask=[],
+        distillation_mask=[],
+        response_logprobs=[],
+    )
+
+    state = await ToolAgentLoop._handle_processing_tools_state(loop, agent_data)
+
+    assert state == AgentState.GENERATING
+    assert agent_data.prompt_ids == [101, 102, 103]
+    assert agent_data.messages == captured["messages"]
+    prompt_text = json.dumps(captured["messages"], ensure_ascii=False)
+    assert "latest result" in prompt_text
+    assert "stale retrieval observation" not in prompt_text
+    assert '"tool":"RETRIEVE"' in captured["messages"][-1]["content"]
+
+
+@pytest.mark.asyncio
 async def test_verl_native_opd_tools_share_hidden_state_and_hide_ids() -> None:
     records = [record.to_dict() for record in _records()]
     agent_data = FakeAgentData(
@@ -534,24 +702,31 @@ async def test_verl_native_opd_tools_share_hidden_state_and_hide_ids() -> None:
     )
     filter_tool = OPDFilterTool(config={"type": "native"}, tool_schema=None)
 
-    await filter_tool.execute("instance", {"field": "modality", "op": "eq", "value": "image"}, agent_data=agent_data)
+    await filter_tool.execute(
+        "instance",
+        {"field": "modality", "op": "eq", "value": "image", "scope": "full_memory"},
+        agent_data=agent_data,
+    )
     response, _, metrics = await filter_tool.execute(
         "instance",
-        {"field": "author", "op": "eq", "value": "user"},
+        {"field": "source_type", "op": "eq", "value": "uploaded_image", "scope": "current_pool"},
         agent_data=agent_data,
     )
 
     observation = json.loads(response.text)
     assert observation["pool_count"] == 1
     assert observation["pool_preview"][0]["content"] == "A tabby cat sitting on a sofa."
+    assert observation["pool_preview"][0]["image_id"] == "D1:IMG_001"
+    assert observation["evidence_preview"][0]["image_id"] == "D1:IMG_001"
     assert "raw_pointer" not in observation["pool_preview"][0]
     assert "summary" not in observation["pool_preview"][0]
     assert "source_type" not in observation["pool_preview"][0]
     assert "turn_id" not in observation["pool_preview"][0]
-    assert metrics["opd_mm_evidence_count"] == 2
+    assert metrics["opd_mm_evidence_count"] == 1
     assert "memory_id" not in json.dumps(observation)
     assert agent_data.extra_fields["opd_mm"]["pool_count"] == 1
-    assert agent_data.extra_fields["opd_mm"]["evidence_count"] == 2
+    assert agent_data.extra_fields["opd_mm"]["evidence_count"] == 1
+    assert agent_data.extra_fields["opd_mm"]["evidence"][0]["image_id"] == "D1:IMG_001"
     assert "memory_id" not in json.dumps(agent_data.extra_fields["opd_mm"])
 
 
@@ -564,18 +739,25 @@ async def test_verl_native_filter_scope_can_restart_hidden_pool() -> None:
     )
     filter_tool = OPDFilterTool(config={"type": "native"}, tool_schema=None)
 
-    await filter_tool.execute("instance", {"field": "modality", "op": "eq", "value": "image"}, agent_data=agent_data)
-    await filter_tool.execute("instance", {"field": "author", "op": "eq", "value": "assistant"}, agent_data=agent_data)
+    await filter_tool.execute(
+        "instance",
+        {"field": "modality", "op": "eq", "value": "image", "scope": "full_memory"},
+        agent_data=agent_data,
+    )
+    await filter_tool.execute(
+        "instance",
+        {"field": "source_type", "op": "eq", "value": "generated_image", "scope": "current_pool"},
+        agent_data=agent_data,
+    )
     response, _, _ = await filter_tool.execute(
         "instance",
-        {"field": "author", "op": "eq", "value": "user", "scope": "full_memory"},
+        {"field": "source_type", "op": "eq", "value": "uploaded_image", "scope": "full_memory"},
         agent_data=agent_data,
     )
 
     observation = json.loads(response.text)
-    assert observation["pool_count"] == 4
-    assert {item["author"] for item in observation["pool_preview"]} == {"assistant", "user"}
-    assert observation["evidence_count"] == 4
+    assert observation["pool_count"] == 1
+    assert observation["evidence_count"] == 1
 
 
 @pytest.mark.asyncio
@@ -596,10 +778,58 @@ async def test_retrieve_tool_adds_public_evidence_before_inspect_raw() -> None:
     observation = json.loads(response.text)
     assert observation["evidence_count"] == 2
     assert metrics["opd_mm_evidence_count"] == 2
-    assert {item["source"] for item in observation["new_evidence"]} == {"RETRIEVE"}
-    assert {item["modality"] for item in observation["new_evidence"]} == {"text", "image"}
-    assert all("visual_observation" not in item for item in observation["new_evidence"])
+    assert observation["new_evidence_count"] == 2
+    assert {item["source"] for item in observation["evidence_preview"]} == {"MEMORY"}
+    assert {item["modality"] for item in observation["evidence_preview"]} == {"text", "image"}
+    image_preview = [item for item in observation["evidence_preview"] if item["modality"] == "image"]
+    text_preview = [item for item in observation["evidence_preview"] if item["modality"] == "text"]
+    assert image_preview[0]["image_id"] == "D1:IMG_001"
+    assert "image_id" not in text_preview[0]
+    assert all("visual_observation" not in item for item in observation["evidence_preview"])
     assert "memory_id" not in json.dumps(observation)
+    assert "last_action" not in observation
+    prompt_state = agent_data.extra_fields["opd_mm_prompt_state"]
+    assert prompt_state["action_history"] == [{"tool": "RETRIEVE", "method": "bm25", "top_k": 1}]
+    assert prompt_state["observation"] == observation
+
+
+@pytest.mark.asyncio
+async def test_tool_observation_stays_bounded_when_refreshed_evidence_grows() -> None:
+    records = [
+        MemoryRecord(
+            memory_id=f"bounded_{index}",
+            turn_id=f"turn_{index}",
+            timestamp=f"2026-03-{index + 1:02d}T10:00:00",
+            author="user",
+            modality="text",
+            source_type="conversation",
+            summary=f"summary {index}",
+            content=f"memory {index} " + ("x" * 1000),
+        ).to_dict()
+        for index in range(20)
+    ]
+    agent_data = FakeAgentData(
+        messages=[{"role": "user", "content": "Find all memories."}],
+        tools_kwargs={"opd_mm": {"query": "Find all memories.", "records": records, "vector_store_dir": None}},
+    )
+    filter_tool = OPDFilterTool(config={"type": "native"}, tool_schema=None)
+
+    response, _, _ = await filter_tool.execute(
+        "instance",
+        {"field": "modality", "op": "eq", "value": "text", "scope": "full_memory"},
+        agent_data=agent_data,
+    )
+
+    observation = json.loads(response.text)
+    assert observation["pool_count"] == 20
+    assert observation["evidence_count"] == 20
+    assert len(observation["pool_preview"]) == 3
+    assert len(observation["evidence_preview"]) == 4
+    assert all(len(item["content"]) <= 234 for item in observation["pool_preview"])
+    assert all(len(item["content"]) <= 234 for item in observation["evidence_preview"])
+    assert "new_evidence" not in observation
+    assert "last_action" not in observation
+    assert len(response.text) < 4000
 
 
 @pytest.mark.asyncio
@@ -645,8 +875,10 @@ async def test_inspect_raw_can_use_async_teacher_service_callback() -> None:
     assert calls[0]["raw_pointer"] == "images/cat.png"
     assert calls[0]["query"] == "What is in the cat image?"
     assert observation["error"] == ""
-    assert observation["new_evidence"][0]["source"] == "INSPECT_RAW"
-    assert observation["new_evidence"][0]["visual_observation"] == "Teacher sees a tabby cat sitting on a sofa."
+    assert observation["new_evidence_count"] == 1
+    assert observation["evidence_preview"][-1]["source"] == "INSPECT_RAW"
+    assert observation["evidence_preview"][-1]["image_id"] == "D1:IMG_001"
+    assert observation["evidence_preview"][-1]["visual_observation"] == "Teacher sees a tabby cat sitting on a sofa."
     assert metrics["agent_loop_terminate"] is False
 
 
@@ -673,8 +905,10 @@ async def test_verl_native_expand_neighbors_observation_is_visible_next_step() -
     assert observation["tool"] == "EXPAND_NEIGHBORS"
     assert observation["pool_count"] == 3
     assert observation["evidence_count"] == 3
-    assert {item["source"] for item in observation["new_evidence"]} == {"EXPAND_NEIGHBORS"}
-    assert {item["content"] for item in observation["new_evidence"]} == {
+    assert observation["new_evidence_count"] == 2
+    assert {item["source"] for item in observation["evidence_preview"]} == {"MEMORY"}
+    assert {item["content"] for item in observation["evidence_preview"]} == {
+        "The unique middle clue is here.",
         "Previous context before the middle clue.",
         "Follow-up context after the middle clue.",
     }
@@ -701,6 +935,39 @@ async def test_verl_native_expand_neighbors_without_candidates_errors_and_termin
     assert "EXPAND_NEIGHBORS requires an existing candidate pool" in observation["error"]
     assert observation["evidence_count"] == 0
     assert metrics["agent_loop_terminate"] is True
+
+
+@pytest.mark.asyncio
+async def test_verl_native_max_action_forces_stop() -> None:
+    records = [record.to_dict() for record in _records()]
+    agent_data = FakeAgentData(
+        messages=[{"role": "user", "content": "Find the tabby cat on the sofa."}],
+        tools_kwargs={"opd_mm": {"query": "Find the tabby cat on the sofa.", "records": records}},
+    )
+    retrieve_tool = OPDRetrieveTool(config={"type": "native"}, tool_schema=None)
+
+    for _ in range(7):
+        response, _, metrics = await retrieve_tool.execute(
+            "instance",
+            {"method": "bm25", "top_k": 1},
+            agent_data=agent_data,
+        )
+        observation = json.loads(response.text)
+        assert observation["tool"] == "RETRIEVE"
+        assert metrics["agent_loop_terminate"] is False
+
+    response, _, metrics = await retrieve_tool.execute(
+        "instance",
+        {"method": "bm25", "top_k": 1},
+        agent_data=agent_data,
+    )
+    observation = json.loads(response.text)
+    assert observation["tool"] == "STOP"
+    assert observation["stopped"] is True
+    assert observation["error"] == ""
+    assert metrics["agent_loop_terminate"] is True
+    assert len(agent_data.extra_fields["opd_mm"]["trace"]) == 8
+    assert agent_data.extra_fields["opd_mm"]["trace"][-1]["tool"] == "STOP"
 
 
 @pytest.mark.asyncio
@@ -982,7 +1249,10 @@ class FakeStudent:
     def generate_trace(self, query: str) -> PolicyOutput:
         return PolicyOutput(
             actions=[
-                ToolAction("FILTER", {"field": "author", "op": "eq", "value": "assistant"}),
+                ToolAction(
+                    "FILTER",
+                    {"field": "source_type", "op": "eq", "value": "generated_image", "scope": "full_memory"},
+                ),
                 ToolAction("STOP"),
             ],
             raw_response="student_wrong_trace",
@@ -1537,7 +1807,8 @@ def test_online_xml_correction_requests_include_invalid_student_state() -> None:
     assert "If verifier.evidence_sufficient is false, STOP is invalid" in requests[0]["teacher_prompt"]
     assert "Do not use verifier.reason as lexical material for RETRIEVE.query" in requests[0]["teacher_prompt"]
     assert "scope=full_memory" in requests[0]["teacher_prompt"]
-    assert "optionally query as rewritten search text" in requests[0]["teacher_prompt"]
+    assert "optionally query" in requests[0]["teacher_prompt"]
+    assert "RETRIEVE has no scope parameter" in requests[0]["teacher_prompt"]
     assert "EXPAND_NEIGHBORS(window=1|2|3)" in requests[0]["teacher_prompt"]
 
     correction = finalize_online_step_correction(
@@ -1783,3 +2054,5 @@ def test_helpers_build_hidden_store_from_dicts_and_schemas() -> None:
     ]
     filter_scope = schemas[0]["function"]["parameters"]["properties"]["scope"]
     assert filter_scope["enum"] == ["current_pool", "full_memory"]
+    assert "scope" in schemas[0]["function"]["parameters"]["required"]
+    assert "scope" not in schemas[3]["function"]["parameters"]["properties"]

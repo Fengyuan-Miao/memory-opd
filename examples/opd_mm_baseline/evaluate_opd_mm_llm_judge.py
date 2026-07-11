@@ -53,7 +53,7 @@ from transformers import AutoTokenizer
 from vllm import LLM, SamplingParams
 
 from verl.experimental.agent_loop.tool_parser import ToolParser
-from verl.experimental.opd_mm.dataset import OPD_MM_SYSTEM_PROMPT
+from verl.experimental.opd_mm.dataset import OPD_MM_SYSTEM_PROMPT, opd_messages_for_state
 from verl.experimental.opd_mm.executor import ToolExecutor
 from verl.experimental.opd_mm.models import ToolAction
 from verl.experimental.opd_mm.retrieval import TurnAwareHybridRetriever
@@ -171,22 +171,6 @@ def _messages_for_query(query: str) -> list[dict[str, Any]]:
         {"role": "system", "content": OPD_MM_SYSTEM_PROMPT},
         {"role": "user", "content": query},
     ]
-
-
-def _assistant_message(content: str, tool_calls: list[Any]) -> dict[str, Any]:
-    message: dict[str, Any] = {"role": "assistant", "content": content or ""}
-    if tool_calls:
-        message["tool_calls"] = [
-            {
-                "type": "function",
-                "function": {
-                    "name": call.name,
-                    "arguments": json.loads(call.arguments or "{}"),
-                },
-            }
-            for call in tool_calls
-        ]
-    return message
 
 
 def _normalize_text(value: Any) -> str:
@@ -332,7 +316,8 @@ def rollout_student(args: argparse.Namespace, qas: list[dict[str, Any]]) -> list
             )
             continue
 
-        messages = _messages_for_query(str(qa.get("question") or ""))
+        base_messages = _messages_for_query(str(qa.get("question") or ""))
+        messages = list(base_messages)
         session = _make_session(qa, records)
         final_answer = ""
         raw_generations = []
@@ -356,14 +341,13 @@ def rollout_student(args: argparse.Namespace, qas: list[dict[str, Any]]) -> list
                 text = text[: -len("<|im_end|>")]
             raw_generations.append(text)
 
-            content, calls = asyncio.run(_parse_tool_calls(parser, tokenizer, text, tool_schemas))
+            _content, calls = asyncio.run(_parse_tool_calls(parser, tokenizer, text, tool_schemas))
             if not calls:
                 final_answer = text.strip()
                 break
 
             # ToolAgentLoop only executes max_parallel_calls=1 in the training config.
             calls = calls[:1]
-            messages.append(_assistant_message(content, calls))
             call = calls[0]
             try:
                 action = ToolAction(call.name.upper(), json.loads(call.arguments or "{}"))
@@ -374,11 +358,16 @@ def rollout_student(args: argparse.Namespace, qas: list[dict[str, Any]]) -> list
                     "pool_count": len(session.pool),
                     "evidence_count": len(session.evidence),
                     "pool_preview": [],
-                    "new_evidence": [],
+                    "new_evidence_count": 0,
+                    "evidence_preview": [],
                     "stopped": session.stopped,
                     "error": str(exc),
                 }
-            messages.append({"role": "tool", "content": json.dumps(observation, ensure_ascii=False)})
+            messages = opd_messages_for_state(
+                base_messages,
+                [item.to_dict() for item in session.trace],
+                observation,
+            )
             if session.stopped:
                 # STOP is the terminal action for the retrieval policy. The
                 # retrieval model is not asked to produce the final QA answer;
@@ -453,6 +442,7 @@ def _call_answer_model(args: argparse.Namespace, messages: list[dict[str, str]])
         "messages": messages,
         "temperature": float(args.answer_temperature),
         "max_tokens": int(args.answer_max_new_tokens),
+        "chat_template_kwargs": {"enable_thinking": False},
     }
     response = _post_openai_json(args.answer_base_url, payload, args.answer_timeout)
     choices = response.get("choices") if isinstance(response, dict) else None
@@ -514,6 +504,39 @@ Is the student answer semantically correct?"""
     return [{"role": "system", "content": system}, {"role": "user", "content": user}]
 
 
+def _evidence_answerable_prompt(row: dict[str, Any], max_evidence: int) -> list[dict[str, str]]:
+    evidence = row.get("evidence") or []
+    del max_evidence
+    evidence_text = json.dumps(evidence, ensure_ascii=False, indent=2)
+    system = (
+        "You are a gold-aware evidence verifier for a memory QA benchmark. "
+        "Given the user question, gold answer, and retrieved evidence, judge whether "
+        "the evidence alone is sufficient for a separate answer model to derive the "
+        "gold answer. Do not require exact wording. Penalize missing comparison sides, "
+        "missing list entities, unsupported temporal claims, off-topic evidence, and "
+        "missing visual details. Empty evidence is not sufficient, including for "
+        "not-mentioned or absence answers. Return only valid JSON."
+    )
+    user = f"""Question:
+{row.get('question')}
+
+Gold answer:
+{row.get('gold_answer')}
+
+Retrieved evidence:
+{evidence_text}
+
+Return JSON with keys:
+{{
+  "answerable": boolean,
+  "score": 0.0,
+  "relevance": 0.0,
+  "completeness": 0.0,
+  "reason": "short diagnostic"
+}}"""
+    return [{"role": "system", "content": system}, {"role": "user", "content": user}]
+
+
 def _parse_judge_json(text: str) -> dict[str, Any]:
     text = text.strip()
     try:
@@ -530,6 +553,37 @@ def _parse_judge_json(text: str) -> dict[str, Any]:
     }
 
 
+def _parse_evidence_answerable_json(text: str) -> dict[str, Any]:
+    text = text.strip()
+    try:
+        value = json.loads(text)
+    except Exception:
+        match = re.search(r"\{.*\}", text, flags=re.DOTALL)
+        value = json.loads(match.group(0)) if match else {}
+    if not isinstance(value, dict):
+        value = {}
+
+    def _float_key(key: str, default: float = 0.0) -> float:
+        try:
+            return max(0.0, min(1.0, float(value.get(key, default))))
+        except (TypeError, ValueError):
+            return default
+
+    relevance = _float_key("relevance")
+    completeness = _float_key("completeness")
+    score = _float_key("score", 1.0 if bool(value.get("answerable")) else 0.0)
+    answerable = bool(value.get("answerable"))
+    return {
+        "judge_correct": answerable,
+        "judge_score": 1.0 if answerable else 0.0,
+        "judge_reason": str(value.get("reason", "")),
+        "evidence_answerable": answerable,
+        "evidence_answerable_score": score,
+        "evidence_relevance": relevance,
+        "evidence_completeness": completeness,
+    }
+
+
 def run_judge(args: argparse.Namespace, rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     tokenizer = AutoTokenizer.from_pretrained(args.judge_model, trust_remote_code=True)
     llm = LLM(
@@ -540,9 +594,15 @@ def run_judge(args: argparse.Namespace, rows: list[dict[str, Any]]) -> list[dict
         max_model_len=args.judge_max_model_len,
         dtype="bfloat16",
     )
+    if args.judge_mode == "evidence_answerable":
+        prompt_builder = lambda row: _evidence_answerable_prompt(row, args.answer_max_evidence)
+        parse_judge = _parse_evidence_answerable_json
+    else:
+        prompt_builder = _judge_prompt
+        parse_judge = _parse_judge_json
     prompts = [
         tokenizer.apply_chat_template(
-            _judge_prompt(row),
+            prompt_builder(row),
             tokenize=False,
             add_generation_prompt=True,
             enable_thinking=False,
@@ -556,10 +616,10 @@ def run_judge(args: argparse.Namespace, rows: list[dict[str, Any]]) -> list[dict
     for row, generation in zip(rows, generations, strict=True):
         text = generation.outputs[0].text
         try:
-            parsed = _parse_judge_json(text)
+            parsed = parse_judge(text)
         except Exception as exc:
             parsed = {"judge_correct": False, "judge_score": 0.0, "judge_reason": f"judge_parse_error: {exc}"}
-        judged.append({**row, **parsed, "judge_raw": text})
+        judged.append({**row, **parsed, "judge_raw": text, "judge_mode": args.judge_mode})
 
     del llm
     gc.collect()
@@ -585,7 +645,12 @@ def summarize(rows: list[dict[str, Any]]) -> dict[str, Any]:
 
     return {
         "num_samples": n,
+        "judge_mode": next((str(row.get("judge_mode")) for row in rows if row.get("judge_mode")), ""),
         "judge_accuracy": mean([float(row.get("judge_score") or 0.0) for row in rows]),
+        "evidence_answerable_rate": mean([float(row.get("evidence_answerable") or 0.0) for row in rows]),
+        "evidence_answerable_score": mean([float(row.get("evidence_answerable_score") or 0.0) for row in rows]),
+        "evidence_relevance": mean([float(row.get("evidence_relevance") or 0.0) for row in rows]),
+        "evidence_completeness": mean([float(row.get("evidence_completeness") or 0.0) for row in rows]),
         "answer_contains_gold_rate": mean([float(row.get("answer_contains_gold") or 0.0) for row in rows]),
         "evidence_present_rate": mean([1.0 if int(row.get("evidence_count") or 0) > 0 else 0.0 for row in rows]),
         "avg_evidence_count": mean([float(row.get("evidence_count") or 0.0) for row in rows]),
@@ -635,8 +700,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--temperature", type=float, default=0.0)
     parser.add_argument("--top-p", type=float, default=1.0)
     parser.add_argument("--judge-tp", type=int, default=2)
+    parser.add_argument("--judge-mode", choices=["answer_correctness", "evidence_answerable"], default="answer_correctness")
     parser.add_argument("--judge-gpu-memory-utilization", type=float, default=0.55)
-    parser.add_argument("--judge-max-model-len", type=int, default=8192)
+    parser.add_argument("--judge-max-model-len", type=int, default=16384)
     parser.add_argument("--judge-max-new-tokens", type=int, default=192)
     parser.add_argument("--answer-base-url", default=DEFAULT_ANSWER_BASE_URL)
     parser.add_argument("--answer-model", default=DEFAULT_ANSWER_MODEL)
@@ -659,7 +725,7 @@ def main() -> None:
         qas = load_eval_qas(args)
         rows = rollout_student(args, qas)
         write_outputs(rows, args.output)
-    if not args.rollout_only and not args.skip_answer_model:
+    if not args.rollout_only and not args.skip_answer_model and args.judge_mode != "evidence_answerable":
         rows = run_answer_model(args, rows)
         write_outputs(rows, args.output)
     if not args.rollout_only:

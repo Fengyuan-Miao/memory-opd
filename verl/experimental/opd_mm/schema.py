@@ -32,7 +32,7 @@ ALLOWED_TOOLS = {
     "INSPECT_RAW",
     "STOP",
 }
-FILTER_FIELDS = {"modality", "author", "source_type", "timestamp", "status"}
+FILTER_FIELDS = {"modality", "source_type", "timestamp", "status"}
 FILTER_OPS = {"eq", "neq", "before", "after", "contains"}
 FILTER_SCOPES = {"current_pool", "full_memory"}
 SORT_FIELDS = {"timestamp", "turn_id", "score"}
@@ -51,25 +51,31 @@ FORBIDDEN_ARGUMENT_KEYS = {
 MEMORY_ID_PATTERN = re.compile(r"\b(?:m|memory|mau)[-_]?\d+\b", re.IGNORECASE)
 
 TOOL_SCHEMA_TEXT = """Allowed executable tools:
-FILTER(field=modality|author|source_type|timestamp|status,
+FILTER(field=modality|source_type|timestamp|status,
        op=eq|neq|before|after|contains, value=...,
-       scope=optional current_pool|full_memory)
+       scope=current_pool|full_memory)
 SORT(field=timestamp|turn_id|score, order=asc|desc)
 TOPK(k=positive integer)
-RETRIEVE(method=bm25|dense|vision|hybrid, top_k=positive integer, query=optional rewritten search text)
+RETRIEVE(method=bm25|dense|vision|hybrid, top_k=positive integer,
+         query=optional rewritten search text)
 EXPAND_NEIGHBORS(window=1|2|3)
 STOP()
 
 Return only a JSON array of tool calls. Do not emit memory IDs. RETRIEVE uses
 the original user query by default; optionally provide query to rewrite the
-search text for the current retrieval step. RETRIEVE and full_memory FILTER
-merge new candidates into the accumulated pool and deduplicate by memory. For
-timestamp filters, date-only values such as YYYY-MM-DD match all memory
-timestamps from that date. FILTER scope defaults to current_pool; use
-scope=full_memory to collect metadata-filtered candidates from the original
-hidden memory pool without discarding existing candidates. EXPAND_NEIGHBORS
-adds nearby turns around the current candidate pool; use it only after a
-retrieve/filter step has selected relevant candidates."""
+search text for the current retrieval step. Every RETRIEVE searches the
+original hidden memory store and replaces the current candidate pool.
+Pool-changing tools refresh the answer evidence from the current candidate pool
+instead of accumulating stale evidence. For timestamp filters, date-only values
+such as YYYY-MM-DD match all memory timestamps from that date. FILTER scope is
+required: use full_memory for an independent metadata/date filter over the
+original store; use current_pool only for an intentional intersection with the
+current candidates. Chaining unrelated current_pool filters can empty the pool.
+For Mem-Gallery, source_type values are dialogue_turn and dialogue_image;
+MEMORY/user/assistant are not source_type values, and status is normally unset.
+EXPAND_NEIGHBORS adds
+nearby turns around the current candidate pool; use it only after a retrieve or
+filter step has selected relevant candidates."""
 
 
 def build_tool_schema(allow_inspect_raw: bool = True) -> str:
@@ -80,7 +86,8 @@ def build_tool_schema(allow_inspect_raw: bool = True) -> str:
             "INSPECT_RAW(target=current_pool,",
             "            instruction=answer_query_related_visual_details)",
             "# INSPECT_RAW calls a visual inspector only for the current retrieved candidate pool;",
-            "# it returns text observations and is not a search over the original full memory store.",
+            "# it cannot inspect the user's attached question image, cannot inspect an empty pool,",
+            "# and is not a search over the original full memory store. Use vision/hybrid RETRIEVE first.",
         ]
     return "\n".join(lines)
 
@@ -169,14 +176,14 @@ class TrajectoryValidator:
             )
 
     def _validate_filter(self, args: Dict[str, Any], index: int) -> None:
-        self._require_exact_keys(args, {"field", "op", "value"}, {"scope"}, index)
+        self._require_exact_keys(args, {"field", "op", "value", "scope"}, set(), index)
         if args["field"] not in FILTER_FIELDS:
             raise TrajectoryValidationError(f"action {index}: invalid FILTER field")
         if args["op"] not in FILTER_OPS:
             raise TrajectoryValidationError(f"action {index}: invalid FILTER op")
         if not isinstance(args["value"], (str, int, float, bool)):
             raise TrajectoryValidationError(f"action {index}: invalid FILTER value")
-        if args.get("scope", "current_pool") not in FILTER_SCOPES:
+        if args["scope"] not in FILTER_SCOPES:
             raise TrajectoryValidationError(f"action {index}: invalid FILTER scope")
 
     def _validate_sort(self, args: Dict[str, Any], index: int) -> None:

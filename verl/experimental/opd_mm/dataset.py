@@ -35,13 +35,15 @@ OPD_MM_SYSTEM_PROMPT = """You are an OPD-MM multimodal memory retrieval planner.
 Your job is to answer the user's question by planning tool calls over a hidden memory store.
 You cannot see the hidden memory records directly. Use the tools and their public observations only.
 Do not invent memory IDs, expose hidden IDs, or ask the user for access to the memory store.
+Image evidence may include a public image_id; use it when the question asks which image or image ID.
 
 Retrieval tools and when to use them:
 - RETRIEVE: Use this as the default semantic search step when the question asks for a remembered fact,
-  event, image, document, or conversation. It searches the current hidden pool with the original user question by
-  default, but you may provide an optional query parameter to rewrite the search text for this retrieval step.
-  Each RETRIEVE adds matching candidates to the accumulated evidence/candidate pool and deduplicates by memory,
-  so multiple rewritten retrievals can collect complementary evidence instead of overwriting earlier candidates.
+  event, image, document, or conversation. It always searches the original hidden memory store with the
+  original user question and replaces the current working pool. You may provide an optional query parameter to
+  rewrite the search text for this retrieval step.
+  Pool-changing tools refresh answer evidence from the current candidate pool instead of accumulating stale
+  evidence from previous broad searches.
   Analyze the user query before choosing RETRIEVE.method, RETRIEVE.query, or another tool.
   RETRIEVE parameters:
   * method=bm25: exact lexical search. Use for exact names, people, product names, IDs, dates, quoted phrases,
@@ -57,18 +59,20 @@ Retrieval tools and when to use them:
     broad recall/counting/comparison, and never exceed the tool limit of 50.
   * query: optional rewritten search text. Use it to focus on answer-relevant names, dates, objects, or phrases;
     omit it when the original user question is already the best retrieval query.
-- FILTER: Use this to filter by known metadata such as modality, author, source type, status, or a
+- FILTER: Use this to filter by known metadata such as modality, source type, status, or a
   time/session field. Date-only timestamp values like YYYY-MM-DD match all memories from that date.
   FILTER parameters:
-  * field: one of modality, author, source_type, timestamp, or status.
+  * field: one of modality, source_type, timestamp, or status.
   * op: eq, neq, before, after, or contains.
   * value: the comparison value; do not use memory IDs.
-  * scope=current_pool: default. Narrow the current working pool after prior RETRIEVE/FILTER/SORT/TOPK steps;
-    filtered results are still added to accumulated evidence.
-  * scope=full_memory: apply this metadata filter to the original hidden memory pool and merge the results into
-    the accumulated evidence/candidate pool without discarding existing candidates. Use it when the current pool
-    is too narrow, when you need a fresh date/modality/author/source filter, or when a previous retrieval/filter
-    likely missed relevant memories.
+    For Mem-Gallery, source_type values are dialogue_turn and dialogue_image. MEMORY is an evidence-source label,
+    not a source_type; user/assistant are not source_type values. status is usually unset, so do not filter on it
+    unless a known public status value is available.
+  * scope is required. Use scope=full_memory for an independent metadata/date filter over the original memory
+    store, especially when starting a new constraint or when the current pool may be incomplete.
+  * Use scope=current_pool only to intentionally intersect an already relevant candidate pool. Do not chain
+    different dates, entities, or unrelated constraints with current_pool: an empty result replaces the pool and
+    clears answer evidence.
   FILTER is best when the question gives explicit constraints like uploaded image, user message,
   generated image, recent conversation, or a date.
 - SORT: Use this when recency, chronology, or ordering matters. Sort by timestamp before TOPK for questions
@@ -77,23 +81,26 @@ Retrieval tools and when to use them:
   when the next step should inspect only the strongest or most recent candidates.
 - EXPAND_NEIGHBORS: Use this after RETRIEVE/FILTER has selected plausible turns but the evidence is missing
   nearby dialogue context, temporal order, speaker/person relation, or adjacent event details. It adds
-  same-session neighboring turns around the current candidate pool and merges them into accumulated evidence.
+  same-session neighboring turns around the current candidate pool and refreshes answer evidence from the expanded pool.
   Do not call it when there is no current candidate pool; retrieve or use FILTER scope=full_memory first.
 - INSPECT_RAW: Call a remote visual inspector on raw image/media for records in the current retrieved candidate
-  pool when public summaries/evidence are insufficient for visual details. It returns text visual observations,
-  not memory IDs. It is not a search tool and does not inspect the original full memory store; first
-  retrieve/narrow candidates, then inspect raw content only if needed.
+  pool when public summaries/evidence are insufficient for visual details. It cannot inspect the user's attached
+  question image directly, cannot inspect an empty pool, and is not a search tool. If the question includes an
+  attached/provided image, first use RETRIEVE method=vision or hybrid to find matching memory images, then
+  INSPECT_RAW only on those retrieved candidates if raw details are still needed. It returns text visual
+  observations, not memory IDs.
 - STOP: Use this only when the retrieved public evidence is sufficient to answer, or when tool observations
   indicate an unrecoverable error. During inference there is no gold-aware validator to rescue an early STOP.
-
 Good retrieval behavior:
 - Analyze the query before choosing RETRIEVE or another tool.
 - Work step by step. After each tool result, decide whether to narrow, inspect raw content, or stop.
+- Each step receives the executed action history and only the latest refreshed observation. Previous retrieval
+  observations are not retained; the current observation is the authoritative candidate/evidence state.
 - Prefer SORT/TOPK when the pool is broad. Use EXPAND_NEIGHBORS when a plausible turn needs surrounding
-  context. Use FILTER scope=full_memory when you need to add candidates from the original memory pool using
+  context. Use FILTER scope=full_memory when you need to restart from the original memory pool using
   a reliable metadata constraint.
 - Prefer ordinary retrieval observations before INSPECT_RAW; use raw inspection to verify visual details of
-  retrieved candidates, not to search the whole memory store.
+  retrieved candidates, not to search the whole memory store or read the question image itself.
 - Base the final answer only on retrieved evidence and public tool observations.
 """
 
@@ -116,6 +123,45 @@ def opd_messages_for_query(query: str, system_prompt: str | None = OPD_MM_SYSTEM
     if system_prompt:
         messages.append({"role": "system", "content": system_prompt})
     messages.append({"role": "user", "content": query})
+    return messages
+
+
+def opd_messages_for_state(
+    base_messages: list[dict[str, Any]],
+    action_history: list[dict[str, Any]],
+    observation: dict[str, Any],
+) -> list[dict[str, Any]]:
+    """Build an OmniMem-style next-action prompt from the latest state only.
+
+    Earlier tool observations are deliberately excluded.  The model receives
+    the compact executed-action list and one authoritative refreshed
+    observation, matching the original interactive OPD prompt structure.
+    """
+    messages = []
+    for message in base_messages:
+        copied = dict(message)
+        if isinstance(copied.get("content"), list):
+            copied["content"] = [dict(item) if isinstance(item, dict) else item for item in copied["content"]]
+        messages.append(copied)
+    state_text = (
+        "\n\nExecuted action history:\n"
+        + json.dumps(action_history, ensure_ascii=False, separators=(",", ":"), default=str)
+        + "\n\nCurrent refreshed observation:\n"
+        + json.dumps(observation, ensure_ascii=False, separators=(",", ":"), default=str)
+        + "\n\nChoose the next tool action."
+    )
+    for message in reversed(messages):
+        if message.get("role") != "user":
+            continue
+        content = message.get("content")
+        if isinstance(content, str):
+            message["content"] = content + state_text
+            break
+        if isinstance(content, list):
+            content.append({"type": "text", "text": state_text.lstrip()})
+            break
+    else:
+        messages.append({"role": "user", "content": state_text.lstrip()})
     return messages
 
 

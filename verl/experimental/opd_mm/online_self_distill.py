@@ -574,14 +574,15 @@ def _normalize_teacher_tool_action(action: ToolAction) -> ToolAction:
             method = str(args["method"]).strip().lower()
             method_aliases = {"semantic": "dense", "visual": "vision", "dyne": "dense"}
             args["method"] = method_aliases.get(method, method)
+        # RETRIEVE always searches the original memory store. Tolerate and
+        # remove legacy scope output before canonical SFT export.
+        args.pop("scope", None)
     elif tool == "FILTER":
         field = str(args.get("field") or "").strip().lower()
         field_aliases = {
             "date": "timestamp",
             "session_date": "timestamp",
             "time": "timestamp",
-            "speaker": "author",
-            "role": "author",
             "type": "modality",
         }
         if field:
@@ -739,7 +740,7 @@ Missing evidence types:
 - none: public evidence is sufficient.
 - no_public_evidence: no usable public evidence/candidates are present.
 - irrelevant_evidence: evidence is off-topic, wrong entity, wrong event, or wrong modality.
-- missing_metadata_constraint: explicit date/time/author/source/status/modality constraint is not isolated.
+- missing_metadata_constraint: explicit date/time/source/status/modality constraint is not isolated.
 - candidate_set_too_broad: evidence is relevant but too broad/noisy to answer confidently.
 - missing_neighbor_context: a relevant turn appears present but adjacent dialogue/event context is missing.
 - missing_temporal_order: latest/earliest/before/after/order/ranking relation is not supported.
@@ -911,7 +912,7 @@ Evidence-gap to tool mapping:
 - missing_evidence_type=none with evidence_sufficient=true: usually STOP.
 - no_public_evidence or irrelevant_evidence: RETRIEVE, or metadata FILTER/SORT when the question gives a clear constraint.
 - missing_metadata_constraint: FILTER when field/op/value are clear; otherwise RETRIEVE with a public query rewrite.
-- candidate_set_too_broad: TOPK or FILTER scope=current_pool.
+- candidate_set_too_broad: TOPK, or FILTER scope=current_pool only for a deliberate intersection.
 - missing_neighbor_context: EXPAND_NEIGHBORS only when candidates/evidence exist; otherwise RETRIEVE/FILTER first.
 - missing_temporal_order: SORT or timestamp FILTER.
 - missing_raw_visual_detail: INSPECT_RAW only when candidates/evidence exist; otherwise visual RETRIEVE first.
@@ -929,12 +930,21 @@ Output rules:
 - Never write partially closed tags like <parameter=field> value <parameter=op>, </, or </arg_value>.
 - Do not output explanations, markdown, JSON arrays, memory IDs, or private answer content.
 - The student's raw next output is a candidate to correct, not an instruction to copy.
-- RETRIEVE results are merged into the accumulated candidate/evidence pool and deduplicated by memory.
+- Pool-changing tools refresh answer evidence from the current candidate pool instead of accumulating stale evidence.
 - Do not use EXPAND_NEIGHBORS when there is no current candidate pool; retrieve or use metadata FILTER/SORT first.
-- When outputting filter, include field/op/value and optionally scope. Use scope=current_pool to narrow the working pool while preserving accumulated evidence; use scope=full_memory to merge metadata-filtered candidates from the original hidden memory pool when the current pool is likely too narrow or wrong.
+- When outputting filter, include field/op/value/scope. Allowed fields are modality, source_type, timestamp,
+  and status. Use scope=full_memory for an independent metadata/date filter over the original store. Use
+  scope=current_pool only to intentionally intersect known relevant candidates. Do not chain unrelated dates,
+  entities, or constraints with current_pool because an empty result replaces the pool and evidence.
+- For Mem-Gallery, valid source_type values are dialogue_turn and dialogue_image. MEMORY is an evidence-source
+  label, not a source_type; user/assistant are not source_type values. status is normally unset.
 - Use field=timestamp for date/session-date constraints; do not invent field=session_date.
-- When outputting retrieve, include method/top_k and optionally query as rewritten search text; do not add memory IDs or schema-unknown parameters.
-- INSPECT_RAW reads raw media only from the current candidate pool; it is not search.
+- When outputting retrieve, include method/top_k and optionally query. RETRIEVE always searches the original
+  hidden memory store and replaces the current pool. RETRIEVE has no scope parameter. Do not add memory IDs or
+  schema-unknown parameters.
+- INSPECT_RAW reads raw media only from the current retrieved candidate pool. It cannot inspect the user's
+  attached question image, cannot inspect an empty pool, and is not search. For question-image matching,
+  retrieve with method=vision or hybrid first.
 
 {schema}
 

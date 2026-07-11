@@ -196,6 +196,7 @@ class AgentData:
         tools_kwargs: dict[str, Any],
     ):
         self.messages = messages
+        self.base_messages = list(messages)
         self.image_data = image_data
         self.video_data = video_data
         self.audio_data = audio_data
@@ -206,6 +207,7 @@ class AgentData:
 
         # State variables
         self.prompt_ids: list[int] = []
+        self.full_prompt_ids: list[int] = []
         self.response_ids: list[int] = []
         self.response_mask: list[int] = []
         self.distillation_mask: list[int] = []
@@ -217,6 +219,7 @@ class AgentData:
 
         # Temporary state for tool calls
         self.tool_calls: list[FunctionCall] = []
+        self.last_assistant_content: str = ""
         self.online_state_corrector: Any = None
         self.teacher_raw_inspector: Any = None
 
@@ -306,8 +309,9 @@ class ToolAgentLoop(AgentLoopBase):
                 state = AgentState.TERMINATED
 
         # Finalize output
-        response_ids = agent_data.prompt_ids[-len(agent_data.response_mask) :]
-        prompt_ids = agent_data.prompt_ids[: len(agent_data.prompt_ids) - len(agent_data.response_mask)]
+        full_prompt_ids = agent_data.full_prompt_ids or agent_data.prompt_ids
+        response_ids = full_prompt_ids[-len(agent_data.response_mask) :] if agent_data.response_mask else []
+        prompt_ids = full_prompt_ids[: len(full_prompt_ids) - len(agent_data.response_mask)]
         multi_modal_data = {}
         if agent_data.image_data is not None:
             multi_modal_data["images"] = agent_data.image_data
@@ -355,6 +359,8 @@ class ToolAgentLoop(AgentLoopBase):
                 mm_processor_kwargs=agent_data.mm_processor_kwargs,
             )
         agent_data.prompt_ids = prompt_ids
+        if not agent_data.full_prompt_ids:
+            agent_data.full_prompt_ids = list(prompt_ids)
         return AgentState.GENERATING
 
     async def _handle_generating_state(
@@ -411,6 +417,8 @@ class ToolAgentLoop(AgentLoopBase):
                 agent_data.response_logprobs = response_logprobs
         else:
             agent_data.prompt_ids += agent_data.response_ids
+            if agent_data.full_prompt_ids:
+                agent_data.full_prompt_ids += agent_data.response_ids
             agent_data.response_mask += [1] * len(agent_data.response_ids)
             current_distillation_mask = build_tool_call_xml_span_mask(self.tokenizer, agent_data.response_ids)
             agent_data.distillation_mask += current_distillation_mask
@@ -434,6 +442,7 @@ class ToolAgentLoop(AgentLoopBase):
         assistant_content, agent_data.tool_calls = await self.tool_parser.extract_tool_calls(
             agent_data.response_ids, tools
         )
+        agent_data.last_assistant_content = assistant_content or ""
         await self._collect_online_state_correction(
             agent_data=agent_data,
             state_prompt_ids=state_prompt_ids,
@@ -600,6 +609,31 @@ class ToolAgentLoop(AgentLoopBase):
         agent_data.messages.extend(add_messages)
         if terminate_after_tools:
             return AgentState.TERMINATED
+
+        # OPD-MM refreshes its retrieval state after every action. Rebuild the
+        # next prompt from the compact action history and latest observation,
+        # rather than retaining earlier retrieval observations in token history.
+        opd_prompt_state = agent_data.extra_fields.get("opd_mm_prompt_state")
+        if not self.enable_continuous_token and not new_images_this_turn and isinstance(opd_prompt_state, dict):
+            from verl.experimental.opd_mm.dataset import opd_messages_for_state
+
+            state_messages = opd_messages_for_state(
+                agent_data.base_messages,
+                opd_prompt_state.get("action_history") or [],
+                opd_prompt_state.get("observation") or {},
+            )
+            schemas = getattr(agent_data, "_active_tool_schemas", self.tool_schemas)
+            agent_data.messages = state_messages
+            agent_data.prompt_ids = await self.apply_chat_template(
+                state_messages,
+                tools=schemas,
+                images=agent_data.image_data,
+                videos=agent_data.video_data,
+                audios=agent_data.audio_data,
+                mm_processor_kwargs=agent_data.mm_processor_kwargs,
+            )
+            agent_data.user_turns += 1
+            return AgentState.GENERATING
 
         if self.enable_continuous_token and not new_images_this_turn:
             schemas = getattr(agent_data, "_active_tool_schemas", self.tool_schemas)

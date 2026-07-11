@@ -56,6 +56,9 @@ DEFAULT_VISION_MODEL_PATH = "/home/miaofy/data/pretrained_models/SigLIP-Base-Pat
 DEFAULT_HYBRID_MODEL_PATH = "/home/miaofy/data/pretrained_models/gme-Qwen2-VL-2B-Instruct"
 DEFAULT_RAW_INSPECTOR_TIMEOUT = 60.0
 DEFAULT_RAW_INSPECTOR_MAX_TOKENS = 256
+OBSERVATION_TEXT_MAX_CHARS = 220
+OBSERVATION_POOL_PREVIEW_ITEMS = 3
+OBSERVATION_EVIDENCE_PREVIEW_ITEMS = 4
 
 
 def _property(type_: str | list[str], description: str, enum: Optional[list[Any]] = None) -> dict[str, Any]:
@@ -382,16 +385,53 @@ def _sanitize_evidence(items: list[EvidenceItem]) -> list[dict[str, Any]]:
     return sanitized
 
 
-def _sanitize_pool_preview(items: list[PoolItem], max_items: int = 5) -> list[dict[str, Any]]:
-    """Return an ID-free preview of the current hidden pool for tool observations."""
+def _clip_text(value: Any, max_chars: int = OBSERVATION_TEXT_MAX_CHARS) -> Any:
+    if not isinstance(value, str) or len(value) <= max_chars:
+        return value
+    return value[:max_chars].rstrip() + "...(truncated)"
+
+
+def _sanitize_evidence_preview(
+    items: list[EvidenceItem],
+    max_items: int = OBSERVATION_EVIDENCE_PREVIEW_ITEMS,
+) -> list[dict[str, Any]]:
+    """Return a compact, internal-ID-free evidence preview for tool observations."""
+    preview = []
+    for item in items[-max_items:]:
+        data = item.to_dict()
+        data.pop("memory_id", None)
+        fields = data.get("fields") if isinstance(data.get("fields"), dict) else data
+        entry: dict[str, Any] = {"source": data.get("source")}
+        for key in (
+            "image_id",
+            "content",
+            "visual_observation",
+            "linked_text_context",
+            "timestamp",
+            "session_date",
+            "modality",
+            "retrieval_score",
+        ):
+            value = fields.get(key)
+            if value not in (None, ""):
+                entry[key] = _clip_text(value)
+        preview.append({key: value for key, value in entry.items() if value not in (None, "")})
+    return preview
+
+
+def _sanitize_pool_preview(
+    items: list[PoolItem],
+    max_items: int = OBSERVATION_POOL_PREVIEW_ITEMS,
+) -> list[dict[str, Any]]:
+    """Return an internal-ID-free preview of the current hidden pool for tool observations."""
     preview = []
     for item in items[:max_items]:
         memory = item.memory
         content = memory.content or memory.summary
         entry = {
-            "content": content[:360] if content else None,
+            "image_id": memory.public_image_id(),
+            "content": _clip_text(content) if content else None,
             "timestamp": memory.timestamp,
-            "author": memory.author,
             "modality": memory.modality,
             "session_date": memory.metadata.get("session_date"),
         }
@@ -425,21 +465,21 @@ class OPDToolSession:
     def execute(self, action: ToolAction) -> dict[str, Any]:
         """Execute one validated action against the current hidden pool."""
         before = len(self.pool)
-        evidence_before = len(self.evidence)
         step_error = ""
+        new_evidence: list[EvidenceItem] = []
 
         if self.stopped:
             return self._observation(action, [], "trajectory already stopped")
 
         try:
-            if len(self.trace) >= self.executor.validator.max_actions and action.tool != "STOP":
-                raise ValueError("maximum OPD-MM actions reached")
+            if len(self.trace) >= self.executor.validator.max_actions - 1 and action.tool != "STOP":
+                action = ToolAction("STOP")
             self.executor.validator._validate_action(action, len(self.trace))
             if action.tool == "FILTER":
                 source_pool = self.executor._filter_source_pool(
                     self.pool,
                     self.memory_store,
-                    action.arguments.get("scope", "current_pool"),
+                    action.arguments["scope"],
                 )
                 filtered = self.executor._filter(
                     source_pool,
@@ -447,40 +487,37 @@ class OPDToolSession:
                     op=action.arguments["op"],
                     value=action.arguments["value"],
                 )
-                if self.pool_has_candidates and action.arguments.get("scope") == "full_memory":
-                    self.pool = self.executor._merge_pools(self.pool, filtered)
-                else:
-                    self.pool = filtered
+                self.pool = filtered
                 self.pool_has_candidates = True
-                self.executor._append_pool_evidence(
-                    self.evidence,
-                    filtered,
-                    source="FILTER",
+                new_evidence = self.executor._refresh_evidence_from_pool(
+                    self.evidence, self.pool, source="FILTER"
                 )
             elif action.tool == "SORT":
                 self.pool = self.executor._sort(self.pool, **action.arguments)
+                if self.pool_has_candidates:
+                    new_evidence = self.executor._refresh_evidence_from_pool(
+                        self.evidence, self.pool, source="SORT"
+                    )
             elif action.tool == "TOPK":
                 self.pool = self.executor._topk_turns(self.pool, action.arguments["k"])
+                if self.pool_has_candidates:
+                    new_evidence = self.executor._refresh_evidence_from_pool(
+                        self.evidence, self.pool, source="TOPK"
+                    )
             elif action.tool == "RETRIEVE":
                 retrieve_query = action.arguments.get("query") or self.query
                 retrieved = self.executor.retriever.retrieve(
-                    self.pool,
+                    self.memory_store.initial_pool(),
                     query=retrieve_query,
                     store=self.memory_store,
                     method=action.arguments.get("method", "hybrid"),
                     top_k=action.arguments.get("top_k", 5),
                     question_image=self.question_image,
                 )
-                self.pool = (
-                    self.executor._merge_pools(self.pool, retrieved)
-                    if self.pool_has_candidates
-                    else retrieved
-                )
+                self.pool = retrieved
                 self.pool_has_candidates = True
-                self.executor._append_pool_evidence(
-                    self.evidence,
-                    retrieved,
-                    source="RETRIEVE",
+                new_evidence = self.executor._refresh_evidence_from_pool(
+                    self.evidence, self.pool, source="RETRIEVE"
                 )
             elif action.tool == "EXPAND_NEIGHBORS":
                 if not self.pool_has_candidates or not self.pool:
@@ -492,10 +529,8 @@ class OPDToolSession:
                 )
                 self.pool = self.executor._merge_pools(self.pool, expanded)
                 self.pool_has_candidates = True
-                self.executor._append_pool_evidence(
-                    self.evidence,
-                    expanded,
-                    source="EXPAND_NEIGHBORS",
+                new_evidence = self.executor._refresh_evidence_from_pool(
+                    self.evidence, self.pool, source="EXPAND_NEIGHBORS"
                 )
             elif action.tool == "INSPECT_RAW":
                 remaining = max(0, self.executor.max_raw_inspections - self.raw_calls)
@@ -507,6 +542,7 @@ class OPDToolSession:
                 )
                 self.raw_calls += len(inspected)
                 self.evidence.extend(inspected)
+                new_evidence = inspected
             elif action.tool == "STOP":
                 self.stopped = True
         except Exception as exc:
@@ -520,26 +556,38 @@ class OPDToolSession:
                 action=action,
                 pool_before=before,
                 pool_after=len(self.pool),
-                evidence_added=len(self.evidence) - evidence_before,
+                evidence_added=len(new_evidence),
                 error=step_error,
             )
         )
-        new_evidence = self.evidence[evidence_before:]
         return self._observation(action, new_evidence, step_error)
 
     async def execute_inspect_raw_with_teacher(self, action: ToolAction, inspect_fn: Any) -> dict[str, Any]:
         """Execute INSPECT_RAW using the async verl teacher service callback."""
         before = len(self.pool)
-        evidence_before = len(self.evidence)
         step_error = ""
         inspected: list[EvidenceItem] = []
 
         if self.stopped:
             return self._observation(action, [], "trajectory already stopped")
 
+        if len(self.trace) >= self.executor.validator.max_actions - 1 and action.tool != "STOP":
+            action = ToolAction("STOP")
+            self.stopped = True
+            self.trace.append(action)
+            self.steps.append(
+                ExecutionStep(
+                    index=len(self.steps),
+                    action=action,
+                    pool_before=before,
+                    pool_after=len(self.pool),
+                    evidence_added=0,
+                    error="",
+                )
+            )
+            return self._observation(action, [], "")
+
         try:
-            if len(self.trace) >= self.executor.validator.max_actions:
-                raise ValueError("maximum OPD-MM actions reached")
             self.executor.validator._validate_action(action, len(self.trace))
             remaining = max(0, self.executor.max_raw_inspections - self.raw_calls)
             inspect_pool = [item for item in self.pool if item.retrieved]
@@ -559,16 +607,20 @@ class OPDToolSession:
                         "text_context": context,
                     }
                 )
+                fields = {
+                    "visual_observation": str(visual_observation or ""),
+                    "linked_text_context": context,
+                    "image_label": f"context={context[:220]}",
+                    "session_date": item.memory.metadata.get("session_date"),
+                    "timestamp": item.memory.timestamp,
+                }
+                image_id = item.memory.public_image_id()
+                if image_id:
+                    fields["image_id"] = image_id
                 inspected.append(
                     EvidenceItem(
                         memory_id=item.memory.memory_id,
-                        fields={
-                            "visual_observation": str(visual_observation or ""),
-                            "linked_text_context": context,
-                            "image_label": f"context={context[:220]}",
-                            "session_date": item.memory.metadata.get("session_date"),
-                            "timestamp": item.memory.timestamp,
-                        },
+                        fields=fields,
                         source="INSPECT_RAW",
                     )
                 )
@@ -585,25 +637,34 @@ class OPDToolSession:
                 action=action,
                 pool_before=before,
                 pool_after=len(self.pool),
-                evidence_added=len(self.evidence) - evidence_before,
+                evidence_added=len(inspected),
                 error=step_error,
             )
         )
         return self._observation(action, inspected, step_error)
 
     def _observation(self, action: ToolAction, new_evidence: list[EvidenceItem], error: str) -> dict[str, Any]:
+        """Return a bounded snapshot of the refreshed state.
+
+        ToolAgentLoop already keeps the assistant tool call in message history,
+        so repeating its full arguments here only grows the prompt.  Candidate
+        and evidence previews have fixed item and text limits regardless of the
+        size of the current pool.
+        """
         return {
+            "refresh_state": True,
             "tool": action.tool,
             "pool_count": len(self.pool),
             "evidence_count": len(self.evidence),
             "pool_preview": _sanitize_pool_preview(self.pool),
-            "new_evidence": _sanitize_evidence(new_evidence),
+            "new_evidence_count": len(new_evidence),
+            "evidence_preview": _sanitize_evidence_preview(self.evidence),
             "stopped": self.stopped,
-            "error": error,
+            "error": _clip_text(error),
         }
 
     def public_state(self) -> dict[str, Any]:
-        """Return serializable, ID-free state for AgentLoopOutput.extra_fields."""
+        """Return serializable public state for AgentLoopOutput.extra_fields."""
         return {
             "pool_count": len(self.pool),
             "evidence_count": len(self.evidence),
@@ -637,6 +698,10 @@ class OPDBaseTool(BaseTool):
         observation = session.execute(action)
         if agent_data is not None and hasattr(agent_data, "extra_fields"):
             agent_data.extra_fields["opd_mm"] = session.public_state()
+            agent_data.extra_fields["opd_mm_prompt_state"] = {
+                "action_history": [item.to_dict() for item in session.trace],
+                "observation": observation,
+            }
         terminate_agent_loop = bool(observation["stopped"] or observation["error"])
         return ToolResponse(text=json.dumps(observation, ensure_ascii=False)), 0.0, {
             "opd_mm_pool_count": observation["pool_count"],
@@ -715,22 +780,26 @@ class OPDFilterTool(OPDBaseTool):
     tool_name = "filter"
     description = (
         "Filter hidden memories by metadata. current_pool narrows the working pool; "
-        "full_memory collects matching candidates from the original memory and merges them with existing candidates."
+        "full_memory collects matching candidates from the original memory when the current pool is too narrow."
     )
     properties = {
         "field": _property("string", "The memory field to filter.", sorted(FILTER_FIELDS)),
         "op": _property("string", "The comparison operator.", sorted(FILTER_OPS)),
         "value": _property(
             ["string", "number", "boolean"],
-            "The comparison value. For timestamp, YYYY-MM-DD matches all memories from that date. Do not use memory IDs.",
+            "The comparison value. For timestamp, YYYY-MM-DD matches all memories from that date. "
+            "For Mem-Gallery source_type, use dialogue_turn or dialogue_image, never MEMORY/user/assistant. "
+            "Do not use memory IDs.",
         ),
         "scope": _property(
             "string",
-            "Optional filter scope. Use current_pool to narrow the existing working pool; use full_memory to merge metadata-filtered candidates from the original hidden memory pool without discarding existing candidates.",
+            "Required filter scope. Use full_memory for an independent metadata/date filter over the original "
+            "memory store. Use current_pool only to intentionally intersect the existing candidates; unrelated "
+            "or mutually exclusive current_pool filters can empty the pool.",
             sorted(FILTER_SCOPES),
         ),
     }
-    required = ["field", "op", "value"]
+    required = ["field", "op", "value", "scope"]
 
 
 class OPDSortTool(OPDBaseTool):
@@ -753,8 +822,8 @@ class OPDTopKTool(OPDBaseTool):
 class OPDRetrieveTool(OPDBaseTool):
     tool_name = "retrieve"
     description = (
-        "Rank the current hidden pool against the original user query or an optional rewritten query. "
-        "Retrieved candidates are merged into the accumulated candidate/evidence pool and deduplicated by memory."
+        "Rank hidden memories against the original user query or an optional rewritten query. "
+        "Always searches the original hidden memory store and replaces the working pool."
     )
     properties = {
         "method": _property("string", "Retrieval method.", sorted(RETRIEVAL_METHODS)),
@@ -787,7 +856,8 @@ class OPDInspectRawTool(OPDBaseTool):
     tool_name = "inspect_raw"
     description = (
         "Opt-in raw visual inspection for images/media in the current retrieved candidate pool. "
-        "This does not search or inspect the original full memory store."
+        "Use only after retrieve/filter has selected candidate images. This cannot inspect the user's "
+        "attached question image, cannot inspect an empty pool, and does not search the original full memory store."
     )
     properties = {
         "target": _property("string", "Inspection target.", sorted(INSPECT_TARGETS)),
@@ -815,6 +885,10 @@ class OPDInspectRawTool(OPDBaseTool):
         observation = await session.execute_inspect_raw_with_teacher(action, inspect_fn)
         if agent_data is not None and hasattr(agent_data, "extra_fields"):
             agent_data.extra_fields["opd_mm"] = session.public_state()
+            agent_data.extra_fields["opd_mm_prompt_state"] = {
+                "action_history": [item.to_dict() for item in session.trace],
+                "observation": observation,
+            }
         terminate_agent_loop = bool(observation["stopped"] or observation["error"])
         return ToolResponse(text=json.dumps(observation, ensure_ascii=False)), 0.0, {
             "opd_mm_pool_count": observation["pool_count"],
