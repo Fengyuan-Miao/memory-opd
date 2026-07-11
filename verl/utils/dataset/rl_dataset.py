@@ -256,8 +256,9 @@ class RLHFDataset(Dataset):
                         apply_kwargs.pop("return_dict", None)
                         apply_kwargs.pop("return_tensors", None)
 
+                        messages = self._build_messages(doc, key=self.prompt_key)
                         tokenized_prompt = tokenizer.apply_chat_template(
-                            doc[prompt_key], add_generation_prompt=True, tokenize=True, **apply_kwargs
+                            messages, add_generation_prompt=True, tokenize=True, **apply_kwargs
                         )
                         return len(normalize_token_ids(tokenized_prompt))
                     except Exception:
@@ -310,7 +311,7 @@ class RLHFDataset(Dataset):
         Returns:
             messages: List of messages with replaced placeholder.
         """
-        messages: list = example[key]
+        messages = self._refresh_opd_mm_messages(example, key=key)
         # When concatenating multimodal datasets, get will return None for samples without a modality column.
         images = example.get(self.image_key, None) or []
         videos = example.get(self.video_key, None) or []
@@ -382,6 +383,55 @@ class RLHFDataset(Dataset):
         assert video_offset == len(videos), f"video_offset {video_offset} != len(videos) {len(videos)}"
         assert audio_offset == len(audios), f"audio_offset {audio_offset} != len(audios) {len(audios)}"
         return messages
+
+    def _refresh_opd_mm_messages(self, example: dict, key: str) -> list[dict[str, Any]]:
+        """Return student messages, refreshing OPD-MM rows to the current system prompt.
+
+        OPD-MM training rows historically stored fully materialized ``prompt``
+        messages in parquet.  The action schema and tool semantics are still
+        evolving, so using the serialized prompt can silently train/evaluate a
+        student with stale instructions.  For online OPD-MM rows, rebuild the
+        student-visible messages from the current code while leaving all other
+        datasets untouched.
+        """
+        raw_messages = example[key]
+        messages = [dict(message) if isinstance(message, dict) else message for message in raw_messages]
+        extra_info = example.get("extra_info") or {}
+        if hasattr(extra_info, "item"):
+            try:
+                extra_info = extra_info.item()
+            except Exception:
+                pass
+        if not isinstance(extra_info, dict) or not extra_info.get("opd_mm_online_self_distill"):
+            return messages
+
+        tools_kwargs = extra_info.get("tools_kwargs") or {}
+        if hasattr(tools_kwargs, "item"):
+            try:
+                tools_kwargs = tools_kwargs.item()
+            except Exception:
+                pass
+        opd_kwargs = tools_kwargs.get("opd_mm") if isinstance(tools_kwargs, dict) else {}
+        if not isinstance(opd_kwargs, dict):
+            opd_kwargs = {}
+        query = opd_kwargs.get("query")
+        if not query:
+            for message in reversed(messages):
+                if not isinstance(message, dict) or message.get("role") != "user":
+                    continue
+                content = message.get("content")
+                if isinstance(content, str):
+                    query = content
+                elif isinstance(content, list):
+                    query = "\n".join(str(item.get("text", "")) for item in content if isinstance(item, dict))
+                if query:
+                    break
+        if not query:
+            return messages
+
+        from verl.experimental.opd_mm.dataset import OPD_MM_SYSTEM_PROMPT, opd_messages_for_query
+
+        return opd_messages_for_query(str(query), system_prompt=OPD_MM_SYSTEM_PROMPT)
 
     def __getitem__(self, item):
         """For rollout, apply_chat_template has been moved to AgentLoop, so we only return raw_prompt here."""

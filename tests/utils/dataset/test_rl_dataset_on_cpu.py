@@ -108,6 +108,29 @@ def test_build_messages_accepts_image_path():
     ]
 
 
+def test_build_messages_refreshes_opd_mm_system_prompt():
+    from verl.experimental.opd_mm.dataset import OPD_MM_SYSTEM_PROMPT
+
+    dataset = _mock_rlhf_dataset()
+    example = {
+        "prompt": [
+            {"role": "system", "content": "old OPD-MM prompt mentioning author"},
+            {"role": "user", "content": "old question text"},
+        ],
+        "extra_info": {
+            "opd_mm_online_self_distill": True,
+            "tools_kwargs": {"opd_mm": {"query": "What is the latest OPD-MM question?"}},
+        },
+    }
+
+    messages = dataset._build_messages(example, key=dataset.prompt_key)
+
+    assert messages[0] == {"role": "system", "content": OPD_MM_SYSTEM_PROMPT}
+    assert messages[1] == {"role": "user", "content": "What is the latest OPD-MM question?"}
+    assert "old OPD-MM prompt" not in str(messages)
+    assert "public image_id" in messages[0]["content"]
+
+
 @pytest.mark.parametrize(
     ("videos", "expected_video"),
     [

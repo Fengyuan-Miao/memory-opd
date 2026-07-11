@@ -899,8 +899,7 @@ def build_teacher_correction_prompt(
 Teacher role:
 - Correct exactly one next tool action for the current student-visible retrieval state.
 - You are not answering the user and you are not a memory oracle.
-- Your output becomes an SFT target for a student that cannot see teacher-only fields.
-- Therefore, never expose privileged facts through tool arguments.
+- Your XML becomes an SFT target; never expose privileged facts through tool arguments.
 
 Verifier feedback role:
 - The verifier used the gold answer privately. You do not see the gold answer.
@@ -908,43 +907,46 @@ Verifier feedback role:
 - If verifier.evidence_sufficient is false, STOP is invalid.
 - Never copy verifier.reason into RETRIEVE.query or any tool argument.
 
-Evidence-gap to tool mapping:
-- missing_evidence_type=none with evidence_sufficient=true: usually STOP.
-- no_public_evidence or irrelevant_evidence: RETRIEVE, or metadata FILTER/SORT when the question gives a clear constraint.
-- missing_metadata_constraint: FILTER when field/op/value are clear; otherwise RETRIEVE with a public query rewrite.
-- candidate_set_too_broad: TOPK, or FILTER scope=current_pool only for a deliberate intersection.
-- missing_neighbor_context: EXPAND_NEIGHBORS only when candidates/evidence exist; otherwise RETRIEVE/FILTER first.
+Choose the action:
+- none + evidence_sufficient=true: usually STOP.
+- no_public_evidence/irrelevant_evidence: RETRIEVE, or clear metadata FILTER.
+- missing_metadata_constraint: FILTER when field/op/value are clear; otherwise RETRIEVE.
+- candidate_set_too_broad: TOPK or a deliberate current_pool FILTER.
+- missing_neighbor_context: EXPAND_NEIGHBORS only after candidates exist.
 - missing_temporal_order: SORT or timestamp FILTER.
-- missing_raw_visual_detail: INSPECT_RAW only when candidates/evidence exist; otherwise visual RETRIEVE first.
-- incomplete_coverage or insufficient_absence_support: broaden with RETRIEVE/FILTER, or EXPAND_NEIGHBORS if current candidates are relevant.
+- missing_raw_visual_detail: INSPECT_RAW only after candidate images/media exist.
+- incomplete_coverage/insufficient_absence_support: broaden or refine with RETRIEVE/FILTER; use neighbors when local context is missing.
 
-Output rules:
+Choose RETRIEVE.method deliberately:
+- bm25: exact names, products, dates, IDs, quoted phrases, or distinctive words.
+- dense: semantic text facts when wording may differ.
+- vision: question image, visual matching, object/color/layout/fine visual attributes.
+- hybrid: both text/caption and visual clues are useful, or modality is genuinely mixed.
+
+XML output contract:
 - Output exactly one {format_name} tool call and nothing else.
-- Use lower-case function names from the tool schema.
-- Function names must be one of: retrieve, filter, sort, topk, expand_neighbors, inspect_raw, stop.
-- Never output a function name or parameter name that is not listed in the tool schema.
-- For Qwen function XML, every parameter must have this exact closed form:
+- Start with <tool_call> and end with </tool_call>.
+- Function names must be lower-case: retrieve, filter, sort, topk, expand_neighbors, inspect_raw, stop.
+- Only these XML tag forms are allowed: tool_call, function=NAME, and parameter=NAME.
+- Each argument must use this exact parameter form, replacing NAME/VALUE:
   <parameter=name>
   value
   </parameter>
-- Never write partially closed tags like <parameter=field> value <parameter=op>, </, or </arg_value>.
-- Do not output explanations, markdown, JSON arrays, memory IDs, or private answer content.
+- Do not use JSON, markdown, attribute-style arguments, inline arguments, standalone argument tags, unnamed parameters,
+  partial tags, memory IDs, or private answer content.
+- Never output a parameter not listed in the schema.
 - The student's raw next output is a candidate to correct, not an instruction to copy.
-- Pool-changing tools refresh answer evidence from the current candidate pool instead of accumulating stale evidence.
-- Do not use EXPAND_NEIGHBORS when there is no current candidate pool; retrieve or use metadata FILTER/SORT first.
-- When outputting filter, include field/op/value/scope. Allowed fields are modality, source_type, timestamp,
-  and status. Use scope=full_memory for an independent metadata/date filter over the original store. Use
-  scope=current_pool only to intentionally intersect known relevant candidates. Do not chain unrelated dates,
-  entities, or constraints with current_pool because an empty result replaces the pool and evidence.
-- For Mem-Gallery, valid source_type values are dialogue_turn and dialogue_image. MEMORY is an evidence-source
-  label, not a source_type; user/assistant are not source_type values. status is normally unset.
-- Use field=timestamp for date/session-date constraints; do not invent field=session_date.
-- When outputting retrieve, include method/top_k and optionally query. RETRIEVE always searches the original
-  hidden memory store and replaces the current pool. RETRIEVE has no scope parameter. Do not add memory IDs or
-  schema-unknown parameters.
-- INSPECT_RAW reads raw media only from the current retrieved candidate pool. It cannot inspect the user's
-  attached question image, cannot inspect an empty pool, and is not search. For question-image matching,
-  retrieve with method=vision or hybrid first.
+
+Tool argument notes:
+- filter requires field/op/value/scope. Valid fields: modality, source_type, timestamp, status. Do not use author,
+  session_date, content, image_id, turn_id, or message as filter fields. For dates, use field=timestamp.
+- FILTER scope=full_memory starts from the original store; scope=current_pool intentionally intersects known candidates.
+- source_type values are dialogue_turn or dialogue_image. MEMORY/user/assistant are not source_type values.
+- retrieve requires method/top_k and optionally query. RETRIEVE always searches the original hidden memory store and
+  replaces the current pool. RETRIEVE has no scope parameter.
+- EXPAND_NEIGHBORS requires an existing candidate pool.
+- INSPECT_RAW reads raw media only from the current retrieved candidate pool; it cannot inspect the user's question image
+  directly, cannot inspect an empty pool, and is not search.
 
 {schema}
 
@@ -967,13 +969,12 @@ This may be wrong; correct it for the student-visible state.
 Final decision checklist:
 - If the JSON observation above has "evidence_count": 0 and "trace": [], stop is invalid.
 - If verifier.evidence_sufficient is false, STOP is invalid even if the student proposed stop.
-- Use verifier.missing_evidence_type as a diagnostic, not as lexical content or a command.
-- RETRIEVE.query must be a search rewrite based only on the user question, student-visible history, and public observations.
-- Do not use verifier.reason as lexical material for RETRIEVE.query; use it only to decide the action type.
+- Use verifier.missing_evidence_type only as a diagnostic.
+- RETRIEVE.query must be based only on the user question, student-visible history, and public observations.
+- Do not use verifier.reason as lexical material for RETRIEVE.query.
 
 Now output the corrected next action.
-Your entire response must begin with <tool_call> and end with </tool_call>.
-Do not write reasoning, analysis, markdown, or any text outside the XML tool call.
+Begin immediately with <tool_call>. No reasoning text.
 """
 
 

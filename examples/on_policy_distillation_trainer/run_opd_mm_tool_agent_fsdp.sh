@@ -27,7 +27,9 @@ distillation_topk=${DISTILLATION_TOPK:-64}
 per_gpu_batch_size=${PER_GPU_BATCH_SIZE:-8}
 train_batch_size=${TRAIN_BATCH_SIZE:-$(( NGPUS_PER_NODE * per_gpu_batch_size ))}
 ppo_mini_batch_size=${PPO_MINI_BATCH_SIZE:-$train_batch_size}
-max_prompt_length=${MAX_PROMPT_LENGTH:-2048}
+# Current OPD-MM system prompt plus OpenAI tool schemas is about 2.5k tokens
+# before any tool observations, so keep the initial prompt budget above 2k.
+max_prompt_length=${MAX_PROMPT_LENGTH:-4096}
 max_response_length=${MAX_RESPONSE_LENGTH:-2048}
 ppo_max_token_len_per_gpu=${PPO_MAX_TOKEN_LEN_PER_GPU:-8192}
 teacher_max_model_len=${TEACHER_MAX_MODEL_LEN:-16384}
