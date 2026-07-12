@@ -715,19 +715,16 @@ def build_state_verifier_prompt(
         "incomplete_coverage|insufficient_absence_support"
     )
     visual_decision_line = (
-        "- missing_raw_visual_detail: candidate evidence exists, but raw visual/media details are still needed."
+        "- missing_raw_visual_detail: relevant image evidence exists but lacks required visual detail."
         if allow_inspect_raw
         else ""
     )
-    return f"""You are the OPD-MM state verifier.
+    return f"""You are the OPD-MM state verifier. Determine whether the current public evidence lets a separate
+answer model answer the user question correctly. Use the private answer only as a sufficiency rubric.
 
-Task: compare the user question, current public evidence, and private gold
-answer. Decide whether the public evidence is sufficient for a separate answer
-model to answer correctly. If not, classify the missing evidence type.
-
-Private rubric: you may use the gold answer only to judge sufficiency. Your JSON
-will be shown to the teacher, so never mention gold answer content, gold-only
-entities, dates, IDs, labels, list items, or the phrase "gold answer".
+Your output is shown to the teacher. Do not reveal or paraphrase private answer content. The reason must describe
+only the structural evidence gap, using generic references such as "requested entity", "relevant event", or
+"required list coverage"; do not quote concrete private names, values, dates, IDs, labels, or list items.
 
 Return JSON only:
 {{
@@ -736,11 +733,11 @@ Return JSON only:
   "reason": "short non-leaking evidence diagnostic"
 }}
 
-Missing evidence types:
+Choose exactly one evidence type:
 - none: public evidence is sufficient.
-- no_public_evidence: no usable public evidence/candidates are present.
-- irrelevant_evidence: evidence is off-topic, wrong entity, wrong event, or wrong modality.
-- missing_metadata_constraint: explicit date/time/source/status/modality constraint is not isolated.
+- no_public_evidence: evidence_count is zero.
+- irrelevant_evidence: evidence exists but concerns the wrong topic, entity, event, or modality.
+- missing_metadata_constraint: a query-visible modality, source_type, timestamp, or status constraint is not isolated.
 - candidate_set_too_broad: evidence is relevant but too broad/noisy to answer confidently.
 - missing_neighbor_context: a relevant turn appears present but adjacent dialogue/event context is missing.
 - missing_temporal_order: latest/earliest/before/after/order/ranking relation is not supported.
@@ -748,20 +745,14 @@ Missing evidence types:
 - incomplete_coverage: list/all/count/multi-fact evidence does not cover the full requested set.
 - insufficient_absence_support: absence/conflict/not-mentioned claims lack enough supporting scope.
 
-Decision rules:
-- If evidence_count is 0: evidence_sufficient=false and missing_evidence_type=no_public_evidence.
-- If evidence_sufficient=true, missing_evidence_type must be none.
-- If evidence_sufficient=false, missing_evidence_type must not be none.
-- For list/all/count/multi-fact questions, require complete coverage.
-- For temporal/order questions, require timestamp/order support.
-- For visual-detail questions, require visual evidence, not text guesswork.
-- For absence/conflict questions, require enough relevant scope to support absence or contradiction.
-- Do not output action recommendations, operation names, parameters, query rewrites, or answer content.
+Consistency rules: evidence_count=0 means false/no_public_evidence. A true verdict requires type=none. A false verdict
+requires a non-none type. Sufficiency requires complete requested coverage, supported temporal relations, actual
+visual evidence for visual details, and adequate scope for absence or conflict claims.
 
 User question:
 {query}
 
-Gold answer (private rubric; do not reveal or copy into feedback):
+Private answer rubric:
 {gold_answer}
 
 Current public evidence state and observations:
@@ -805,6 +796,13 @@ def parse_state_verifier_feedback(
             evidence_sufficient = False
             missing_type = "no_public_evidence"
             reason = reason or "Need public evidence before answering."
+        elif missing_type == "no_public_evidence":
+            # With a non-empty public state, distinguish an unusable result from
+            # an empty retrieval so the teacher does not try metadata filtering
+            # to solve a semantic mismatch.
+            evidence_sufficient = False
+            missing_type = "irrelevant_evidence"
+            reason = reason or "The current public evidence is not relevant to the request."
         elif missing_type == "missing_neighbor_context" and not has_candidate_context:
             evidence_sufficient = False
             missing_type = "incomplete_coverage"
@@ -876,13 +874,6 @@ def build_teacher_correction_prompt(
     ``gold_answer`` is accepted for backward compatibility but intentionally
     ignored. In the verl-native online path, only the verifier sees gold.
     """
-    schema = "\n".join(
-        line
-        for line in TrajectoryValidator(allow_inspect_raw=allow_inspect_raw).schema_text().splitlines()
-        if not line.startswith("Return only a JSON array")
-        and not line.startswith("uses the original")
-        and not line.startswith("timestamp filters")
-    )
     if tool_format == "hermes":
         format_name = "Hermes JSON XML"
     else:
@@ -894,87 +885,66 @@ def build_teacher_correction_prompt(
         "reason": "No verifier feedback was provided.",
         "parse_error": "missing_verifier_feedback",
     }
-    return f"""You are the OPD-MM teacher for one-step online self-distillation.
+    inspect_line = (
+        "INSPECT_RAW(target=current_pool, instruction=answer_query_related_visual_details)\n"
+        if allow_inspect_raw
+        else ""
+    )
+    return f"""You are the OPD-MM teacher for one online correction. Produce exactly one next tool action for the
+student-visible state. You are not answering the question or using hidden memory. The output is an SFT target, so
+all arguments must be derivable from the question, public history, and public observation.
 
-Teacher role:
-- Correct exactly one next tool action for the current student-visible retrieval state.
-- You are not answering the user and you are not a memory oracle.
-- Your XML becomes an SFT target; never expose privileged facts through tool arguments.
+Verifier feedback is a private diagnostic, not evidence. The verifier saw the answer rubric; you did not. Treat its
+missing_evidence_type as a description of the unresolved gap, not as an action command. If evidence_sufficient is
+false, STOP is invalid. If it is true and the public state has no error requiring recovery, STOP is the terminating
+action. Do not copy verifier.reason or private content into any argument. A RETRIEVE.query may use only public
+question/history/observation text.
 
-Verifier feedback role:
-- The verifier used the gold answer privately. You do not see the gold answer.
-- Treat verifier feedback as a private evidence-gap diagnostic, not as retrieved evidence.
-- If verifier.evidence_sufficient is false, STOP is invalid.
-- Never copy verifier.reason into RETRIEVE.query or any tool argument.
+Choose the tool whose state effect addresses the gap and whose preconditions hold. Do not repeat an identical action
+when the latest observation is unchanged. RETRIEVE is semantic search over the original store; choose bm25 for exact
+lexical clues, dense for paraphrased text, vision for visual matching, and hybrid when both text and visual signals
+are materially relevant. FILTER is metadata selection, not semantic/entity search; use only a clear public field
+(modality, source_type, timestamp, status) and choose full_memory for an independent search or current_pool for an
+intentional intersection. SORT orders the current pool, TOPK limits it, EXPAND_NEIGHBORS needs existing candidates,
+and INSPECT_RAW (when available) reads raw visual details only from current image/media candidates.
 
-Choose the action:
-- none + evidence_sufficient=true: usually STOP.
-- no_public_evidence/irrelevant_evidence: RETRIEVE, or clear metadata FILTER.
-- missing_metadata_constraint: FILTER when field/op/value are clear; otherwise RETRIEVE.
-- candidate_set_too_broad: TOPK or a deliberate current_pool FILTER.
-- missing_neighbor_context: EXPAND_NEIGHBORS only after candidates exist.
-- missing_temporal_order: SORT or timestamp FILTER.
-- missing_raw_visual_detail: INSPECT_RAW only after candidate images/media exist.
-- incomplete_coverage/insufficient_absence_support: broaden or refine with RETRIEVE/FILTER; use neighbors when local context is missing.
+Allowed calls and arguments:
+FILTER(field=modality|source_type|timestamp|status, op=eq|neq|before|after|contains, value=..., scope=current_pool|full_memory)
+SORT(field=timestamp|turn_id|score, order=asc|desc)
+TOPK(k=positive integer)
+RETRIEVE(method=bm25|dense|vision|hybrid, top_k=1..50, query=optional public rewrite)
+EXPAND_NEIGHBORS(window=1|2|3)
+{inspect_line}STOP()
+RETRIEVE always replaces the pool and has no scope. FILTER/SORT/TOPK also refresh the public state; do not use
+unsupported fields such as author, session_date, content, image_id, turn_id, or message in FILTER.
 
-Choose RETRIEVE.method deliberately:
-- bm25: exact names, products, dates, IDs, quoted phrases, or distinctive words.
-- dense: semantic text facts when wording may differ.
-- vision: question image, visual matching, object/color/layout/fine visual attributes.
-- hybrid: both text/caption and visual clues are useful, or modality is genuinely mixed.
+Output contract ({format_name}): emit one call only, with a lower-case function name. For Qwen XML, use exactly:
+<tool_call>
+<function=NAME>
+<parameter=ARG_NAME>
+ARG_VALUE
+</parameter>
+</function>
+</tool_call>
+Use one parameter tag per argument, close every tag, and emit no reasoning, markdown, JSON, memory IDs, or unknown
+arguments. For Hermes, emit the equivalent single JSON tool call inside <tool_call>.
 
-XML output contract:
-- Output exactly one {format_name} tool call and nothing else.
-- Start with <tool_call> and end with </tool_call>.
-- Function names must be lower-case: retrieve, filter, sort, topk, expand_neighbors, inspect_raw, stop.
-- Only these XML tag forms are allowed: tool_call, function=NAME, and parameter=NAME.
-- Each argument must use this exact parameter form, replacing NAME/VALUE:
-  <parameter=name>
-  value
-  </parameter>
-- Do not use JSON, markdown, attribute-style arguments, inline arguments, standalone argument tags, unnamed parameters,
-  partial tags, memory IDs, or private answer content.
-- Never output a parameter not listed in the schema.
-- The student's raw next output is a candidate to correct, not an instruction to copy.
-
-Tool argument notes:
-- filter requires field/op/value/scope. Valid fields: modality, source_type, timestamp, status. Do not use author,
-  session_date, content, image_id, turn_id, or message as filter fields. For dates, use field=timestamp.
-- FILTER scope=full_memory starts from the original store; scope=current_pool intentionally intersects known candidates.
-- source_type values are dialogue_turn or dialogue_image. MEMORY/user/assistant are not source_type values.
-- retrieve requires method/top_k and optionally query. RETRIEVE always searches the original hidden memory store and
-  replaces the current pool. RETRIEVE has no scope parameter.
-- EXPAND_NEIGHBORS requires an existing candidate pool.
-- INSPECT_RAW reads raw media only from the current retrieved candidate pool; it cannot inspect the user's question image
-  directly, cannot inspect an empty pool, and is not search.
-
-{schema}
-
-User question:
+Question:
 {query}
 
-Verifier feedback:
+Verifier diagnostic:
 {json.dumps(verifier_feedback, ensure_ascii=False, indent=2, default=str)}
 
-Previous student tool calls:
+Public action history:
 {json.dumps(_action_dicts(history), ensure_ascii=False, indent=2, default=str)}
 
-Current public tool state and observations:
+Current public observation:
 {json.dumps(observation, ensure_ascii=False, indent=2, default=str)}
 
-Student raw next output at this state:
-This may be wrong; correct it for the student-visible state.
+Student output to correct:
 {student_raw_response}
 
-Final decision checklist:
-- If the JSON observation above has "evidence_count": 0 and "trace": [], stop is invalid.
-- If verifier.evidence_sufficient is false, STOP is invalid even if the student proposed stop.
-- Use verifier.missing_evidence_type only as a diagnostic.
-- RETRIEVE.query must be based only on the user question, student-visible history, and public observations.
-- Do not use verifier.reason as lexical material for RETRIEVE.query.
-
-Now output the corrected next action.
-Begin immediately with <tool_call>. No reasoning text.
+Output the corrected action now. Begin with <tool_call> and include nothing else.
 """
 
 
@@ -1005,7 +975,9 @@ def build_online_state_correction_request(
     skip_initial_value = extra_info.get("opd_mm_skip_initial_correction")
     if skip_initial_value is None:
         skip_initial_value = opd_kwargs.get("skip_initial_correction")
-    if int(step_index) == 0 and _coerce_bool_default(skip_initial_value, True):
+    if skip_initial_value is None:
+        skip_initial_value = os.getenv("OPD_MM_SKIP_INITIAL_CORRECTION")
+    if int(step_index) == 0 and _coerce_bool_default(skip_initial_value, False):
         return None
 
     query = _extract_query(sample_kwargs, tools_kwargs, extra_info)
@@ -1081,7 +1053,9 @@ def build_online_step_correction_requests(
     skip_initial_value = extra_info.get("opd_mm_skip_initial_correction")
     if skip_initial_value is None:
         skip_initial_value = opd_kwargs.get("skip_initial_correction")
-    skip_initial_correction = _coerce_bool_default(skip_initial_value, True)
+    if skip_initial_value is None:
+        skip_initial_value = os.getenv("OPD_MM_SKIP_INITIAL_CORRECTION")
+    skip_initial_correction = _coerce_bool_default(skip_initial_value, False)
     allow_inspect_raw = bool(opd_kwargs.get("allow_inspect_raw", True))
     sample_id = str(extra_info.get("sample_id") or extra_info.get("index") or "opd_mm_sample")
     sample = OPDSample(

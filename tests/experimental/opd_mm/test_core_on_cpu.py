@@ -1582,7 +1582,7 @@ def test_live_online_state_request_uses_current_state_without_snapshot_replay() 
     assert "SECRET_GOLD_ANSWER" in request["verifier_prompt"]
 
 
-def test_live_online_state_request_skips_initial_state_by_default() -> None:
+def test_live_online_state_request_includes_initial_state_by_default() -> None:
     request = build_online_state_correction_request(
         sample_kwargs={
             "raw_prompt": [{"role": "user", "content": "Find the relevant memory."}],
@@ -1590,10 +1590,36 @@ def test_live_online_state_request_skips_initial_state_by_default() -> None:
             "extra_info": {
                 "gold_answer": "SECRET_GOLD_ANSWER",
                 "opd_mm_online_self_distill": True,
-                "sample_id": "skip-stage0-sample",
+            "sample_id": "stage0-sample",
             },
         },
         request_id="request-stage0",
+        step_index=0,
+        student_prompt_ids=[11, 22, 33],
+        student_raw_response="<tool_call><function=retrieve></function></tool_call>",
+        student_next_action=ToolAction("RETRIEVE", {"method": "hybrid", "top_k": 5}),
+        history=[],
+        observation={"pool_count": 0, "evidence_count": 0, "trace": []},
+    )
+
+    assert request is not None
+    assert request["step_index"] == 0
+    assert request["observation"]["evidence_count"] == 0
+
+
+def test_live_online_state_request_can_skip_initial_state_explicitly() -> None:
+    request = build_online_state_correction_request(
+        sample_kwargs={
+            "raw_prompt": [{"role": "user", "content": "Find the relevant memory."}],
+            "tools_kwargs": {"opd_mm": {"query": "Find the relevant memory."}},
+            "extra_info": {
+                "gold_answer": "SECRET_GOLD_ANSWER",
+                "opd_mm_online_self_distill": True,
+                "opd_mm_skip_initial_correction": True,
+                "sample_id": "skip-stage0-sample",
+            },
+        },
+        request_id="request-stage0-skip",
         step_index=0,
         student_prompt_ids=[11, 22, 33],
         student_raw_response="<tool_call><function=retrieve></function></tool_call>",
@@ -1767,7 +1793,7 @@ def test_online_xml_correction_requests_include_invalid_student_state() -> None:
     assert requests[0]["student_next_action"] is None
     assert "teacher_prompt" not in requests[0]
     assert "You are the OPD-MM state verifier" in requests[0]["verifier_prompt"]
-    assert "Private rubric:" in requests[0]["verifier_prompt"]
+    assert "Private answer rubric:" in requests[0]["verifier_prompt"]
     assert "Current public evidence state and observations" in requests[0]["verifier_prompt"]
     assert "Tool semantics to consider" not in requests[0]["verifier_prompt"]
     assert "retrieve(method=bm25|dense|vision|hybrid" not in requests[0]["verifier_prompt"]
@@ -1793,22 +1819,19 @@ def test_online_xml_correction_requests_include_invalid_student_state() -> None:
         allow_inspect_raw=requests[0]["allow_inspect_raw"],
         tool_format=requests[0]["tool_format"],
     )
-    assert "Teacher role:" in requests[0]["teacher_prompt"]
-    assert "Correct exactly one next tool action" in requests[0]["teacher_prompt"]
-    assert "Verifier feedback role:" in requests[0]["teacher_prompt"]
-    assert "The verifier used the gold answer privately. You do not see the gold answer." in requests[0]["teacher_prompt"]
+    assert "Produce exactly one next tool action" in requests[0]["teacher_prompt"]
+    assert "Verifier feedback is a private diagnostic, not evidence" in requests[0]["teacher_prompt"]
+    assert "The verifier saw the answer rubric; you did not." in requests[0]["teacher_prompt"]
     assert "Gold answer:" not in requests[0]["teacher_prompt"]
     assert "SECRET_GOLD_ANSWER" not in requests[0]["teacher_prompt"]
-    assert "Never copy verifier.reason into RETRIEVE.query" in requests[0]["teacher_prompt"]
-    assert "not an instruction to copy" in requests[0]["teacher_prompt"]
-    assert 'If the JSON observation above has "evidence_count": 0 and "trace": [], stop is invalid' in requests[
-        0
-    ]["teacher_prompt"]
-    assert "If verifier.evidence_sufficient is false, STOP is invalid" in requests[0]["teacher_prompt"]
-    assert "Do not use verifier.reason as lexical material for RETRIEVE.query" in requests[0]["teacher_prompt"]
-    assert "scope=full_memory" in requests[0]["teacher_prompt"]
-    assert "optionally query" in requests[0]["teacher_prompt"]
-    assert "RETRIEVE has no scope parameter" in requests[0]["teacher_prompt"]
+    assert "Do not copy verifier.reason" in requests[0]["teacher_prompt"]
+    assert "evidence_sufficient is" in requests[0]["teacher_prompt"]
+    assert "false, STOP is invalid" in requests[0]["teacher_prompt"]
+    assert "FILTER is metadata selection, not semantic/entity search" in requests[0]["teacher_prompt"]
+    assert "Do not repeat an identical action" in requests[0]["teacher_prompt"]
+    assert "scope=current_pool|full_memory" in requests[0]["teacher_prompt"]
+    assert "query=optional public rewrite" in requests[0]["teacher_prompt"]
+    assert "RETRIEVE always replaces the pool and has no scope" in requests[0]["teacher_prompt"]
     assert "EXPAND_NEIGHBORS(window=1|2|3)" in requests[0]["teacher_prompt"]
 
     correction = finalize_online_step_correction(
@@ -1862,6 +1885,18 @@ def test_state_verifier_feedback_sanitizes_gold_answer_leakage() -> None:
     assert "Miso" not in feedback["reason"]
     assert "gold answer" not in feedback["reason"].lower()
     assert feedback["reason"] == "Current public evidence is insufficient; collect relevant evidence first."
+
+
+def test_state_verifier_feedback_distinguishes_nonempty_irrelevant_evidence() -> None:
+    feedback = parse_state_verifier_feedback(
+        '{"evidence_sufficient": false, "reason": "No usable evidence for the requested event.", '
+        '"missing_evidence_type": "no_public_evidence"}',
+        {"evidence_count": 3, "pool_count": 3},
+    )
+
+    assert feedback["evidence_sufficient"] is False
+    assert feedback["missing_evidence_type"] == "irrelevant_evidence"
+    assert feedback["parse_error"] == ""
 
 
 def test_state_verifier_feedback_parser_falls_back_on_invalid_missing_evidence_type() -> None:
