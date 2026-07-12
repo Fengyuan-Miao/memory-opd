@@ -873,6 +873,7 @@ class AgentLoopWorker:
             finalize_online_step_correction,
             parse_state_verifier_feedback,
         )
+        from verl.experimental.opd_mm.tools import openai_tool_schemas
 
         request = build_online_state_correction_request(
             sample_kwargs=sample_kwargs,
@@ -945,7 +946,10 @@ class AgentLoopWorker:
             allow_inspect_raw=bool(request.get("allow_inspect_raw", True)),
             tool_format=str(request.get("tool_format") or self.rollout_config.multi_turn.format),
         )
-        teacher_prompt_ids = self._encode_opd_mm_teacher_prompt(request["teacher_prompt"])
+        teacher_tool_schemas = openai_tool_schemas(include_inspect_raw=bool(request.get("allow_inspect_raw", True)))
+        teacher_prompt_ids = self._encode_opd_mm_teacher_prompt(
+            request["teacher_prompt"], tools=teacher_tool_schemas
+        )
         teacher_response_ids = await self.teacher_server_manager.generate_teacher_response_single(
             prompt_ids=teacher_prompt_ids,
             sampling_params=teacher_sampling_params,
@@ -1287,7 +1291,7 @@ class AgentLoopWorker:
                 final_output.extra_fields["reward_extra_info"] = result["reward_extra_info"]
             final_output.metrics.compute_score = timing["compute_score"]
 
-    def _encode_opd_mm_teacher_prompt(self, prompt: str) -> list[int]:
+    def _encode_opd_mm_teacher_prompt(self, prompt: str, *, tools: Optional[list[dict[str, Any]]] = None) -> list[int]:
         messages = [
             {"role": "system", "content": "You are a precise OPD-MM teacher."},
             {"role": "user", "content": prompt},
@@ -1295,6 +1299,7 @@ class AgentLoopWorker:
         try:
             tokenized = self.tokenizer.apply_chat_template(
                 messages,
+                tools=tools,
                 add_generation_prompt=True,
                 tokenize=True,
                 enable_thinking=False,
@@ -1303,6 +1308,7 @@ class AgentLoopWorker:
         except TypeError:
             tokenized = self.tokenizer.apply_chat_template(
                 messages,
+                tools=tools,
                 add_generation_prompt=True,
                 tokenize=True,
             )

@@ -8,7 +8,7 @@ RUN_TIMESTAMP=${RUN_TIMESTAMP:-$(date +%Y%m%d_%H%M%S)}
 STUDENT_MODEL=${STUDENT_MODEL:-/home/guojr/data/pretrained_models/Qwen/Qwen3.5-4B}
 # Frozen-teacher OPD-MM path. The same teacher vLLM service is also used by the
 # verifier and INSPECT_RAW when OPD_MM_RAW_INSPECTOR_BACKEND=teacher.
-TEACHER_MODEL=${TEACHER_MODEL:-/home/guojr/data/pretrained_models/Qwen/Qwen3.5-4B}
+TEACHER_MODEL=${TEACHER_MODEL:-/home/guojr/data/pretrained_models/Qwen/Qwen3.5-9B}
 
 OPD_MM_TRAIN_FILES=${OPD_MM_TRAIN_FILES:-"['/home/miaofy/memory-opd/dataset/mem_gallery/opd_mm_store/subsets/balanced_train_cap2/train.parquet']"}
 OPD_MM_VAL_FILES=${OPD_MM_VAL_FILES:-$OPD_MM_TRAIN_FILES}
@@ -46,7 +46,7 @@ save_freq=${SAVE_FREQ:-50}
 test_freq=${TEST_FREQ:--1}
 
 project_name=${PROJECT_NAME:-verl_distill_opd_mm}
-experiment_name=${EXPERIMENT_NAME:-opd_mm_qwen35_4b_teacher4b_verifierfeedback_sanitized_${RUN_TIMESTAMP}}
+experiment_name=${EXPERIMENT_NAME:-opd_mm_qwen35_4b_teacher9b_verifierfeedback_sanitized_${RUN_TIMESTAMP}}
 
 LOG_DIR=${LOG_DIR:-logs}
 TRAIN_LOG_PATH=${TRAIN_LOG_PATH:-${LOG_DIR}/${experiment_name}.log}

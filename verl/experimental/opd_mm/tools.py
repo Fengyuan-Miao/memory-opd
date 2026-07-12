@@ -804,7 +804,7 @@ class OPDFilterTool(OPDBaseTool):
 
 class OPDSortTool(OPDBaseTool):
     tool_name = "sort"
-    description = "Sort the current hidden memory pool."
+    description = "Sort the current candidate pool when timestamp, recency, score, or turn order matters."
     properties = {
         "field": _property("string", "The field to sort by.", sorted(SORT_FIELDS)),
         "order": _property("string", "Sort order.", sorted(SORT_ORDERS)),
@@ -814,8 +814,8 @@ class OPDSortTool(OPDBaseTool):
 
 class OPDTopKTool(OPDBaseTool):
     tool_name = "topk"
-    description = "Keep the top k turns from the current hidden memory pool."
-    properties = {"k": _property("integer", "Positive number of turns to keep.")}
+    description = "Keep the strongest k turns from the current candidate pool after retrieval, filtering, or sorting."
+    properties = {"k": _property("integer", "Positive number of candidate turns to keep.")}
     required = ["k"]
 
 
@@ -826,14 +826,24 @@ class OPDRetrieveTool(OPDBaseTool):
         "Always searches the original hidden memory store and replaces the working pool."
     )
     properties = {
-        "method": _property("string", "Retrieval method.", sorted(RETRIEVAL_METHODS)),
-        "top_k": _property("integer", "Positive number of turns to retrieve."),
+        "method": _property(
+            "string",
+            "Retrieval route: bm25 for exact names, IDs, dates, or phrases; dense for paraphrased semantic text; "
+            "vision for image matching or visual attributes; hybrid when text/caption and visual signals are both "
+            "materially relevant.",
+            sorted(RETRIEVAL_METHODS),
+        ),
+        "top_k": _property(
+            "integer",
+            "Positive number of turns to retrieve (1-50); use larger values for broad coverage and smaller values "
+            "for a focused candidate set.",
+        ),
         "query": _property(
             "string",
             "Optional rewritten search text for this retrieval step. Omit to use the original user query.",
         ),
     }
-    required: list[str] = []
+    required = ["method", "top_k"]
 
 
 class OPDExpandNeighborsTool(OPDBaseTool):
@@ -863,7 +873,7 @@ class OPDInspectRawTool(OPDBaseTool):
         "target": _property("string", "Inspection target.", sorted(INSPECT_TARGETS)),
         "instruction": _property("string", "Inspection instruction.", sorted(INSPECT_INSTRUCTIONS)),
     }
-    required: list[str] = []
+    required = ["target", "instruction"]
 
     async def execute(self, instance_id: str, parameters: dict[str, Any], **kwargs) -> tuple[ToolResponse, float, dict]:
         agent_data = kwargs.get("agent_data")

@@ -1642,6 +1642,11 @@ async def test_agent_loop_worker_generates_verifier_and_teacher_for_one_live_sta
             return [101] if len(self.calls) == 1 else [202]
 
     teacher_server = FakeTeacherServer()
+    encoded_tools: list[Any] = []
+
+    def encode_teacher_prompt(prompt: str, **kwargs: Any) -> list[int]:
+        encoded_tools.append(kwargs.get("tools"))
+        return [len(prompt)]
 
     def decode(token_ids: list[int], skip_special_tokens: bool = False) -> str:
         del skip_special_tokens
@@ -1666,7 +1671,7 @@ async def test_agent_loop_worker_generates_verifier_and_teacher_for_one_live_sta
         teacher_server_manager=teacher_server,
         tokenizer=SimpleNamespace(decode=decode),
         rollout_config=SimpleNamespace(multi_turn=SimpleNamespace(format="qwen3_coder")),
-        _encode_opd_mm_teacher_prompt=lambda prompt: [len(prompt)],
+        _encode_opd_mm_teacher_prompt=encode_teacher_prompt,
     )
     correction = await AgentLoopWorker._generate_opd_mm_online_state_correction(
         worker,
@@ -1701,6 +1706,17 @@ async def test_agent_loop_worker_generates_verifier_and_teacher_for_one_live_sta
 
     assert correction is not None
     assert len(teacher_server.calls) == 2
+    assert encoded_tools[0] is None
+    teacher_tools = encoded_tools[1]
+    assert [tool["function"]["name"] for tool in teacher_tools] == [
+        "filter",
+        "sort",
+        "topk",
+        "retrieve",
+        "expand_neighbors",
+        "inspect_raw",
+        "stop",
+    ]
     assert correction["step_index"] == 1
     assert correction["sft_prompt_ids"] == [7, 8, 9]
     assert correction["teacher_actions"] == [{"tool": "EXPAND_NEIGHBORS", "window": 1}]
@@ -1824,15 +1840,18 @@ def test_online_xml_correction_requests_include_invalid_student_state() -> None:
     assert "The verifier saw the answer rubric; you did not." in requests[0]["teacher_prompt"]
     assert "Gold answer:" not in requests[0]["teacher_prompt"]
     assert "SECRET_GOLD_ANSWER" not in requests[0]["teacher_prompt"]
-    assert "Do not copy verifier.reason" in requests[0]["teacher_prompt"]
-    assert "evidence_sufficient is" in requests[0]["teacher_prompt"]
-    assert "false, STOP is invalid" in requests[0]["teacher_prompt"]
-    assert "FILTER is metadata selection, not semantic/entity search" in requests[0]["teacher_prompt"]
-    assert "Do not repeat an identical action" in requests[0]["teacher_prompt"]
-    assert "scope=current_pool|full_memory" in requests[0]["teacher_prompt"]
-    assert "query=optional public rewrite" in requests[0]["teacher_prompt"]
-    assert "RETRIEVE always replaces the pool and has no scope" in requests[0]["teacher_prompt"]
-    assert "EXPAND_NEIGHBORS(window=1|2|3)" in requests[0]["teacher_prompt"]
+    assert "Do not copy" in requests[0]["teacher_prompt"]
+    assert "verifier.reason" in requests[0]["teacher_prompt"]
+    assert "Use evidence_sufficient as" in requests[0]["teacher_prompt"]
+    assert "when false, choose a non-STOP tool" in requests[0]["teacher_prompt"]
+    assert "when true and the observation has no" in requests[0]["teacher_prompt"]
+    assert "For STOP, emit exactly" not in requests[0]["teacher_prompt"]
+    assert "schema-described tool" in requests[0]["teacher_prompt"]
+    assert "Do not repeat an" in requests[0]["teacher_prompt"]
+    assert "identical action" in requests[0]["teacher_prompt"]
+    assert "Allowed calls and arguments:" not in requests[0]["teacher_prompt"]
+    assert "Output contract" not in requests[0]["teacher_prompt"]
+    assert "chat template supplies the tool descriptions" in requests[0]["teacher_prompt"]
 
     correction = finalize_online_step_correction(
         requests[0],
@@ -2090,4 +2109,7 @@ def test_helpers_build_hidden_store_from_dicts_and_schemas() -> None:
     filter_scope = schemas[0]["function"]["parameters"]["properties"]["scope"]
     assert filter_scope["enum"] == ["current_pool", "full_memory"]
     assert "scope" in schemas[0]["function"]["parameters"]["required"]
+    assert schemas[3]["function"]["parameters"]["required"] == ["method", "top_k"]
+    inspect_schema = openai_tool_schemas(include_inspect_raw=True)[5]
+    assert inspect_schema["function"]["parameters"]["required"] == ["target", "instruction"]
     assert "scope" not in schemas[3]["function"]["parameters"]["properties"]

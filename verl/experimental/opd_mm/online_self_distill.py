@@ -874,10 +874,6 @@ def build_teacher_correction_prompt(
     ``gold_answer`` is accepted for backward compatibility but intentionally
     ignored. In the verl-native online path, only the verifier sees gold.
     """
-    if tool_format == "hermes":
-        format_name = "Hermes JSON XML"
-    else:
-        format_name = "Qwen function XML"
     _ = privileged_context
     verifier_feedback = verifier_feedback or {
         "evidence_sufficient": False,
@@ -885,49 +881,19 @@ def build_teacher_correction_prompt(
         "reason": "No verifier feedback was provided.",
         "parse_error": "missing_verifier_feedback",
     }
-    inspect_line = (
-        "INSPECT_RAW(target=current_pool, instruction=answer_query_related_visual_details)\n"
-        if allow_inspect_raw
-        else ""
-    )
     return f"""You are the OPD-MM teacher for one online correction. Produce exactly one next tool action for the
 student-visible state. You are not answering the question or using hidden memory. The output is an SFT target, so
 all arguments must be derivable from the question, public history, and public observation.
 
 Verifier feedback is a private diagnostic, not evidence. The verifier saw the answer rubric; you did not. Treat its
-missing_evidence_type as a description of the unresolved gap, not as an action command. If evidence_sufficient is
-false, STOP is invalid. If it is true and the public state has no error requiring recovery, STOP is the terminating
-action. Do not copy verifier.reason or private content into any argument. A RETRIEVE.query may use only public
-question/history/observation text.
+missing_evidence_type as a description of the unresolved gap, not as an action command. Use evidence_sufficient as
+the termination gate: when false, choose a non-STOP tool that addresses the gap; when true and the observation has no
+error, choose STOP without an additional confirmation action. Do not copy verifier.reason or private content into any
+argument. A RETRIEVE.query may use only public question/history/observation text.
 
-Choose the tool whose state effect addresses the gap and whose preconditions hold. Do not repeat an identical action
-when the latest observation is unchanged. RETRIEVE is semantic search over the original store; choose bm25 for exact
-lexical clues, dense for paraphrased text, vision for visual matching, and hybrid when both text and visual signals
-are materially relevant. FILTER is metadata selection, not semantic/entity search; use only a clear public field
-(modality, source_type, timestamp, status) and choose full_memory for an independent search or current_pool for an
-intentional intersection. SORT orders the current pool, TOPK limits it, EXPAND_NEIGHBORS needs existing candidates,
-and INSPECT_RAW (when available) reads raw visual details only from current image/media candidates.
-
-Allowed calls and arguments:
-FILTER(field=modality|source_type|timestamp|status, op=eq|neq|before|after|contains, value=..., scope=current_pool|full_memory)
-SORT(field=timestamp|turn_id|score, order=asc|desc)
-TOPK(k=positive integer)
-RETRIEVE(method=bm25|dense|vision|hybrid, top_k=1..50, query=optional public rewrite)
-EXPAND_NEIGHBORS(window=1|2|3)
-{inspect_line}STOP()
-RETRIEVE always replaces the pool and has no scope. FILTER/SORT/TOPK also refresh the public state; do not use
-unsupported fields such as author, session_date, content, image_id, turn_id, or message in FILTER.
-
-Output contract ({format_name}): emit one call only, with a lower-case function name. For Qwen XML, use exactly:
-<tool_call>
-<function=NAME>
-<parameter=ARG_NAME>
-ARG_VALUE
-</parameter>
-</function>
-</tool_call>
-Use one parameter tag per argument, close every tag, and emit no reasoning, markdown, JSON, memory IDs, or unknown
-arguments. For Hermes, emit the equivalent single JSON tool call inside <tool_call>.
+Choose the schema-described tool whose effect addresses the gap and whose preconditions hold. Do not repeat an
+identical action when the latest observation is unchanged. Emit exactly one function call with no reasoning,
+markdown, JSON, memory IDs, or unknown arguments. The chat template supplies the tool descriptions and serialization.
 
 Question:
 {query}
