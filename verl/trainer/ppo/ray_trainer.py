@@ -1295,6 +1295,26 @@ class RayPPOTrainer:
         if opd_mm_sft_batch is not None:
             batch = opd_mm_sft_batch
             opd_mm_sft_examples = len(batch)
+        opd_mm_grpo_states = 0
+        if not opd_mm_sft_examples and not is_distillation_enabled(self.config.get("distillation")):
+            state_column_present = "opd_mm_policy_states" in batch.non_tensor_batch
+            opd_mm_grpo_batch = self._build_opd_mm_grpo_state_batch(batch)
+            if opd_mm_grpo_batch is not None:
+                batch = opd_mm_grpo_batch
+                opd_mm_grpo_states = len(batch)
+            elif state_column_present:
+                has_policy_states = False
+                for value in batch.non_tensor_batch["opd_mm_policy_states"]:
+                    value = value.item() if hasattr(value, "item") else value
+                    if isinstance(value, np.ndarray):
+                        value = value.tolist()
+                    if isinstance(value, list) and value:
+                        has_policy_states = True
+                        break
+                if has_policy_states:
+                    raise RuntimeError(
+                        "OPD-MM GRPO rollout states were present but none had aligned rollout log-probabilities"
+                    )
         rollout_config = self.config.actor_rollout_ref.rollout
         batch.meta_info["multi_turn"] = rollout_config.multi_turn.enable
         # TODO: Make "temperature" single source of truth from generation.
@@ -1352,11 +1372,155 @@ class RayPPOTrainer:
         actor_output = rename_dict(actor_output, "actor/")
         if opd_mm_sft_examples:
             actor_output["actor/opd_mm_sft_examples"] = opd_mm_sft_examples
+        if opd_mm_grpo_states:
+            actor_output["actor/opd_mm_grpo_states"] = opd_mm_grpo_states
         # modify key name
         actor_output["perf/mfu/actor"] = actor_output.pop("actor/mfu")
         actor_output = DataProto.from_single_dict(data={}, meta_info={"metrics": actor_output})
 
         return actor_output
+
+    def _build_opd_mm_grpo_state_batch(self, batch: DataProto) -> Optional[DataProto]:
+        """Expand refreshed OPD-MM state/action pairs with their trajectory advantage.
+
+        OPD-MM replaces the observation prompt after every tool action to keep the
+        context bounded.  Those disjoint prompts cannot be represented by one
+        autoregressive trajectory tensor, so policy updates operate on the exact
+        prompt and sampled action from each visited state.  Every state inherits
+        the already normalized terminal GRPO advantage of its source trajectory.
+        """
+        states_column = batch.non_tensor_batch.get("opd_mm_policy_states")
+        if states_column is None or "advantages" not in batch.batch:
+            return None
+
+        prompt_width = int(self.config.actor_rollout_ref.rollout.prompt_length)
+        response_width = int(self.config.actor_rollout_ref.rollout.response_length)
+        pad_id = self.tokenizer.pad_token_id if self.tokenizer.pad_token_id is not None else 0
+        response_mask = batch.batch.get("response_mask")
+        original_uids = batch.non_tensor_batch.get("uid")
+
+        rows: list[tuple[list[int], list[int], list[float], float, str, dict[str, Any]]] = []
+        for sample_index, sample_states in enumerate(states_column):
+            sample_states = sample_states.item() if hasattr(sample_states, "item") else sample_states
+            if isinstance(sample_states, np.ndarray):
+                sample_states = sample_states.tolist()
+            if not isinstance(sample_states, list) or not sample_states:
+                continue
+
+            valid_advantages = batch.batch["advantages"][sample_index]
+            if response_mask is not None:
+                valid_advantages = valid_advantages[response_mask[sample_index].bool()]
+            if valid_advantages.numel() == 0:
+                continue
+            trajectory_advantage = float(valid_advantages.float().mean().item())
+            uid = str(original_uids[sample_index]) if original_uids is not None else str(uuid.uuid4())
+
+            for state in sample_states:
+                if not isinstance(state, dict):
+                    continue
+                prompt_ids = state.get("prompt_ids") or []
+                sampled_ids = state.get("response_ids") or []
+                rollout_logprobs = state.get("response_logprobs") or []
+                if hasattr(prompt_ids, "tolist"):
+                    prompt_ids = prompt_ids.tolist()
+                if hasattr(sampled_ids, "tolist"):
+                    sampled_ids = sampled_ids.tolist()
+                if hasattr(rollout_logprobs, "tolist"):
+                    rollout_logprobs = rollout_logprobs.tolist()
+                if not isinstance(prompt_ids, list) or not isinstance(sampled_ids, list):
+                    raise RuntimeError("OPD-MM GRPO state has non-list prompt or response token IDs")
+                if not isinstance(rollout_logprobs, list) or len(rollout_logprobs) != len(sampled_ids):
+                    raise RuntimeError(
+                        "OPD-MM GRPO state response tokens and rollout log-probabilities are not aligned"
+                    )
+                if not prompt_ids or not sampled_ids or len(sampled_ids) > response_width:
+                    raise RuntimeError("OPD-MM GRPO state has an empty or overlong prompt/response")
+                rows.append(
+                    (
+                        [int(token) for token in prompt_ids],
+                        [int(token) for token in sampled_ids],
+                        [float(value) for value in rollout_logprobs],
+                        trajectory_advantage,
+                        uid,
+                        state,
+                    )
+                )
+
+        if not rows:
+            return None
+
+        default_mini_batch_size = (
+            int(self.config.actor_rollout_ref.actor.ppo_mini_batch_size)
+            * int(self.config.actor_rollout_ref.rollout.n)
+        )
+        dp_size = self._get_dp_size(self.actor_rollout_wg, "actor")
+        multiple = max(dp_size, default_mini_batch_size)
+        if multiple % dp_size != 0:
+            multiple = max(dp_size, (multiple // dp_size) * dp_size)
+        target_size = max(multiple, math.ceil(len(rows) / multiple) * multiple)
+        if len(rows) < target_size:
+            rows = (rows * math.ceil(target_size / len(rows)))[:target_size]
+
+        prompts = []
+        responses = []
+        response_masks = []
+        input_ids = []
+        attention_masks = []
+        position_ids = []
+        old_log_probs = []
+        advantages = []
+        for prompt_ids, sampled_ids, rollout_logprobs, advantage, _, _ in rows:
+            prompt_ids = prompt_ids[-prompt_width:]
+            left_pad = prompt_width - len(prompt_ids)
+            padded_prompt = [pad_id] * left_pad + prompt_ids
+            prompt_attention = [0] * left_pad + [1] * len(prompt_ids)
+
+            right_pad = response_width - len(sampled_ids)
+            padded_response = sampled_ids + [pad_id] * right_pad
+            sampled_mask = [1] * len(sampled_ids) + [0] * right_pad
+            sample_attention = prompt_attention + sampled_mask
+            sample_position_ids = [0] * len(sample_attention)
+            position = 0
+            for token_index, is_valid in enumerate(sample_attention):
+                if is_valid:
+                    sample_position_ids[token_index] = position
+                    position += 1
+
+            prompts.append(padded_prompt)
+            responses.append(padded_response)
+            response_masks.append(sampled_mask)
+            input_ids.append(padded_prompt + padded_response)
+            attention_masks.append(sample_attention)
+            position_ids.append(sample_position_ids)
+            old_log_probs.append(rollout_logprobs + [0.0] * right_pad)
+            advantages.append([advantage] * len(sampled_ids) + [0.0] * right_pad)
+
+        tensor_batch = TensorDict(
+            {
+                "prompts": torch.tensor(prompts, dtype=torch.long),
+                "responses": torch.tensor(responses, dtype=torch.long),
+                "response_mask": torch.tensor(response_masks, dtype=torch.long),
+                "input_ids": torch.tensor(input_ids, dtype=torch.long),
+                "attention_mask": torch.tensor(attention_masks, dtype=torch.long),
+                "position_ids": torch.tensor(position_ids, dtype=torch.long),
+                "old_log_probs": torch.tensor(old_log_probs, dtype=torch.float32),
+                "rollout_log_probs": torch.tensor(old_log_probs, dtype=torch.float32),
+                "advantages": torch.tensor(advantages, dtype=torch.float32),
+            },
+            batch_size=len(rows),
+        )
+        non_tensor_batch = {
+            "uid": np.array([row[4] for row in rows], dtype=object),
+            "data_source": np.array(["opd_mm"] * len(rows), dtype=object),
+            "multi_modal_inputs": np.array([{} for _ in rows], dtype=object),
+            "opd_mm_grpo_state_batch": np.array([True for _ in rows], dtype=object),
+            "opd_mm_policy_state": np.array([row[5] for row in rows], dtype=object),
+        }
+        return DataProto(
+            batch=tensor_batch,
+            non_tensor_batch=non_tensor_batch,
+            meta_info=dict(batch.meta_info),
+        )
 
     def _opd_mm_sft_mini_batch_size(self, *, batch_size: int, default_mini_batch_size: int) -> int:
         dp_size = self._get_dp_size(self.actor_rollout_wg, "actor")

@@ -119,7 +119,7 @@ def _cached_remote_raw_inspector(
 def _raw_inspector_from_runtime(runtime: dict[str, Any]) -> Any:
     if runtime.get("raw_inspector") is not None:
         return runtime["raw_inspector"]
-    backend = _optional_str(runtime.get("raw_inspector_backend") or os.getenv("OPD_MM_RAW_INSPECTOR_BACKEND"))
+    backend = _optional_str(os.getenv("OPD_MM_RAW_INSPECTOR_BACKEND") or runtime.get("raw_inspector_backend"))
     if backend.lower() == "teacher":
         return None
     if not bool(runtime.get("allow_inspect_raw", True)):
@@ -459,6 +459,7 @@ class OPDToolSession:
     stopped: bool = False
     error: str = ""
     pool_has_candidates: bool = False
+    max_actions_reached: bool = False
 
     def __post_init__(self) -> None:
         if not self.pool:
@@ -475,6 +476,7 @@ class OPDToolSession:
 
         try:
             if len(self.trace) >= self.executor.validator.max_actions - 1 and action.tool != "STOP":
+                self.max_actions_reached = True
                 action = ToolAction("STOP")
             self.executor.validator._validate_action(action, len(self.trace))
             if action.tool == "FILTER":
@@ -574,6 +576,7 @@ class OPDToolSession:
             return self._observation(action, [], "trajectory already stopped")
 
         if len(self.trace) >= self.executor.validator.max_actions - 1 and action.tool != "STOP":
+            self.max_actions_reached = True
             action = ToolAction("STOP")
             self.stopped = True
             self.trace.append(action)
@@ -668,6 +671,7 @@ class OPDToolSession:
     def public_state(self) -> dict[str, Any]:
         """Return serializable public state for AgentLoopOutput.extra_fields."""
         return {
+            "query": self.query,
             "pool_count": len(self.pool),
             "evidence_count": len(self.evidence),
             "pool_preview": _sanitize_pool_preview(self.pool),
@@ -676,6 +680,7 @@ class OPDToolSession:
             "stopped": self.stopped,
             "error": self.error,
             "raw_inspection_calls": self.raw_calls,
+            "max_actions_reached": self.max_actions_reached,
         }
 
 

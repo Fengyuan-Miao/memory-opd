@@ -61,10 +61,12 @@ from verl.experimental.opd_mm.tools import (
     OPDInspectRawTool,
     OPDRetrieveTool,
     OPDStopTool,
+    OPDTopKTool,
     hidden_store_from_records,
     openai_tool_schemas,
 )
 from verl.trainer.distillation.losses import distillation_ppo_loss
+from verl.trainer.ppo.ray_trainer import RayPPOTrainer
 from verl.tools.schemas import ToolResponse
 from verl.utils import tensordict_utils as tu
 from verl.tools.tool_registry import load_all_tools
@@ -1073,8 +1075,72 @@ async def test_opd_stop_tool_requests_agent_loop_termination() -> None:
     observation = json.loads(response.text)
     assert observation["stopped"] is True
     assert agent_data.extra_fields["opd_mm"]["stopped"] is True
+    assert agent_data.extra_fields["opd_mm"]["query"] == "Find the tabby cat on the sofa."
+    assert agent_data.extra_fields["opd_mm"]["max_actions_reached"] is False
     assert metrics["opd_mm_terminate"] is True
     assert metrics["agent_loop_terminate"] is True
+
+
+@pytest.mark.asyncio
+async def test_opd_tool_session_marks_forced_max_action_stop() -> None:
+    records = [record.to_dict() for record in _records()]
+    agent_data = FakeAgentData(
+        messages=[{"role": "user", "content": "Find the tabby cat."}],
+        tools_kwargs={"opd_mm": {"query": "Find the tabby cat.", "records": records}},
+    )
+    retrieve_tool = OPDRetrieveTool(config={"type": "native", "max_actions": 2}, tool_schema=None)
+    topk_tool = OPDTopKTool(config={"type": "native", "max_actions": 2}, tool_schema=None)
+
+    await retrieve_tool.execute("instance", {"method": "bm25", "top_k": 2}, agent_data=agent_data)
+    response, _, metrics = await topk_tool.execute("instance", {"k": 1}, agent_data=agent_data)
+
+    observation = json.loads(response.text)
+    state = agent_data.extra_fields["opd_mm"]
+    assert observation["tool"] == "STOP"
+    assert state["trace"][-1] == {"tool": "STOP"}
+    assert state["max_actions_reached"] is True
+    assert metrics["agent_loop_terminate"] is True
+
+
+def test_raw_inspector_backend_environment_overrides_tool_config(monkeypatch) -> None:
+    monkeypatch.setenv("OPD_MM_RAW_INSPECTOR_BACKEND", "vllm")
+    monkeypatch.setenv("OPD_MM_RAW_INSPECTOR_URL", "http://outcome-model:8011")
+    monkeypatch.setenv("OPD_MM_RAW_INSPECTOR_MODEL", "opd-mm-outcome")
+    records = [record.to_dict() for record in _records()]
+    agent_data = FakeAgentData(
+        messages=[{"role": "user", "content": "Inspect the image."}],
+        tools_kwargs={"opd_mm": {"query": "Inspect the image.", "records": records}},
+    )
+    tool = OPDInspectRawTool(config={"type": "native", "raw_inspector_backend": "teacher"}, tool_schema=None)
+
+    session = tool._session(agent_data)
+
+    assert isinstance(session.executor.raw_inspector, RemoteVLLMRawInspector)
+    assert session.executor.raw_inspector.base_url == "http://outcome-model:8011"
+    assert session.executor.raw_inspector.model == "opd-mm-outcome"
+
+
+def test_tool_agent_records_exact_opd_policy_state(monkeypatch) -> None:
+    monkeypatch.setenv("OPD_MM_RECORD_POLICY_STATES", "1")
+    agent_data = SimpleNamespace(
+        tools_kwargs={"opd_mm": {"query": "Find the cat."}},
+        extra_fields={},
+    )
+
+    ToolAgentLoop._record_opd_mm_policy_state(
+        agent_data=agent_data,
+        state_prompt_ids=[1, 2, 3],
+        response_ids=[4, 5],
+        response_logprobs=[-0.1, -0.2],
+    )
+
+    assert agent_data.extra_fields["opd_mm_policy_states"] == [
+        {
+            "prompt_ids": [1, 2, 3],
+            "response_ids": [4, 5],
+            "response_logprobs": [-0.1, -0.2],
+        }
+    ]
 
 
 def test_tool_config_loads_verl_native_opd_tools() -> None:
@@ -2130,6 +2196,54 @@ def test_reward_manager_places_score_on_last_response_token() -> None:
     reward = output["reward_tensor"]
     assert reward.tolist() == [[0.0, 1.0, 0.0], [0.0, 0.0, 0.0]]
     assert output["reward_extra_info"]["opd_mm/correct"] == [1.0, 0.0]
+
+
+def test_opd_grpo_batch_uses_each_refreshed_state_and_terminal_advantage() -> None:
+    config = SimpleNamespace(
+        actor_rollout_ref=SimpleNamespace(
+            rollout=SimpleNamespace(prompt_length=6, response_length=4, n=2),
+            actor=SimpleNamespace(ppo_mini_batch_size=1),
+        )
+    )
+    trainer = SimpleNamespace(
+        config=config,
+        tokenizer=SimpleNamespace(pad_token_id=0),
+        actor_rollout_wg=object(),
+        _get_dp_size=lambda worker_group, role: 1,
+    )
+    states = np.empty(2, dtype=object)
+    states[0] = [
+        {"prompt_ids": [10, 11], "response_ids": [20, 21], "response_logprobs": [-0.1, -0.2]},
+        {"prompt_ids": [10, 11, 12], "response_ids": [22], "response_logprobs": [-0.3]},
+    ]
+    states[1] = [
+        {"prompt_ids": [30], "response_ids": [31, 32], "response_logprobs": [-0.4, -0.5]},
+    ]
+    batch = DataProto.from_dict(
+        tensors={
+            "response_mask": torch.tensor([[1, 1, 0, 0], [1, 1, 0, 0]]),
+            "advantages": torch.tensor([[0.5, 0.5, 0.0, 0.0], [-0.25, -0.25, 0.0, 0.0]]),
+        },
+        non_tensors={
+            "uid": np.array(["trajectory-a", "trajectory-b"], dtype=object),
+            "opd_mm_policy_states": states,
+        },
+    )
+
+    expanded = RayPPOTrainer._build_opd_mm_grpo_state_batch(trainer, batch)
+
+    assert expanded is not None
+    assert len(expanded) == 4  # padded to ppo_mini_batch_size * rollout.n
+    assert expanded.batch["prompts"][0, -2:].tolist() == [10, 11]
+    assert expanded.batch["responses"][0, :2].tolist() == [20, 21]
+    assert expanded.batch["old_log_probs"][0, :2].tolist() == pytest.approx([-0.1, -0.2])
+    assert expanded.batch["advantages"][0, :2].tolist() == [0.5, 0.5]
+    assert expanded.batch["advantages"][2, :2].tolist() == [-0.25, -0.25]
+    assert expanded.non_tensor_batch["uid"].tolist()[:3] == [
+        "trajectory-a",
+        "trajectory-a",
+        "trajectory-b",
+    ]
 
 
 def test_helpers_build_hidden_store_from_dicts_and_schemas() -> None:

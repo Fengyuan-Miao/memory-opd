@@ -161,6 +161,14 @@ def _stratified_sample(
 def load_eval_qas(args: argparse.Namespace) -> list[dict[str, Any]]:
     df = pd.read_parquet(args.qas_path)
     rows = df.to_dict("records")
+    eval_ids = _read_train_ids(args.eval_sample_ids) if args.eval_sample_ids else set()
+    if eval_ids:
+        selected = [row for row in rows if str(row.get("sample_id")) in eval_ids]
+        selected_ids = {str(row.get("sample_id")) for row in selected}
+        missing = sorted(eval_ids - selected_ids)
+        if missing:
+            raise ValueError(f"eval sample IDs are missing from the QA store: {missing[:3]}")
+        return _stratified_sample(selected, max_samples=args.max_samples, seed=args.seed)
     train_ids = _read_train_ids(args.train_sample_ids)
     heldout = [row for row in rows if str(row.get("sample_id")) not in train_ids]
     return _stratified_sample(heldout, max_samples=args.max_samples, seed=args.seed)
@@ -687,6 +695,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--qas-path", default=DEFAULT_QAS)
     parser.add_argument("--train-sample-ids", default=DEFAULT_TRAIN_IDS)
     parser.add_argument("--train-rlhf-path", default=DEFAULT_TRAIN_RLHF)
+    parser.add_argument("--eval-sample-ids", default="", help="Optional fixed evaluation sample-ID file.")
     parser.add_argument("--input", default="", help="Existing rollout JSONL to read when --skip-rollout is set.")
     parser.add_argument("--output", default=DEFAULT_OUTPUT)
     parser.add_argument("--max-samples", type=int, default=80)

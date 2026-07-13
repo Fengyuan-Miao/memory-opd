@@ -1276,7 +1276,13 @@ class AgentLoopWorker:
                 non_tensor_batch = {
                     **{k: np.array([v] * n) for k, v in kwargs.items()},
                     "__num_turns__": np.array([o.num_turns for o in outputs]),
-                    "tool_extra_fields": np.array([o.extra_fields for o in outputs], dtype=object),
+                    "tool_extra_fields": np.array(
+                        [
+                            {key: value for key, value in o.extra_fields.items() if key != "opd_mm_policy_states"}
+                            for o in outputs
+                        ],
+                        dtype=object,
+                    ),
                     "prompt_len": np.array([len(o.prompt_ids) for o in outputs]),
                     "response_len": np.array([len(o.response_ids) for o in outputs]),
                 }
@@ -1382,7 +1388,7 @@ class AgentLoopWorker:
         batch. Keep known optional fields present in every chunk so missing
         per-sample values are represented explicitly.
         """
-        if key in {"turn_scores", "tool_rewards"}:
+        if key in {"turn_scores", "tool_rewards", "opd_mm_policy_states"}:
             return []
         return None
 
@@ -1491,6 +1497,7 @@ class AgentLoopWorker:
             # DataProto.concat with e.g. "key opd_mm length 30 is not equal to
             # batch size 48".
             "opd_mm",
+            "opd_mm_policy_states",
             "opd_mm_step_corrections",
         }
         all_keys = set(key for input_item in inputs for key in input_item.extra_fields) | default_extra_keys

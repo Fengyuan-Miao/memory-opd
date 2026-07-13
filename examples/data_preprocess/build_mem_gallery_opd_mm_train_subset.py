@@ -115,6 +115,75 @@ def stratified_mem_gallery_subset(
     return sorted(selected, key=lambda qa: (qa["scenario"], qa["point"], qa["sample_id"]))
 
 
+def stratified_holdout_subset(
+    qas: list[dict[str, Any]],
+    *,
+    max_samples: int,
+    seed: int,
+) -> list[dict[str, Any]]:
+    """Match the fixed scenario/category-balanced OPD-MM evaluation sampling."""
+    if max_samples <= 0:
+        return []
+    if max_samples >= len(qas):
+        return sorted(qas, key=lambda qa: (qa["scenario"], qa["point"], qa["sample_id"]))
+
+    rng = random.Random(seed)
+    groups = _group_qas(qas)
+    selected: list[dict[str, Any]] = []
+    keys = sorted(groups)
+    rng.shuffle(keys)
+    while len(selected) < max_samples and keys:
+        next_keys = []
+        for key in keys:
+            rows = groups[key]
+            if not rows:
+                continue
+            rows.sort(key=lambda qa: str(qa["sample_id"]))
+            selected.append(rows.pop(rng.randrange(len(rows))))
+            if rows:
+                next_keys.append(key)
+            if len(selected) >= max_samples:
+                break
+        keys = next_keys
+    return sorted(selected, key=lambda qa: (qa["scenario"], qa["point"], qa["sample_id"]))
+
+
+def extend_stratified_mem_gallery_subset(
+    qas: list[dict[str, Any]],
+    *,
+    base_sample_ids: set[str],
+    excluded_sample_ids: set[str],
+    per_cell_cap: int,
+    seed: int,
+) -> list[dict[str, Any]]:
+    """Retain a base subset and fill each cell without sampling excluded QAs."""
+    if per_cell_cap <= 0:
+        raise ValueError("per_cell_cap must be positive")
+    available_ids = {str(qa["sample_id"]) for qa in qas}
+    missing_base = sorted(base_sample_ids - available_ids)
+    if missing_base:
+        raise ValueError(f"base sample IDs are missing from Mem-Gallery: {missing_base[:3]}")
+    overlap = base_sample_ids & excluded_sample_ids
+    if overlap:
+        raise ValueError(f"base and excluded sample IDs overlap: {sorted(overlap)[:3]}")
+
+    rng = random.Random(seed)
+    selected: list[dict[str, Any]] = []
+    for _, rows in sorted(_group_qas(qas).items()):
+        base_rows = [qa for qa in rows if str(qa["sample_id"]) in base_sample_ids]
+        candidates = [
+            qa
+            for qa in rows
+            if str(qa["sample_id"]) not in base_sample_ids
+            and str(qa["sample_id"]) not in excluded_sample_ids
+        ]
+        selected.extend(base_rows)
+        remaining = max(0, per_cell_cap - len(base_rows))
+        if remaining:
+            selected.extend(_sample_group(candidates, cap=remaining, rng=rng))
+    return sorted(selected, key=lambda qa: (qa["scenario"], qa["point"], qa["sample_id"]))
+
+
 def _counter_by(rows: Iterable[dict[str, Any]], key: str) -> dict[str, int]:
     return dict(sorted(Counter(str(row.get(key) or "") for row in rows).items()))
 
@@ -210,13 +279,46 @@ def build_subset(
     data_source: str,
     agent_name: str,
     write_rlhf: bool = True,
+    base_sample_ids: Iterable[str] | None = None,
+    excluded_sample_ids: Iterable[str] | None = None,
+    reserve_eval_samples: int = 0,
+    reserve_eval_seed: int = 20260705,
 ) -> dict[str, Any]:
     qas = load_mem_gallery_qas(dataset_root)
-    selected = stratified_mem_gallery_subset(
-        qas,
-        per_cell_cap=per_cell_cap,
-        seed=seed,
+    base_ids = {str(sample_id).strip() for sample_id in (base_sample_ids or []) if str(sample_id).strip()}
+    excluded_ids = {
+        str(sample_id).strip() for sample_id in (excluded_sample_ids or []) if str(sample_id).strip()
+    }
+    if base_ids & excluded_ids:
+        raise ValueError("base_sample_ids and excluded_sample_ids must be disjoint")
+
+    reserve_candidates = [
+        qa
+        for qa in qas
+        if str(qa["sample_id"]) not in base_ids and str(qa["sample_id"]) not in excluded_ids
+    ]
+    reserved_eval = stratified_holdout_subset(
+        reserve_candidates,
+        max_samples=reserve_eval_samples,
+        seed=reserve_eval_seed,
     )
+    excluded_ids.update(str(qa["sample_id"]) for qa in reserved_eval)
+    heldout = [qa for qa in qas if str(qa["sample_id"]) in excluded_ids]
+
+    if base_ids or excluded_ids:
+        selected = extend_stratified_mem_gallery_subset(
+            qas,
+            base_sample_ids=base_ids,
+            excluded_sample_ids=excluded_ids,
+            per_cell_cap=per_cell_cap,
+            seed=seed,
+        )
+    else:
+        selected = stratified_mem_gallery_subset(
+            qas,
+            per_cell_cap=per_cell_cap,
+            seed=seed,
+        )
 
     output = Path(output_dir)
     output.mkdir(parents=True, exist_ok=True)
@@ -230,6 +332,17 @@ def build_subset(
         "train_qas_jsonl": str((output / "train_qas.jsonl").resolve()),
         "train_sample_ids": str((output / "train_sample_ids.txt").resolve()),
     }
+    if base_ids:
+        (output / "base_sample_ids.txt").write_text("\n".join(sorted(base_ids)) + "\n", encoding="utf-8")
+        files["base_sample_ids"] = str((output / "base_sample_ids.txt").resolve())
+    if heldout:
+        qas_to_jsonl(heldout, output / "heldout_qas.jsonl")
+        (output / "heldout_sample_ids.txt").write_text(
+            "\n".join(sorted(str(qa["sample_id"]) for qa in heldout)) + "\n",
+            encoding="utf-8",
+        )
+        files["heldout_qas_jsonl"] = str((output / "heldout_qas.jsonl").resolve())
+        files["heldout_sample_ids"] = str((output / "heldout_sample_ids.txt").resolve())
     if write_rlhf:
         samples = _samples_for_qas(
             selected,
@@ -251,14 +364,19 @@ def build_subset(
         "dataset_root": str(Path(dataset_root).resolve()),
         "output_dir": str(output.resolve()),
         "selection_policy": {
-            "type": "scenario_point_stratified",
+            "type": "scenario_point_stratified_extension" if base_ids else "scenario_point_stratified",
             "per_cell_cap": per_cell_cap,
             "seed": seed,
             "non_empty_cells": len(_group_qas(qas)),
             "image_text_diversity_preference": True,
+            "base_sample_count": len(base_ids),
+            "excluded_sample_count": len(excluded_ids),
+            "reserve_eval_samples": reserve_eval_samples,
+            "reserve_eval_seed": reserve_eval_seed,
         },
         "full": _summary(qas),
         "train": _summary(selected),
+        "heldout": _summary(heldout) if heldout else None,
         "files": files,
     }
     _write_json(output / "manifest.json", manifest)
@@ -273,8 +391,18 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=20260705)
     parser.add_argument("--data-source", default=DEFAULT_DATA_SOURCE)
     parser.add_argument("--agent-name", default=DEFAULT_AGENT_NAME)
+    parser.add_argument("--base-sample-ids", default="")
+    parser.add_argument("--exclude-sample-ids", default="")
+    parser.add_argument("--reserve-eval-samples", type=int, default=0)
+    parser.add_argument("--reserve-eval-seed", type=int, default=20260705)
     parser.add_argument("--skip-rlhf", action="store_true")
     return parser.parse_args()
+
+
+def _read_sample_ids(path: str) -> set[str]:
+    if not path:
+        return set()
+    return {line.strip() for line in Path(path).read_text(encoding="utf-8").splitlines() if line.strip()}
 
 
 def main() -> None:
@@ -287,6 +415,10 @@ def main() -> None:
         data_source=args.data_source,
         agent_name=args.agent_name,
         write_rlhf=not args.skip_rlhf,
+        base_sample_ids=_read_sample_ids(args.base_sample_ids),
+        excluded_sample_ids=_read_sample_ids(args.exclude_sample_ids),
+        reserve_eval_samples=args.reserve_eval_samples,
+        reserve_eval_seed=args.reserve_eval_seed,
     )
     print(json.dumps(manifest, ensure_ascii=False, indent=2))
 

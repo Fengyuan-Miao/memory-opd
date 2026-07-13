@@ -443,6 +443,12 @@ class ToolAgentLoop(AgentLoopBase):
             agent_data.response_ids, tools
         )
         agent_data.last_assistant_content = assistant_content or ""
+        self._record_opd_mm_policy_state(
+            agent_data=agent_data,
+            state_prompt_ids=state_prompt_ids,
+            response_ids=agent_data.response_ids,
+            response_logprobs=output.log_probs,
+        )
         await self._collect_online_state_correction(
             agent_data=agent_data,
             state_prompt_ids=state_prompt_ids,
@@ -463,8 +469,31 @@ class ToolAgentLoop(AgentLoopBase):
             return AgentState.TERMINATED
         if agent_data.tool_calls:
             return AgentState.PROCESSING_TOOLS
-        else:
-            return AgentState.TERMINATED
+        return AgentState.TERMINATED
+
+    @staticmethod
+    def _record_opd_mm_policy_state(
+        *,
+        agent_data: AgentData,
+        state_prompt_ids: list[int],
+        response_ids: list[int],
+        response_logprobs: Optional[list[float]],
+    ) -> None:
+        """Keep the actual refreshed state/action pair for a later GRPO update."""
+        enabled = str(os.getenv("OPD_MM_RECORD_POLICY_STATES") or "").strip().lower()
+        if enabled not in {"1", "true", "yes", "on"}:
+            return
+        opd_runtime = (agent_data.tools_kwargs or {}).get("opd_mm")
+        if not isinstance(opd_runtime, dict) or not response_ids:
+            return
+        logprobs = list(response_logprobs or [])
+        agent_data.extra_fields.setdefault("opd_mm_policy_states", []).append(
+            {
+                "prompt_ids": [int(token) for token in state_prompt_ids],
+                "response_ids": [int(token) for token in response_ids],
+                "response_logprobs": [float(value) for value in logprobs],
+            }
+        )
 
     async def _collect_online_state_correction(
         self,
