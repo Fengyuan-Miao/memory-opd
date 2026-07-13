@@ -381,6 +381,8 @@ def _sanitize_evidence(items: list[EvidenceItem]) -> list[dict[str, Any]]:
     for item in items:
         data = item.to_dict()
         data.pop("memory_id", None)
+        data.pop("source", None)
+        data.pop("author", None)
         sanitized.append(data)
     return sanitized
 
@@ -401,7 +403,7 @@ def _sanitize_evidence_preview(
         data = item.to_dict()
         data.pop("memory_id", None)
         fields = data.get("fields") if isinstance(data.get("fields"), dict) else data
-        entry: dict[str, Any] = {"source": data.get("source")}
+        entry: dict[str, Any] = {}
         for key in (
             "image_id",
             "content",
@@ -787,8 +789,8 @@ class OPDFilterTool(OPDBaseTool):
         "op": _property("string", "The comparison operator.", sorted(FILTER_OPS)),
         "value": _property(
             ["string", "number", "boolean"],
-            "The comparison value. For timestamp, YYYY-MM-DD matches all memories from that date. "
-            "For Mem-Gallery source_type, use dialogue_turn or dialogue_image, never MEMORY/user/assistant. "
+            "Allowed values by field: modality uses text or image; source_type uses dialogue_turn or "
+            "dialogue_image; status uses active; timestamp uses a public YYYY-MM-DD date or timestamp. "
             "Do not use memory IDs.",
         ),
         "scope": _property(

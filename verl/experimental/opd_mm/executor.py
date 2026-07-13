@@ -33,7 +33,6 @@ PUBLIC_EVIDENCE_FIELDS = (
     "content",
     "timestamp",
     "session_date",
-    "author",
     "modality",
 )
 TIMESTAMP_DATE_PATTERN = re.compile(

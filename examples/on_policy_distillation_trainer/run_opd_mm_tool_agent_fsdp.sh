@@ -3,6 +3,10 @@
 
 set -xeuo pipefail
 
+SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+REPO_ROOT=$(cd "$SCRIPT_DIR/../.." && pwd)
+cd "$REPO_ROOT"
+
 # ---- user-adjustable ----
 RUN_TIMESTAMP=${RUN_TIMESTAMP:-$(date +%Y%m%d_%H%M%S)}
 STUDENT_MODEL=${STUDENT_MODEL:-/home/guojr/data/pretrained_models/Qwen/Qwen3.5-4B}
@@ -45,8 +49,20 @@ total_epochs=${TOTAL_EPOCHS:-15}
 save_freq=${SAVE_FREQ:-50}
 test_freq=${TEST_FREQ:--1}
 
+# Run the fixed 100-sample evidence-answerable evaluation after a successful
+# training run. Set RUN_POST_TRAIN_EVAL=0 to keep training-only behavior.
+RUN_POST_TRAIN_EVAL=${RUN_POST_TRAIN_EVAL:-1}
+POST_TRAIN_EVAL_GPUS=${POST_TRAIN_EVAL_GPUS:-0,1}
+POST_TRAIN_EVAL_JUDGE_MODEL=${POST_TRAIN_EVAL_JUDGE_MODEL:-/home/guojr/data/pretrained_models/Qwen/Qwen3-VL-8B-Instruct}
+POST_TRAIN_EVAL_OUTPUT_DIR=${POST_TRAIN_EVAL_OUTPUT_DIR:-outputs/opd_mm_eval}
+POST_TRAIN_EVAL_DELAY_SECONDS=${POST_TRAIN_EVAL_DELAY_SECONDS:-15}
+POST_TRAIN_EVAL_SEED=${POST_TRAIN_EVAL_SEED:-20260705}
+POST_TRAIN_EVAL_MAX_TURNS=${POST_TRAIN_EVAL_MAX_TURNS:-8}
+POST_TRAIN_EVAL_JUDGE_MAX_MODEL_LEN=${POST_TRAIN_EVAL_JUDGE_MAX_MODEL_LEN:-40000}
+
 project_name=${PROJECT_NAME:-verl_distill_opd_mm}
 experiment_name=${EXPERIMENT_NAME:-opd_mm_qwen35_4b_teacher9b_verifierfeedback_sanitized_${RUN_TIMESTAMP}}
+POST_TRAIN_CHECKPOINT_ROOT=${POST_TRAIN_CHECKPOINT_ROOT:-checkpoints/${project_name}/${experiment_name}}
 
 LOG_DIR=${LOG_DIR:-logs}
 TRAIN_LOG_PATH=${TRAIN_LOG_PATH:-${LOG_DIR}/${experiment_name}.log}
@@ -91,6 +107,10 @@ echo "OPD_MM_RAW_INSPECTOR_BACKEND=${OPD_MM_RAW_INSPECTOR_BACKEND}"
 echo "OPD_MM_SKIP_INITIAL_CORRECTION=${OPD_MM_SKIP_INITIAL_CORRECTION}"
 echo "TEACHER_MODEL=${TEACHER_MODEL}"
 echo "TEACHER_MAX_MODEL_LEN=${teacher_max_model_len}"
+echo "RUN_POST_TRAIN_EVAL=${RUN_POST_TRAIN_EVAL}"
+echo "POST_TRAIN_CHECKPOINT_ROOT=${POST_TRAIN_CHECKPOINT_ROOT}"
+echo "POST_TRAIN_EVAL_GPUS=${POST_TRAIN_EVAL_GPUS}"
+echo "POST_TRAIN_EVAL_JUDGE_MODEL=${POST_TRAIN_EVAL_JUDGE_MODEL}"
 
 max_num_tokens=$(( max_prompt_length + max_response_length + 1 ))
 
@@ -186,6 +206,7 @@ EXTRA=(
     distillation.distillation_loss.log_prob_min_clamp=-10.0
 )
 
+set +e
 python3 -m verl.trainer.main_ppo \
     "${DATA[@]}" \
     "${MODEL[@]}" \
@@ -195,3 +216,69 @@ python3 -m verl.trainer.main_ppo \
     "${REWARD[@]}" \
     "${EXTRA[@]}" \
     "$@"
+train_status=$?
+set -e
+
+if (( train_status != 0 )); then
+    echo "Training failed with exit code ${train_status}; post-train evaluation is skipped."
+    exit "$train_status"
+fi
+
+case "${RUN_POST_TRAIN_EVAL,,}" in
+    1|true|yes|on)
+        echo "Training completed; starting post-train OPD-MM evaluation."
+        sleep "$POST_TRAIN_EVAL_DELAY_SECONDS"
+
+        mapfile -t checkpoint_dirs < <(
+            find "$POST_TRAIN_CHECKPOINT_ROOT" -mindepth 1 -maxdepth 1 -type d -name 'global_step_*' | sort -V
+        )
+        if (( ${#checkpoint_dirs[@]} == 0 )); then
+            echo "No global_step checkpoint found under ${POST_TRAIN_CHECKPOINT_ROOT}" >&2
+            exit 1
+        fi
+        final_checkpoint=${checkpoint_dirs[$((${#checkpoint_dirs[@]} - 1))]}
+        final_step=$(basename "$final_checkpoint")
+        prepared_model_dir="$final_checkpoint/actor_merged_hf_vllm_fixed"
+        eval_output="$POST_TRAIN_EVAL_OUTPUT_DIR/${experiment_name}_${final_step}_100_evidenceanswerable_qwen3vl8b.jsonl"
+        mkdir -p "$POST_TRAIN_EVAL_OUTPUT_DIR"
+
+        echo "POST_TRAIN_FINAL_CHECKPOINT=${final_checkpoint}"
+        echo "POST_TRAIN_PREPARED_MODEL=${prepared_model_dir}"
+        echo "POST_TRAIN_EVAL_OUTPUT=${eval_output}"
+
+        PYTHONPATH="$REPO_ROOT${PYTHONPATH:+:$PYTHONPATH}" \
+            python3 examples/opd_mm_baseline/prepare_opd_mm_checkpoint.py \
+            --checkpoint-dir "$final_checkpoint" \
+            --output-dir "$prepared_model_dir"
+
+        CUDA_VISIBLE_DEVICES="$POST_TRAIN_EVAL_GPUS" \
+        PYTHONPATH="$REPO_ROOT${PYTHONPATH:+:$PYTHONPATH}" \
+            python3 examples/opd_mm_baseline/evaluate_opd_mm_llm_judge.py \
+            --student-model "$prepared_model_dir" \
+            --judge-model "$POST_TRAIN_EVAL_JUDGE_MODEL" \
+            --judge-mode evidence_answerable \
+            --output "$eval_output" \
+            --max-samples 100 \
+            --seed "$POST_TRAIN_EVAL_SEED" \
+            --max-turns "$POST_TRAIN_EVAL_MAX_TURNS" \
+            --student-tp 1 \
+            --student-gpu-memory-utilization 0.35 \
+            --max-model-len 8192 \
+            --max-new-tokens 1024 \
+            --temperature 0.0 \
+            --judge-tp 2 \
+            --judge-gpu-memory-utilization 0.55 \
+            --judge-max-model-len "$POST_TRAIN_EVAL_JUDGE_MAX_MODEL_LEN" \
+            --judge-max-new-tokens 192
+
+        echo "Post-train evaluation summary:"
+        cat "${eval_output%.jsonl}.summary.json"
+        ;;
+    0|false|no|off)
+        echo "RUN_POST_TRAIN_EVAL=${RUN_POST_TRAIN_EVAL}; post-train evaluation skipped."
+        ;;
+    *)
+        echo "Invalid RUN_POST_TRAIN_EVAL=${RUN_POST_TRAIN_EVAL}; expected 0/1 or false/true." >&2
+        exit 2
+        ;;
+esac

@@ -834,29 +834,6 @@ def parse_state_verifier_feedback(
         return _verifier_parse_fallback(error)
 
 
-def _stop_gate_fallback_action(request: dict[str, Any], verifier_feedback: dict[str, Any]) -> ToolAction:
-    """Choose a safe non-STOP target when verifier marks evidence insufficient."""
-    missing_type = _normalize_missing_evidence_type(verifier_feedback.get("missing_evidence_type")) or "no_public_evidence"
-    observation = _as_dict(request.get("observation"))
-    evidence_count = _observation_evidence_count(observation)
-    allow_inspect_raw = bool(request.get("allow_inspect_raw", True))
-    if missing_type == "missing_neighbor_context" and _observation_has_candidate_context(observation):
-        return ToolAction("EXPAND_NEIGHBORS", {"window": 1})
-    if missing_type == "missing_raw_visual_detail" and allow_inspect_raw and evidence_count > 0:
-        return ToolAction(
-            "INSPECT_RAW",
-            {
-                "target": "current_pool",
-                "instruction": "answer_query_related_visual_details",
-            },
-        )
-    if missing_type == "candidate_set_too_broad" and evidence_count > 0:
-        return ToolAction("TOPK", {"k": min(max(evidence_count, 1), 5)})
-    if missing_type == "missing_temporal_order" and evidence_count > 0:
-        return ToolAction("SORT", {"field": "timestamp", "order": "desc"})
-    return ToolAction("RETRIEVE", {"method": "hybrid", "top_k": 10, "query": str(request.get("query") or "")})
-
-
 def build_teacher_correction_prompt(
     *,
     query: str,
@@ -1105,14 +1082,10 @@ def finalize_online_step_correction(
     sample_id = str(request["sample_id"])
     step_index = int(request["step_index"])
     verifier_feedback = _as_dict(request.get("verifier_feedback"))
-    stop_gate_applied = False
     if teacher_action.tool == "STOP" and verifier_feedback and not bool(verifier_feedback.get("evidence_sufficient")):
-        teacher_action = _stop_gate_fallback_action(request, verifier_feedback)
-        target_xml = action_to_tool_call_xml(
-            teacher_action,
-            tool_format=str(request.get("tool_format") or "qwen3_coder"),
-        )
-        stop_gate_applied = True
+        # Do not turn a privileged STOP rejection into a synthetic action. The
+        # state is not a valid teacher target and must be excluded from SFT.
+        return None
     example = {
         "sample_id": f"{sample_id}:step:{step_index}",
         "input": "",
@@ -1128,7 +1101,7 @@ def finalize_online_step_correction(
                 "student_raw_response": request.get("student_raw_response", ""),
                 "verifier_raw_response": request.get("verifier_raw_response", ""),
                 "verifier_feedback": verifier_feedback,
-                "stop_gate_applied": stop_gate_applied,
+                "stop_gate_applied": False,
             }
         },
     }
@@ -1145,7 +1118,7 @@ def finalize_online_step_correction(
         "teacher_xml_span": raw_xml,
         "verifier_raw_response": request.get("verifier_raw_response", ""),
         "verifier_feedback": verifier_feedback,
-        "stop_gate_applied": stop_gate_applied,
+        "stop_gate_applied": False,
         "sft_prompt_ids": request.get("student_prompt_ids", []),
         "sft_target_xml": target_xml,
         "example": example,

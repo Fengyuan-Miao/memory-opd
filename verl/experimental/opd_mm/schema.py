@@ -35,6 +35,11 @@ ALLOWED_TOOLS = {
 FILTER_FIELDS = {"modality", "source_type", "timestamp", "status"}
 FILTER_OPS = {"eq", "neq", "before", "after", "contains"}
 FILTER_SCOPES = {"current_pool", "full_memory"}
+FILTER_VALUE_ENUMS = {
+    "modality": {"image", "text"},
+    "source_type": {"dialogue_image", "dialogue_turn"},
+    "status": {"active"},
+}
 SORT_FIELDS = {"timestamp", "turn_id", "score"}
 SORT_ORDERS = {"asc", "desc"}
 RETRIEVAL_METHODS = {"bm25", "dense", "vision", "hybrid"}
@@ -72,7 +77,7 @@ required: use full_memory for an independent metadata/date filter over the
 original store; use current_pool only for an intentional intersection with the
 current candidates. Chaining unrelated current_pool filters can empty the pool.
 For Mem-Gallery, source_type values are dialogue_turn and dialogue_image;
-MEMORY/user/assistant are not source_type values, and status is normally unset.
+modality values are text and image; status value is active.
 EXPAND_NEIGHBORS adds
 nearby turns around the current candidate pool; use it only after a retrieve or
 filter step has selected relevant candidates."""
@@ -183,6 +188,14 @@ class TrajectoryValidator:
             raise TrajectoryValidationError(f"action {index}: invalid FILTER op")
         if not isinstance(args["value"], (str, int, float, bool)):
             raise TrajectoryValidationError(f"action {index}: invalid FILTER value")
+        allowed_values = FILTER_VALUE_ENUMS.get(args["field"])
+        if allowed_values is not None and args["value"] not in allowed_values:
+            raise TrajectoryValidationError(
+                f"action {index}: invalid FILTER value for {args['field']}; "
+                f"expected one of {sorted(allowed_values)}"
+            )
+        if args["field"] == "timestamp" and (not isinstance(args["value"], str) or not args["value"].strip()):
+            raise TrajectoryValidationError(f"action {index}: invalid FILTER timestamp value")
         if args["scope"] not in FILTER_SCOPES:
             raise TrajectoryValidationError(f"action {index}: invalid FILTER scope")
 

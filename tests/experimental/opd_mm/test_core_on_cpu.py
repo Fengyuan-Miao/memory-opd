@@ -79,7 +79,7 @@ def _records() -> list[MemoryRecord]:
             timestamp="2026-01-01T09:00:00",
             author="user",
             modality="text",
-            source_type="conversation",
+            source_type="dialogue_turn",
             summary="The user mentioned an older dog photo.",
             content="I uploaded a dog picture yesterday.",
             metadata={"session_date": "2026-01-01"},
@@ -90,7 +90,7 @@ def _records() -> list[MemoryRecord]:
             timestamp="2026-01-01T10:00:00",
             author="user",
             modality="text",
-            source_type="conversation",
+            source_type="dialogue_turn",
             summary="The user described a tabby cat image.",
             content="This is my tabby cat on the sofa.",
             metadata={"session_date": "2026-01-01"},
@@ -101,7 +101,7 @@ def _records() -> list[MemoryRecord]:
             timestamp="2026-01-01T10:00:01",
             author="user",
             modality="image",
-            source_type="uploaded_image",
+            source_type="dialogue_image",
             summary="A tabby cat sitting on a sofa.",
             raw_pointer="images/cat.png",
             metadata={"session_date": "2026-01-01", "image_id": "D1:IMG_001"},
@@ -112,7 +112,7 @@ def _records() -> list[MemoryRecord]:
             timestamp="2026-01-01T11:00:00",
             author="assistant",
             modality="image",
-            source_type="generated_image",
+            source_type="dialogue_turn",
             summary="An assistant-generated chart.",
             raw_pointer="images/chart.png",
             metadata={"image_id": "D1:IMG_002"},
@@ -128,7 +128,7 @@ def _neighbor_records() -> list[MemoryRecord]:
             timestamp="2026-02-01T09:00:00",
             author="user",
             modality="text",
-            source_type="conversation",
+            source_type="dialogue_turn",
             summary="The previous turn contains setup context.",
             content="Previous context before the middle clue.",
             metadata={"scenario": "scenario_a", "session_id": "D1", "round_id": "D1:1"},
@@ -139,7 +139,7 @@ def _neighbor_records() -> list[MemoryRecord]:
             timestamp="2026-02-01T09:01:00",
             author="user",
             modality="text",
-            source_type="conversation",
+            source_type="dialogue_turn",
             summary="The middle turn mentions the unique middle clue.",
             content="The unique middle clue is here.",
             metadata={"scenario": "scenario_a", "session_id": "D1", "round_id": "D1:2"},
@@ -150,7 +150,7 @@ def _neighbor_records() -> list[MemoryRecord]:
             timestamp="2026-02-01T09:02:00",
             author="assistant",
             modality="text",
-            source_type="conversation",
+            source_type="dialogue_turn",
             summary="The next turn contains follow-up context.",
             content="Follow-up context after the middle clue.",
             metadata={"scenario": "scenario_a", "session_id": "D1", "round_id": "D1:3"},
@@ -161,7 +161,7 @@ def _neighbor_records() -> list[MemoryRecord]:
             timestamp="2026-02-01T09:04:00",
             author="assistant",
             modality="text",
-            source_type="conversation",
+            source_type="dialogue_turn",
             summary="A farther turn should not be added with window one.",
             metadata={"scenario": "scenario_a", "session_id": "D1", "round_id": "D1:5"},
         ),
@@ -171,7 +171,7 @@ def _neighbor_records() -> list[MemoryRecord]:
             timestamp="2026-02-01T09:02:00",
             author="assistant",
             modality="text",
-            source_type="conversation",
+            source_type="dialogue_turn",
             summary="Same session label but different scenario.",
             metadata={"scenario": "scenario_b", "session_id": "D1", "round_id": "D1:3"},
         ),
@@ -312,6 +312,20 @@ def test_validator_rejects_memory_ids_and_accepts_rewritten_retrieve_query() -> 
     with pytest.raises(TrajectoryValidationError, match="invalid FILTER scope"):
         validator.validate([{"tool": "FILTER", "field": "modality", "op": "eq", "value": "image", "scope": "all"}])
 
+    invalid_filter_values = (
+        ("modality", "dialogue"),
+        ("source_type", "dialogue"),
+        ("source_type", "user"),
+        ("source_type", "MEMORY"),
+        ("source_type", "assistant"),
+        ("status", "completed"),
+    )
+    for field, value in invalid_filter_values:
+        with pytest.raises(TrajectoryValidationError, match=f"invalid FILTER value for {field}"):
+            validator.validate(
+                [{"tool": "FILTER", "field": field, "op": "eq", "value": value, "scope": "full_memory"}]
+            )
+
     validated = validator.validate([{"tool": "RETRIEVE", "query": "custom query", "top_k": 3}])
     assert validated[0].arguments["query"] == "custom query"
 
@@ -385,14 +399,14 @@ def test_filter_scope_can_restart_from_full_memory_pool() -> None:
                 "tool": "FILTER",
                 "field": "source_type",
                 "op": "eq",
-                "value": "generated_image",
+                "value": "dialogue_turn",
                 "scope": "current_pool",
             },
             {
                 "tool": "FILTER",
                 "field": "source_type",
                 "op": "eq",
-                "value": "uploaded_image",
+                "value": "dialogue_image",
                 "scope": "current_pool",
             },
         ],
@@ -408,10 +422,10 @@ def test_filter_scope_can_restart_from_full_memory_pool() -> None:
                 "tool": "FILTER",
                 "field": "source_type",
                 "op": "eq",
-                "value": "generated_image",
+                "value": "dialogue_turn",
                 "scope": "current_pool",
             },
-            {"tool": "FILTER", "field": "source_type", "op": "eq", "value": "uploaded_image", "scope": "full_memory"},
+            {"tool": "FILTER", "field": "source_type", "op": "eq", "value": "dialogue_image", "scope": "full_memory"},
         ],
         query="Show user memories after resetting the filter scope.",
         memory_store=store,
@@ -463,7 +477,7 @@ def test_executor_composes_generic_tools_to_latest_user_image() -> None:
                 "tool": "FILTER",
                 "field": "source_type",
                 "op": "eq",
-                "value": "uploaded_image",
+                "value": "dialogue_image",
                 "scope": "current_pool",
             },
             {"tool": "SORT", "field": "timestamp", "order": "desc"},
@@ -493,7 +507,7 @@ def test_timestamp_filter_accepts_date_only_model_values() -> None:
             timestamp="2026-01-02T09:00:00",
             author="user",
             modality="text",
-            source_type="conversation",
+            source_type="dialogue_turn",
             summary="A next-day note.",
         ),
     ]
@@ -709,7 +723,7 @@ async def test_verl_native_opd_tools_share_hidden_state_and_hide_ids() -> None:
     )
     response, _, metrics = await filter_tool.execute(
         "instance",
-        {"field": "source_type", "op": "eq", "value": "uploaded_image", "scope": "current_pool"},
+        {"field": "source_type", "op": "eq", "value": "dialogue_image", "scope": "current_pool"},
         agent_data=agent_data,
     )
 
@@ -727,6 +741,8 @@ async def test_verl_native_opd_tools_share_hidden_state_and_hide_ids() -> None:
     assert agent_data.extra_fields["opd_mm"]["pool_count"] == 1
     assert agent_data.extra_fields["opd_mm"]["evidence_count"] == 1
     assert agent_data.extra_fields["opd_mm"]["evidence"][0]["image_id"] == "D1:IMG_001"
+    assert "source" not in agent_data.extra_fields["opd_mm"]["evidence"][0]
+    assert "author" not in agent_data.extra_fields["opd_mm"]["evidence"][0]
     assert "memory_id" not in json.dumps(agent_data.extra_fields["opd_mm"])
 
 
@@ -746,12 +762,12 @@ async def test_verl_native_filter_scope_can_restart_hidden_pool() -> None:
     )
     await filter_tool.execute(
         "instance",
-        {"field": "source_type", "op": "eq", "value": "generated_image", "scope": "current_pool"},
+        {"field": "source_type", "op": "eq", "value": "dialogue_turn", "scope": "current_pool"},
         agent_data=agent_data,
     )
     response, _, _ = await filter_tool.execute(
         "instance",
-        {"field": "source_type", "op": "eq", "value": "uploaded_image", "scope": "full_memory"},
+        {"field": "source_type", "op": "eq", "value": "dialogue_image", "scope": "full_memory"},
         agent_data=agent_data,
     )
 
@@ -779,7 +795,7 @@ async def test_retrieve_tool_adds_public_evidence_before_inspect_raw() -> None:
     assert observation["evidence_count"] == 2
     assert metrics["opd_mm_evidence_count"] == 2
     assert observation["new_evidence_count"] == 2
-    assert {item["source"] for item in observation["evidence_preview"]} == {"MEMORY"}
+    assert all("source" not in item and "author" not in item for item in observation["evidence_preview"])
     assert {item["modality"] for item in observation["evidence_preview"]} == {"text", "image"}
     image_preview = [item for item in observation["evidence_preview"] if item["modality"] == "image"]
     text_preview = [item for item in observation["evidence_preview"] if item["modality"] == "text"]
@@ -802,7 +818,7 @@ async def test_tool_observation_stays_bounded_when_refreshed_evidence_grows() ->
             timestamp=f"2026-03-{index + 1:02d}T10:00:00",
             author="user",
             modality="text",
-            source_type="conversation",
+            source_type="dialogue_turn",
             summary=f"summary {index}",
             content=f"memory {index} " + ("x" * 1000),
         ).to_dict()
@@ -876,7 +892,8 @@ async def test_inspect_raw_can_use_async_teacher_service_callback() -> None:
     assert calls[0]["query"] == "What is in the cat image?"
     assert observation["error"] == ""
     assert observation["new_evidence_count"] == 1
-    assert observation["evidence_preview"][-1]["source"] == "INSPECT_RAW"
+    assert "source" not in observation["evidence_preview"][-1]
+    assert "author" not in observation["evidence_preview"][-1]
     assert observation["evidence_preview"][-1]["image_id"] == "D1:IMG_001"
     assert observation["evidence_preview"][-1]["visual_observation"] == "Teacher sees a tabby cat sitting on a sofa."
     assert metrics["agent_loop_terminate"] is False
@@ -906,7 +923,7 @@ async def test_verl_native_expand_neighbors_observation_is_visible_next_step() -
     assert observation["pool_count"] == 3
     assert observation["evidence_count"] == 3
     assert observation["new_evidence_count"] == 2
-    assert {item["source"] for item in observation["evidence_preview"]} == {"MEMORY"}
+    assert all("source" not in item and "author" not in item for item in observation["evidence_preview"])
     assert {item["content"] for item in observation["evidence_preview"]} == {
         "The unique middle clue is here.",
         "Previous context before the middle clue.",
@@ -1251,7 +1268,12 @@ class FakeStudent:
             actions=[
                 ToolAction(
                     "FILTER",
-                    {"field": "source_type", "op": "eq", "value": "generated_image", "scope": "full_memory"},
+                    {
+                        "field": "timestamp",
+                        "op": "eq",
+                        "value": "2026-01-01T11:00:00",
+                        "scope": "full_memory",
+                    },
                 ),
                 ToolAction("STOP"),
             ],
@@ -1491,6 +1513,29 @@ def test_teacher_xml_correction_rejects_defaultable_empty_calls() -> None:
     assert extract_canonical_tool_call_xml(
         "<tool_call>\n<function=inspect_raw>\n</function>\n</tool_call>"
     ) is None
+
+
+def test_online_xml_correction_drops_invalid_filter_value() -> None:
+    correction = finalize_online_step_correction(
+        {
+            "sample_id": "invalid-filter-value",
+            "step_index": 2,
+            "allow_inspect_raw": True,
+            "tool_format": "qwen3_coder",
+        },
+        teacher_raw_response=(
+            "<tool_call>\n"
+            "<function=filter>\n"
+            "<parameter=field>\nsource_type\n</parameter>\n"
+            "<parameter=op>\neq\n</parameter>\n"
+            "<parameter=value>\nuser\n</parameter>\n"
+            "<parameter=scope>\ncurrent_pool\n</parameter>\n"
+            "</function>\n"
+            "</tool_call>"
+        ),
+    )
+
+    assert correction is None
 
 
 def test_teacher_xml_correction_recovers_explicit_nonstandard_argument_lines() -> None:
@@ -1954,7 +1999,7 @@ def test_state_verifier_feedback_parser_falls_back_from_expand_neighbors_on_empt
     assert feedback["parse_error"] == ""
 
 
-def test_online_xml_correction_stop_gate_replaces_insufficient_teacher_stop() -> None:
+def test_online_xml_correction_drops_insufficient_teacher_stop() -> None:
     request = {
         "sample_id": "stop-gate",
         "step_index": 0,
@@ -1980,13 +2025,10 @@ def test_online_xml_correction_stop_gate_replaces_insufficient_teacher_stop() ->
         teacher_raw_response="<tool_call>\n<function=stop>\n</function>\n</tool_call>",
     )
 
-    assert correction is not None
-    assert correction["stop_gate_applied"] is True
-    assert correction["teacher_actions"][0]["tool"] == "RETRIEVE"
-    assert "<function=retrieve>" in correction["sft_target_xml"]
+    assert correction is None
 
 
-def test_online_xml_correction_stop_gate_can_fallback_to_expand_neighbors() -> None:
+def test_online_xml_correction_drops_insufficient_teacher_stop_with_candidates() -> None:
     request = {
         "sample_id": "stop-gate-expand",
         "step_index": 1,
@@ -2010,11 +2052,7 @@ def test_online_xml_correction_stop_gate_can_fallback_to_expand_neighbors() -> N
         teacher_raw_response="<tool_call>\n<function=stop>\n</function>\n</tool_call>",
     )
 
-    assert correction is not None
-    assert correction["stop_gate_applied"] is True
-    assert correction["teacher_actions"][0]["tool"] == "EXPAND_NEIGHBORS"
-    assert correction["teacher_actions"][0]["window"] == 1
-    assert "<function=expand_neighbors>" in correction["sft_target_xml"]
+    assert correction is None
 
 
 def test_online_teacher_correction_dump_writes_jsonl(tmp_path, monkeypatch) -> None:
@@ -2107,7 +2145,11 @@ def test_helpers_build_hidden_store_from_dicts_and_schemas() -> None:
         "stop",
     ]
     filter_scope = schemas[0]["function"]["parameters"]["properties"]["scope"]
+    filter_value_description = schemas[0]["function"]["parameters"]["properties"]["value"]["description"]
     assert filter_scope["enum"] == ["current_pool", "full_memory"]
+    assert "source_type uses dialogue_turn or dialogue_image" in filter_value_description
+    assert "modality uses text or image" in filter_value_description
+    assert "MEMORY/user/assistant" not in filter_value_description
     assert "scope" in schemas[0]["function"]["parameters"]["required"]
     assert schemas[3]["function"]["parameters"]["required"] == ["method", "top_k"]
     inspect_schema = openai_tool_schemas(include_inspect_raw=True)[5]
