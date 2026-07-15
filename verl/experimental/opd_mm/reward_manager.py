@@ -102,6 +102,8 @@ def compute_score(
         **score_info,
         "opd_mm/answer_match": answer_match,
         "opd_mm/num_turns": float(info.get("num_turns") or 0),
+        "opd_mm/drop_calls": float(opd_state.get("drop_calls") or 0),
+        "opd_mm/dropped_evidence_count": float(opd_state.get("dropped_evidence_count") or 0),
     }
 
 

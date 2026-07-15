@@ -80,11 +80,12 @@ Each row contains:
 - extra_info.tools_kwargs.opd_mm containing hidden memory records for the
   OPD-MM tools.
 
-The default OPD-MM system prompt introduces the retrieval tools and their use
-cases: RETRIEVE for semantic search, FILTER for metadata constraints, SORT for
-recency/ordering, TOPK for narrowing candidates, INSPECT_RAW for limited raw
-visual/detail inspection, and STOP when enough evidence has been collected.
-It does not include hidden memory records or the gold answer.
+The default OPD-MM system prompt gives policy-level guidance while OpenAI tool
+schemas define each action. Discovery actions merge into a bounded working
+pool; DROP removes irrelevant or duplicate entries by trajectory-local public
+evidence ID. INSPECT_RAW enriches retained image evidence, and STOP ends the
+trajectory when the accumulated evidence is sufficient. Hidden memory IDs and
+the gold answer are never exposed to the student.
 
 The training flow is:
 

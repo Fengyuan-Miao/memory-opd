@@ -272,7 +272,7 @@ def _make_session(qa: dict[str, Any], records: list[dict[str, Any]]) -> OPDToolS
     return OPDToolSession(
         executor=ToolExecutor(
             retriever=TurnAwareHybridRetriever(),
-            validator=TrajectoryValidator(max_actions=8, max_top_k=50, allow_inspect_raw=True),
+            validator=TrajectoryValidator(max_actions=args.max_turns, max_top_k=50, allow_inspect_raw=True),
             max_raw_inspections=3,
         ),
         memory_store=hidden_store_from_records(records),
@@ -700,7 +700,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output", default=DEFAULT_OUTPUT)
     parser.add_argument("--max-samples", type=int, default=80)
     parser.add_argument("--seed", type=int, default=20260705)
-    parser.add_argument("--max-turns", type=int, default=8)
+    parser.add_argument("--max-turns", type=int, default=10)
     parser.add_argument("--tool-format", default="qwen3_coder")
     parser.add_argument("--student-tp", type=int, default=1)
     parser.add_argument("--student-gpu-memory-utilization", type=float, default=0.35)

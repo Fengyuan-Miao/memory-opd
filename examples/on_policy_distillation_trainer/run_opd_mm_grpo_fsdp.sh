@@ -314,7 +314,7 @@ case "${RUN_POST_TRAIN_EVAL,,}" in
             --output "$eval_output" \
             --max-samples 100 \
             --seed "$POST_TRAIN_EVAL_SEED" \
-            --max-turns 8 \
+            --max-turns 10 \
             --student-tp 1 \
             --student-gpu-memory-utilization 0.35 \
             --max-model-len 8192 \

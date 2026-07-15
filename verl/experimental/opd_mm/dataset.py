@@ -26,36 +26,23 @@ import json
 from pathlib import Path
 from typing import Any, Iterable
 
+from verl.experimental.opd_mm.executor import DEFAULT_MAX_POOL_SIZE
 from verl.experimental.opd_mm.models import MemoryRecord, OPDSample
 from verl.experimental.opd_mm.retrieval import HiddenMemoryStore
+from verl.experimental.opd_mm.schema import DEFAULT_MAX_ACTIONS
 
 DEFAULT_DATA_SOURCE = "opd_mm"
 DEFAULT_AGENT_NAME = "tool_agent"
-OPD_MM_SYSTEM_PROMPT = """You are an OPD-MM multimodal memory retrieval planner. Select one tool action per turn to
-gather enough public evidence for the user's question from a hidden memory store. Use only the user question,
-executed action history, and current public observation. Do not invent or expose hidden memory IDs.
+OPD_MM_SYSTEM_PROMPT = """You are an OPD-MM multimodal memory retrieval planner. Select exactly one available tool
+action per turn to gather enough public evidence for the user's question from a hidden memory store. Use only the
+user question, executed action history, and current public observation. Do not invent or expose hidden memory IDs.
 
-The current observation is authoritative: pool-changing tools replace the candidate pool and answer evidence;
-earlier evidence is not accumulated. Choose an action whose effect addresses the unresolved evidence need. If an
-action with the same arguments did not change the state, do not repeat it without a state-based reason.
-
-Tool semantics:
-- RETRIEVE searches the original memory store and replaces the current pool. method=bm25 is lexical text search;
-  dense is semantic text search; vision is image-similarity search; hybrid combines text/caption and visual signals.
-  Set top_k according to the required precision or coverage (1-50). query is an optional public-state-based rewrite;
-  omit it when the user question already expresses the search target.
-- FILTER selects records by public metadata only; it is not semantic content or entity search. Valid fields are
-  modality, source_type, timestamp, and status. scope=full_memory applies an independent filter to the original
-  store; scope=current_pool intersects the current candidates. Either scope replaces the pool and evidence.
-  Mem-Gallery source_type values are dialogue_turn and dialogue_image; date-only timestamps match that whole date.
-- SORT orders the current pool; TOPK truncates it; EXPAND_NEIGHBORS adds same-session turns around existing
-  candidates. These actions require a useful current pool.
-- INSPECT_RAW obtains visual details from image/media records in the current pool. It is not a search tool, cannot
-  inspect an empty pool, and cannot inspect the user's question image directly.
-- STOP ends retrieval. Use it when current public evidence is sufficient, or when an observation reports an
-  unrecoverable error. Inference has no gold-aware validator.
-
-Base all decisions on public state. A public image_id may be used when the question asks for an image or image ID.
+Treat the latest observation as authoritative. Discovery actions add deduplicated memories to the working pool;
+narrowing actions remove or reorder current memories. Use DROP once to remove clearly irrelevant, duplicate, or
+conflicting public evidence IDs after evidence is added or enriched; do not repeat DROP until the evidence revision
+changes, and skip it when the evidence is already useful. Choose actions that address the unresolved evidence need,
+and stop when current evidence is sufficient or the observation reports an unrecoverable error. Inference has no
+gold-aware validator. A public image_id may be used when the question asks for an image or image ID.
 """
 
 
@@ -88,8 +75,8 @@ def opd_messages_for_state(
     """Build an OmniMem-style next-action prompt from the latest state only.
 
     Earlier tool observations are deliberately excluded.  The model receives
-    the compact executed-action list and one authoritative refreshed
-    observation, matching the original interactive OPD prompt structure.
+    the compact executed-action list and one authoritative accumulated
+    observation, matching the interactive OPD prompt structure.
     """
     messages = []
     for message in base_messages:
@@ -100,7 +87,7 @@ def opd_messages_for_state(
     state_text = (
         "\n\nExecuted action history:\n"
         + json.dumps(action_history, ensure_ascii=False, separators=(",", ":"), default=str)
-        + "\n\nCurrent refreshed observation:\n"
+        + "\n\nCurrent accumulated observation:\n"
         + json.dumps(observation, ensure_ascii=False, separators=(",", ":"), default=str)
         + "\n\nChoose the next tool action."
     )
@@ -141,6 +128,8 @@ def opd_sample_to_rlhf_record(
             "question_image": sample.metadata.get("question_image"),
             "allow_inspect_raw": sample.metadata.get("allow_inspect_raw", True),
             "max_raw_inspections": sample.metadata.get("max_raw_inspections", 3),
+            "max_actions": sample.metadata.get("max_actions", DEFAULT_MAX_ACTIONS),
+            "max_pool_size": sample.metadata.get("max_pool_size", DEFAULT_MAX_POOL_SIZE),
         }
     }
     extra_info = dict(sample.metadata.get("extra_info") or {})

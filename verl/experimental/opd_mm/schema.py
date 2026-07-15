@@ -29,9 +29,11 @@ ALLOWED_TOOLS = {
     "TOPK",
     "RETRIEVE",
     "EXPAND_NEIGHBORS",
+    "DROP",
     "INSPECT_RAW",
     "STOP",
 }
+DEFAULT_MAX_ACTIONS = 10
 FILTER_FIELDS = {"modality", "source_type", "timestamp", "status"}
 FILTER_OPS = {"eq", "neq", "before", "after", "contains"}
 FILTER_SCOPES = {"current_pool", "full_memory"}
@@ -54,6 +56,7 @@ FORBIDDEN_ARGUMENT_KEYS = {
     "search_query",
 }
 MEMORY_ID_PATTERN = re.compile(r"\b(?:m|memory|mau)[-_]?\d+\b", re.IGNORECASE)
+EVIDENCE_ID_PATTERN = re.compile(r"^E[1-9]\d*$")
 
 TOOL_SCHEMA_TEXT = """Allowed executable tools:
 FILTER(field=modality|source_type|timestamp|status,
@@ -64,23 +67,25 @@ TOPK(k=positive integer)
 RETRIEVE(method=bm25|dense|vision|hybrid, top_k=positive integer,
          query=optional rewritten search text)
 EXPAND_NEIGHBORS(window=1|2|3)
+DROP(evidence_ids=[public evidence IDs])
 STOP()
 
 Return only a JSON array of tool calls. Do not emit memory IDs. RETRIEVE uses
 the original user query by default; optionally provide query to rewrite the
 search text for the current retrieval step. Every RETRIEVE searches the
-original hidden memory store and replaces the current candidate pool.
-Pool-changing tools refresh the answer evidence from the current candidate pool
-instead of accumulating stale evidence. For timestamp filters, date-only values
+original hidden memory store and merges deduplicated results into the current
+candidate pool. For timestamp filters, date-only values
 such as YYYY-MM-DD match all memory timestamps from that date. FILTER scope is
 required: use full_memory for an independent metadata/date filter over the
-original store; use current_pool only for an intentional intersection with the
-current candidates. Chaining unrelated current_pool filters can empty the pool.
+original store and merge its results; use current_pool only for an intentional
+intersection with the current candidates. Chaining unrelated current_pool filters can empty the pool.
 For Mem-Gallery, source_type values are dialogue_turn and dialogue_image;
 modality values are text and image; status value is active.
 EXPAND_NEIGHBORS adds
 nearby turns around the current candidate pool; use it only after a retrieve or
-filter step has selected relevant candidates."""
+filter step has selected relevant candidates. DROP removes clearly irrelevant,
+duplicate, or conflicting current evidence by its public evidence_id. Submit all
+such IDs in one call, and do not call DROP again until evidence is added or enriched."""
 
 
 def build_tool_schema(allow_inspect_raw: bool = True) -> str:
@@ -104,7 +109,7 @@ class TrajectoryValidationError(ValueError):
 class TrajectoryValidator:
     def __init__(
         self,
-        max_actions: int = 8,
+        max_actions: int = DEFAULT_MAX_ACTIONS,
         max_top_k: int = 50,
         allow_inspect_raw: bool = True,
     ):
@@ -221,6 +226,19 @@ class TrajectoryValidator:
         window = args["window"]
         if not isinstance(window, int) or isinstance(window, bool) or window not in EXPAND_NEIGHBOR_WINDOWS:
             raise TrajectoryValidationError(f"action {index}: window must be one of {sorted(EXPAND_NEIGHBOR_WINDOWS)}")
+
+    def _validate_drop(self, args: Dict[str, Any], index: int) -> None:
+        self._require_exact_keys(args, {"evidence_ids"}, set(), index)
+        evidence_ids = args["evidence_ids"]
+        if not isinstance(evidence_ids, list) or not evidence_ids:
+            raise TrajectoryValidationError(f"action {index}: evidence_ids must be a non-empty list")
+        if len(evidence_ids) != len(set(evidence_ids)):
+            raise TrajectoryValidationError(f"action {index}: evidence_ids must be unique")
+        if any(
+            not isinstance(value, str) or EVIDENCE_ID_PATTERN.fullmatch(value.strip()) is None
+            for value in evidence_ids
+        ):
+            raise TrajectoryValidationError(f"action {index}: invalid public evidence_id")
 
     def _validate_inspect_raw(self, args: Dict[str, Any], index: int) -> None:
         self._require_exact_keys(args, set(), {"target", "instruction"}, index)

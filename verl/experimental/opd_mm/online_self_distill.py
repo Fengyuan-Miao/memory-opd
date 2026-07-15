@@ -41,7 +41,7 @@ HERMES_TOOL_CALL_XML_RE = re.compile(r"<tool_call>(.*?)</tool_call>", re.DOTALL)
 QWEN3_FUNCTION_RE = re.compile(r"<function=(.*?)</function>|<function=(.*)$", re.DOTALL)
 QWEN3_PARAMETER_START_RE = re.compile(r"<parameter=([^>\n]+)>", re.DOTALL)
 QWEN3_INLINE_XML_ARG_RE = re.compile(
-    r"<(field|op|value|scope|method|top_k|query|target|instruction|window|k|order)=([^>\n]+)>",
+    r"<(field|op|value|scope|method|top_k|query|target|instruction|window|k|order|evidence_ids)=([^>\n]+)>",
     re.IGNORECASE,
 )
 QWEN3_KEY_VALUE_ARG_RE = re.compile(
@@ -54,6 +54,7 @@ _TOOL_CALL_NAME_BY_ACTION = {
     "TOPK": "topk",
     "RETRIEVE": "retrieve",
     "EXPAND_NEIGHBORS": "expand_neighbors",
+    "DROP": "drop",
     "INSPECT_RAW": "inspect_raw",
     "STOP": "stop",
 }
@@ -252,6 +253,22 @@ def _observation_pool_count(observation: dict[str, Any]) -> int:
         if isinstance(items, list):
             return len(items)
     return 0
+
+
+def _observation_evidence_ids(observation: dict[str, Any]) -> set[str]:
+    """Return public IDs that the teacher is allowed to reference in DROP."""
+    evidence_ids: set[str] = set()
+    for key in ("evidence_catalog", "evidence_preview", "pool_preview", "evidence"):
+        items = observation.get(key)
+        if not isinstance(items, list):
+            continue
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            evidence_id = str(item.get("evidence_id") or "").strip()
+            if evidence_id:
+                evidence_ids.add(evidence_id)
+    return evidence_ids
 
 
 def _observation_has_candidate_context(observation: dict[str, Any]) -> bool:
@@ -604,6 +621,8 @@ def _normalize_teacher_tool_action(action: ToolAction) -> ToolAction:
             args["target"] = str(args["target"]).strip().lower()
         if "instruction" in args:
             args["instruction"] = str(args["instruction"]).strip()
+    elif tool == "DROP" and isinstance(args.get("evidence_ids"), list):
+        args["evidence_ids"] = [str(value).strip().upper() for value in args["evidence_ids"]]
     return ToolAction(tool, args)
 
 
@@ -615,6 +634,8 @@ def _has_explicit_teacher_sft_arguments(action: ToolAction) -> bool:
         return "method" in args and "top_k" in args
     if tool == "INSPECT_RAW":
         return "target" in args and "instruction" in args
+    if tool == "DROP":
+        return "evidence_ids" in args
     return True
 
 
@@ -870,7 +891,8 @@ argument. A RETRIEVE.query may use only public question/history/observation text
 
 Choose the schema-described tool whose effect addresses the gap and whose preconditions hold. Do not repeat an
 identical action when the latest observation is unchanged. Emit exactly one function call with no reasoning,
-markdown, JSON, memory IDs, or unknown arguments. The chat template supplies the tool descriptions and serialization.
+markdown, JSON, hidden memory IDs, or unknown arguments. Public evidence_id values may be copied only into
+DROP.evidence_ids. The chat template supplies the tool descriptions and serialization.
 
 Question:
 {query}
@@ -1082,6 +1104,15 @@ def finalize_online_step_correction(
     sample_id = str(request["sample_id"])
     step_index = int(request["step_index"])
     verifier_feedback = _as_dict(request.get("verifier_feedback"))
+    if teacher_action.tool == "DROP":
+        observation = _as_dict(request.get("observation"))
+        requested_ids = set(teacher_action.arguments.get("evidence_ids") or [])
+        if not requested_ids or not requested_ids.issubset(_observation_evidence_ids(observation)):
+            return None
+        evidence_revision = int(observation.get("evidence_revision") or 0)
+        last_drop_revision = int(observation.get("last_drop_revision") or 0)
+        if evidence_revision <= last_drop_revision:
+            return None
     if teacher_action.tool == "STOP" and verifier_feedback and not bool(verifier_feedback.get("evidence_sufficient")):
         # Do not turn a privileged STOP rejection into a synthetic action. The
         # state is not a valid teacher target and must be excluded from SFT.

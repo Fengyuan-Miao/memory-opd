@@ -15,8 +15,8 @@
 """verl-native tool adapters for the OPD-MM hidden-memory executor.
 
 These tools keep per-trajectory state through the agent_data object supplied by
-ToolAgentLoop. That lets FILTER, SORT, TOPK, RETRIEVE, EXPAND_NEIGHBORS,
-INSPECT_RAW, and STOP behave like the original OPD-MM sequential action space
+ToolAgentLoop. That lets FILTER, SORT, TOPK, RETRIEVE, EXPAND_NEIGHBORS, DROP,
+INSPECT_RAW, and STOP share one bounded working evidence pool
 while still exposing OpenAI function schemas to verl.
 """
 
@@ -29,15 +29,16 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Any, Optional
 
-from verl.experimental.opd_mm.executor import ToolExecutor
+from verl.experimental.opd_mm.executor import DEFAULT_MAX_POOL_SIZE, ToolExecutor
 from verl.experimental.opd_mm.models import EvidenceItem, ExecutionStep, MemoryRecord, PoolItem, ToolAction
 from verl.experimental.opd_mm.raw_inspector import DEFAULT_RAW_INSPECTOR_URL, RemoteVLLMRawInspector
 from verl.experimental.opd_mm.retrieval import HiddenMemoryStore, TurnAwareHybridRetriever
 from verl.experimental.opd_mm.schema import (
+    DEFAULT_MAX_ACTIONS,
+    EXPAND_NEIGHBOR_WINDOWS,
     FILTER_FIELDS,
     FILTER_OPS,
     FILTER_SCOPES,
-    EXPAND_NEIGHBOR_WINDOWS,
     INSPECT_INSTRUCTIONS,
     INSPECT_TARGETS,
     RETRIEVAL_METHODS,
@@ -57,6 +58,7 @@ DEFAULT_HYBRID_MODEL_PATH = "/home/miaofy/data/pretrained_models/gme-Qwen2-VL-2B
 DEFAULT_RAW_INSPECTOR_TIMEOUT = 60.0
 DEFAULT_RAW_INSPECTOR_MAX_TOKENS = 256
 OBSERVATION_TEXT_MAX_CHARS = 220
+OBSERVATION_CATALOG_TEXT_MAX_CHARS = 96
 OBSERVATION_POOL_PREVIEW_ITEMS = 3
 OBSERVATION_EVIDENCE_PREVIEW_ITEMS = 4
 
@@ -376,13 +378,16 @@ def hidden_store_from_records(
     return HiddenMemoryStore(built)
 
 
-def _sanitize_evidence(items: list[EvidenceItem]) -> list[dict[str, Any]]:
+def _sanitize_evidence(
+    items: list[EvidenceItem], evidence_ids_by_memory: dict[str, str]
+) -> list[dict[str, Any]]:
     sanitized = []
     for item in items:
         data = item.to_dict()
         data.pop("memory_id", None)
         data.pop("source", None)
         data.pop("author", None)
+        data["evidence_id"] = evidence_ids_by_memory[item.memory_id]
         sanitized.append(data)
     return sanitized
 
@@ -395,15 +400,16 @@ def _clip_text(value: Any, max_chars: int = OBSERVATION_TEXT_MAX_CHARS) -> Any:
 
 def _sanitize_evidence_preview(
     items: list[EvidenceItem],
+    evidence_ids_by_memory: dict[str, str],
     max_items: int = OBSERVATION_EVIDENCE_PREVIEW_ITEMS,
 ) -> list[dict[str, Any]]:
-    """Return a compact, internal-ID-free evidence preview for tool observations."""
+    """Return a compact evidence preview with trajectory-local public IDs."""
     preview = []
     for item in items[-max_items:]:
         data = item.to_dict()
         data.pop("memory_id", None)
         fields = data.get("fields") if isinstance(data.get("fields"), dict) else data
-        entry: dict[str, Any] = {}
+        entry: dict[str, Any] = {"evidence_id": evidence_ids_by_memory[item.memory_id]}
         for key in (
             "image_id",
             "content",
@@ -423,14 +429,16 @@ def _sanitize_evidence_preview(
 
 def _sanitize_pool_preview(
     items: list[PoolItem],
+    evidence_ids_by_memory: dict[str, str],
     max_items: int = OBSERVATION_POOL_PREVIEW_ITEMS,
 ) -> list[dict[str, Any]]:
-    """Return an internal-ID-free preview of the current hidden pool for tool observations."""
+    """Return an internal-ID-free preview of the current working pool."""
     preview = []
     for item in items[:max_items]:
         memory = item.memory
         content = memory.content or memory.summary
         entry = {
+            "evidence_id": evidence_ids_by_memory[memory.memory_id],
             "image_id": memory.public_image_id(),
             "content": _clip_text(content) if content else None,
             "timestamp": memory.timestamp,
@@ -441,6 +449,53 @@ def _sanitize_pool_preview(
             entry["retrieval_score"] = item.score
         preview.append({key: value for key, value in entry.items() if value is not None})
     return preview
+
+
+def _sanitize_evidence_catalog(
+    pool: list[PoolItem],
+    evidence: list[EvidenceItem],
+    evidence_ids_by_memory: dict[str, str],
+) -> list[dict[str, Any]]:
+    """Return every droppable candidate with enough public content for relevance decisions."""
+    fields_by_memory: dict[str, dict[str, Any]] = {}
+    for item in evidence:
+        fields_by_memory.setdefault(item.memory_id, {}).update(item.fields)
+
+    catalog = []
+    for item in pool:
+        memory = item.memory
+        fields = fields_by_memory.get(memory.memory_id, {})
+        entry: dict[str, Any] = {
+            "evidence_id": evidence_ids_by_memory[memory.memory_id],
+            "content": _clip_text(
+                fields.get("content") or memory.content or memory.summary,
+                OBSERVATION_CATALOG_TEXT_MAX_CHARS,
+            ),
+            "visual_observation": _clip_text(
+                fields.get("visual_observation"),
+                OBSERVATION_CATALOG_TEXT_MAX_CHARS,
+            ),
+            "image_id": memory.public_image_id(),
+            "timestamp": memory.timestamp,
+            "modality": memory.modality,
+        }
+        catalog.append({key: value for key, value in entry.items() if value not in (None, "")})
+    return catalog
+
+
+def _update_dynamic_drop_schema(agent_data: Any, evidence_ids: list[str]) -> None:
+    """Constrain the next DROP call to IDs visible in the current observation."""
+    active_tools = getattr(agent_data, "_active_tools", None)
+    if not isinstance(active_tools, dict):
+        return
+    schemas = []
+    for tool in active_tools.values():
+        schema = tool.tool_schema.model_dump(exclude_unset=True, exclude_none=True)
+        if schema.get("function", {}).get("name") == "drop":
+            items = schema["function"]["parameters"]["properties"]["evidence_ids"].setdefault("items", {})
+            items["enum"] = list(evidence_ids)
+        schemas.append(schema)
+    agent_data._active_tool_schemas = schemas
 
 
 @dataclass
@@ -460,6 +515,12 @@ class OPDToolSession:
     error: str = ""
     pool_has_candidates: bool = False
     max_actions_reached: bool = False
+    evidence_ids_by_memory: dict[str, str] = field(default_factory=dict)
+    evidence_revision: int = 0
+    last_drop_revision: int = 0
+    pool_overflow_count: int = 0
+    drop_calls: int = 0
+    dropped_evidence_count: int = 0
 
     def __post_init__(self) -> None:
         if not self.pool:
@@ -470,6 +531,7 @@ class OPDToolSession:
         before = len(self.pool)
         step_error = ""
         new_evidence: list[EvidenceItem] = []
+        self.pool_overflow_count = 0
 
         if self.stopped:
             return self._observation(action, [], "trajectory already stopped")
@@ -480,10 +542,11 @@ class OPDToolSession:
                 action = ToolAction("STOP")
             self.executor.validator._validate_action(action, len(self.trace))
             if action.tool == "FILTER":
+                scope = action.arguments["scope"]
                 source_pool = self.executor._filter_source_pool(
                     self.pool,
                     self.memory_store,
-                    action.arguments["scope"],
+                    scope,
                 )
                 filtered = self.executor._filter(
                     source_pool,
@@ -491,7 +554,12 @@ class OPDToolSession:
                     op=action.arguments["op"],
                     value=action.arguments["value"],
                 )
-                self.pool = filtered
+                if scope == "full_memory":
+                    self.pool, self.pool_overflow_count = self.executor._merge_discovery_pool(
+                        self.pool, filtered, self.pool_has_candidates
+                    )
+                else:
+                    self.pool = filtered[: self.executor.max_pool_size]
                 self.pool_has_candidates = True
                 new_evidence = self.executor._refresh_evidence_from_pool(
                     self.evidence, self.pool, source="FILTER"
@@ -518,7 +586,9 @@ class OPDToolSession:
                     top_k=action.arguments.get("top_k", 5),
                     question_image=self.question_image,
                 )
-                self.pool = retrieved
+                self.pool, self.pool_overflow_count = self.executor._merge_discovery_pool(
+                    self.pool, retrieved, self.pool_has_candidates
+                )
                 self.pool_has_candidates = True
                 new_evidence = self.executor._refresh_evidence_from_pool(
                     self.evidence, self.pool, source="RETRIEVE"
@@ -531,11 +601,29 @@ class OPDToolSession:
                     self.memory_store,
                     action.arguments["window"],
                 )
-                self.pool = self.executor._merge_pools(self.pool, expanded)
+                self.pool, self.pool_overflow_count = self.executor._merge_discovery_pool(
+                    self.pool,
+                    expanded,
+                    self.pool_has_candidates,
+                    prioritize_incoming=False,
+                )
                 self.pool_has_candidates = True
                 new_evidence = self.executor._refresh_evidence_from_pool(
                     self.evidence, self.pool, source="EXPAND_NEIGHBORS"
                 )
+            elif action.tool == "DROP":
+                if self.evidence_revision <= self.last_drop_revision:
+                    raise ValueError("DROP requires evidence added or enriched since the previous DROP")
+                self.pool = self.executor._drop_pool(
+                    self.pool,
+                    action.arguments["evidence_ids"],
+                    self.evidence_ids_by_memory,
+                )
+                self.pool_has_candidates = True
+                self.executor._refresh_evidence_from_pool(self.evidence, self.pool, source="DROP")
+                self.last_drop_revision = self.evidence_revision
+                self.drop_calls += 1
+                self.dropped_evidence_count += len(action.arguments["evidence_ids"])
             elif action.tool == "INSPECT_RAW":
                 remaining = max(0, self.executor.max_raw_inspections - self.raw_calls)
                 inspected = self.executor._inspect_raw(
@@ -552,6 +640,11 @@ class OPDToolSession:
         except Exception as exc:
             step_error = str(exc)
             self.error = step_error
+
+        if self.pool_has_candidates:
+            self.executor._ensure_public_evidence_ids(self.pool, self.evidence_ids_by_memory)
+        if new_evidence:
+            self.evidence_revision += 1
 
         self.trace.append(action)
         self.steps.append(
@@ -631,6 +724,8 @@ class OPDToolSession:
                 )
             self.raw_calls += len(inspected)
             self.evidence.extend(inspected)
+            if inspected:
+                self.evidence_revision += 1
         except Exception as exc:
             step_error = str(exc)
             self.error = step_error
@@ -649,33 +744,77 @@ class OPDToolSession:
         return self._observation(action, inspected, step_error)
 
     def _observation(self, action: ToolAction, new_evidence: list[EvidenceItem], error: str) -> dict[str, Any]:
-        """Return a bounded snapshot of the refreshed state.
+        """Return a bounded snapshot of the current accumulated state.
 
         ToolAgentLoop already keeps the assistant tool call in message history,
         so repeating its full arguments here only grows the prompt.  Candidate
         and evidence previews have fixed item and text limits regardless of the
         size of the current pool.
         """
-        return {
-            "refresh_state": True,
+        visible_pool = self.pool if self.pool_has_candidates else []
+        self.executor._ensure_public_evidence_ids(visible_pool, self.evidence_ids_by_memory)
+        new_evidence_ids = list(
+            dict.fromkeys(
+                self.evidence_ids_by_memory[item.memory_id]
+                for item in new_evidence
+                if item.memory_id in self.evidence_ids_by_memory
+            )
+        )
+        observation = {
+            "refresh_state": False,
             "tool": action.tool,
-            "pool_count": len(self.pool),
+            "pool_count": len(visible_pool),
+            "pool_capacity": self.executor.max_pool_size,
+            "pool_overflow_count": self.pool_overflow_count,
             "evidence_count": len(self.evidence),
-            "pool_preview": _sanitize_pool_preview(self.pool),
+            "evidence_memory_count": len(visible_pool),
+            "pool_preview": _sanitize_pool_preview(visible_pool, self.evidence_ids_by_memory),
             "new_evidence_count": len(new_evidence),
-            "evidence_preview": _sanitize_evidence_preview(self.evidence),
+            "new_evidence_ids": new_evidence_ids,
+            "evidence_revision": self.evidence_revision,
+            "last_drop_revision": self.last_drop_revision,
+            "drop_calls": self.drop_calls,
+            "dropped_evidence_count": self.dropped_evidence_count,
+            "evidence_catalog": _sanitize_evidence_catalog(
+                visible_pool,
+                self.evidence,
+                self.evidence_ids_by_memory,
+            ),
+            "evidence_preview": _sanitize_evidence_preview(
+                self.evidence,
+                self.evidence_ids_by_memory,
+            ),
             "stopped": self.stopped,
             "error": _clip_text(error),
         }
+        if action.tool == "DROP" and not error:
+            observation["dropped_evidence_ids"] = [
+                str(value).strip() for value in action.arguments.get("evidence_ids", [])
+            ]
+        return observation
 
     def public_state(self) -> dict[str, Any]:
         """Return serializable public state for AgentLoopOutput.extra_fields."""
+        visible_pool = self.pool if self.pool_has_candidates else []
+        self.executor._ensure_public_evidence_ids(visible_pool, self.evidence_ids_by_memory)
         return {
             "query": self.query,
-            "pool_count": len(self.pool),
+            "pool_count": len(visible_pool),
+            "pool_capacity": self.executor.max_pool_size,
+            "pool_overflow_count": self.pool_overflow_count,
             "evidence_count": len(self.evidence),
-            "pool_preview": _sanitize_pool_preview(self.pool),
-            "evidence": _sanitize_evidence(self.evidence),
+            "evidence_memory_count": len(visible_pool),
+            "pool_preview": _sanitize_pool_preview(visible_pool, self.evidence_ids_by_memory),
+            "evidence_catalog": _sanitize_evidence_catalog(
+                visible_pool,
+                self.evidence,
+                self.evidence_ids_by_memory,
+            ),
+            "evidence": _sanitize_evidence(self.evidence, self.evidence_ids_by_memory),
+            "evidence_revision": self.evidence_revision,
+            "last_drop_revision": self.last_drop_revision,
+            "drop_calls": self.drop_calls,
+            "dropped_evidence_count": self.dropped_evidence_count,
             "trace": [action.to_dict() for action in self.trace],
             "stopped": self.stopped,
             "error": self.error,
@@ -703,6 +842,11 @@ class OPDBaseTool(BaseTool):
         session = self._session(agent_data)
         action = self._action(parameters)
         observation = session.execute(action)
+        if agent_data is not None:
+            _update_dynamic_drop_schema(
+                agent_data,
+                [item["evidence_id"] for item in observation.get("evidence_catalog", [])],
+            )
         if agent_data is not None and hasattr(agent_data, "extra_fields"):
             agent_data.extra_fields["opd_mm"] = session.public_state()
             agent_data.extra_fields["opd_mm_prompt_state"] = {
@@ -713,6 +857,8 @@ class OPDBaseTool(BaseTool):
         return ToolResponse(text=json.dumps(observation, ensure_ascii=False)), 0.0, {
             "opd_mm_pool_count": observation["pool_count"],
             "opd_mm_evidence_count": observation["evidence_count"],
+            "opd_mm_drop_calls": observation["drop_calls"],
+            "opd_mm_dropped_evidence_count": observation["dropped_evidence_count"],
             "opd_mm_terminate": terminate_agent_loop,
             "agent_loop_terminate": terminate_agent_loop,
         }
@@ -758,11 +904,12 @@ class OPDBaseTool(BaseTool):
                 retriever=runtime.get("retriever") or TurnAwareHybridRetriever(),
                 raw_inspector=_raw_inspector_from_runtime(runtime),
                 validator=runtime.get("validator") or TrajectoryValidator(
-                    max_actions=int(runtime.get("max_actions", 8)),
+                    max_actions=int(runtime.get("max_actions", DEFAULT_MAX_ACTIONS)),
                     max_top_k=int(runtime.get("max_top_k", 50)),
                     allow_inspect_raw=bool(runtime.get("allow_inspect_raw", True)),
                 ),
                 max_raw_inspections=int(runtime.get("max_raw_inspections", 3)),
+                max_pool_size=int(runtime.get("max_pool_size", DEFAULT_MAX_POOL_SIZE)),
             ),
             memory_store=store,
             query=str(query or ""),
@@ -869,6 +1016,25 @@ class OPDExpandNeighborsTool(OPDBaseTool):
     required = ["window"]
 
 
+class OPDDropTool(OPDBaseTool):
+    tool_name = "drop"
+    description = (
+        "Remove clearly irrelevant, duplicate, or conflicting memories from the current candidate pool using "
+        "their public evidence_id values. Submit all removals in one call. Do not call again until a later action "
+        "adds or enriches evidence; omit this action when the current evidence is already useful."
+    )
+    properties = {
+        "evidence_ids": {
+            "type": "array",
+            "description": "Non-empty unique list of public E1/E2/... IDs from the current evidence_catalog.",
+            "items": {"type": "string", "pattern": "^E[1-9][0-9]*$"},
+            "minItems": 1,
+            "uniqueItems": True,
+        }
+    }
+    required = ["evidence_ids"]
+
+
 class OPDInspectRawTool(OPDBaseTool):
     tool_name = "inspect_raw"
     description = (
@@ -900,6 +1066,11 @@ class OPDInspectRawTool(OPDBaseTool):
 
             inspect_fn = unavailable
         observation = await session.execute_inspect_raw_with_teacher(action, inspect_fn)
+        if agent_data is not None:
+            _update_dynamic_drop_schema(
+                agent_data,
+                [item["evidence_id"] for item in observation.get("evidence_catalog", [])],
+            )
         if agent_data is not None and hasattr(agent_data, "extra_fields"):
             agent_data.extra_fields["opd_mm"] = session.public_state()
             agent_data.extra_fields["opd_mm_prompt_state"] = {
@@ -910,6 +1081,8 @@ class OPDInspectRawTool(OPDBaseTool):
         return ToolResponse(text=json.dumps(observation, ensure_ascii=False)), 0.0, {
             "opd_mm_pool_count": observation["pool_count"],
             "opd_mm_evidence_count": observation["evidence_count"],
+            "opd_mm_drop_calls": observation["drop_calls"],
+            "opd_mm_dropped_evidence_count": observation["dropped_evidence_count"],
             "opd_mm_terminate": terminate_agent_loop,
             "agent_loop_terminate": terminate_agent_loop,
         }
@@ -928,24 +1101,36 @@ OPD_TOOL_CLASSES = [
     OPDTopKTool,
     OPDRetrieveTool,
     OPDExpandNeighborsTool,
+    OPDDropTool,
     OPDInspectRawTool,
     OPDStopTool,
 ]
 
 
-def openai_tool_schemas(include_inspect_raw: bool = True) -> list[dict[str, Any]]:
+def openai_tool_schemas(
+    include_inspect_raw: bool = True,
+    evidence_ids: Optional[list[str]] = None,
+) -> list[dict[str, Any]]:
     """Return OpenAI tool schemas for OPD-MM tools."""
     classes = (
         OPD_TOOL_CLASSES
         if include_inspect_raw
         else [cls for cls in OPD_TOOL_CLASSES if cls is not OPDInspectRawTool]
     )
-    return [
+    schemas = [
         _schema(cls.tool_name, cls.description, cls.properties, cls.required).model_dump(
             exclude_unset=True, exclude_none=True
         )
         for cls in classes
     ]
+    if evidence_ids is not None:
+        for schema in schemas:
+            if schema["function"]["name"] != "drop":
+                continue
+            schema["function"]["parameters"]["properties"]["evidence_ids"]["items"]["enum"] = list(
+                evidence_ids
+            )
+    return schemas
 
 
 __all__ = [

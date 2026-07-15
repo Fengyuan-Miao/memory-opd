@@ -56,6 +56,7 @@ from verl.experimental.opd_mm.teacher_privilege import (
     build_teacher_privileged_prompt,
 )
 from verl.experimental.opd_mm.tools import (
+    OPDDropTool,
     OPDExpandNeighborsTool,
     OPDFilterTool,
     OPDInspectRawTool,
@@ -356,6 +357,17 @@ def test_validator_accepts_expand_neighbors_and_rejects_invalid_arguments() -> N
         validator.validate([{"tool": "EXPAND_NEIGHBORS", "window": 1, "memory_id": "safe"}])
 
 
+def test_validator_accepts_drop_public_ids_and_rejects_invalid_sets() -> None:
+    validator = TrajectoryValidator(max_actions=4)
+
+    validated = validator.validate([{"tool": "DROP", "evidence_ids": ["E1", "E12"]}])
+    assert validated[0] == ToolAction("DROP", {"evidence_ids": ["E1", "E12"]})
+
+    for evidence_ids in ([], ["E0"], ["m_001"], ["E1", "E1"], "E1"):
+        with pytest.raises(TrajectoryValidationError):
+            validator.validate([{"tool": "DROP", "evidence_ids": evidence_ids}])
+
+
 def test_opd_state_prompt_keeps_action_history_and_only_latest_observation() -> None:
     base = opd_messages_for_query("Where did Maya travel?")
     first = opd_messages_for_state(
@@ -432,13 +444,13 @@ def test_filter_scope_can_restart_from_full_memory_pool() -> None:
         query="Show user memories after resetting the filter scope.",
         memory_store=store,
     )
-    assert reset_result.final_memory_ids == ["m_cat_image"]
+    assert reset_result.final_memory_ids == ["m_cat_image", "m_assistant_image"]
     assert reset_result.steps[2].pool_before == 1
-    assert reset_result.steps[2].pool_after == 1
+    assert reset_result.steps[2].pool_after == 2
     assert len({item.memory_id for item in reset_result.evidence}) == len(reset_result.evidence)
 
 
-def test_repeated_retrieve_replaces_pool_by_default() -> None:
+def test_repeated_retrieve_merges_pool_by_default() -> None:
     result = ToolExecutor(retriever=QuerySwitchRetriever()).run(
         [
             {"tool": "RETRIEVE", "method": "hybrid", "top_k": 1, "query": "cat"},
@@ -449,6 +461,23 @@ def test_repeated_retrieve_replaces_pool_by_default() -> None:
         memory_store=HiddenMemoryStore(_records()),
     )
 
+    assert result.final_memory_ids == ["m_assistant_image", "m_cat_text"]
+    assert [item.memory_id for item in result.evidence] == ["m_assistant_image", "m_cat_text"]
+
+
+def test_drop_removes_public_evidence_ids_from_merged_pool() -> None:
+    result = ToolExecutor(retriever=QuerySwitchRetriever()).run(
+        [
+            {"tool": "RETRIEVE", "method": "hybrid", "top_k": 1, "query": "cat"},
+            {"tool": "RETRIEVE", "method": "hybrid", "top_k": 1, "query": "assistant"},
+            {"tool": "DROP", "evidence_ids": ["E1"]},
+            {"tool": "STOP"},
+        ],
+        query="Find multiple memories.",
+        memory_store=HiddenMemoryStore(_records()),
+    )
+
+    assert not result.error
     assert result.final_memory_ids == ["m_assistant_image"]
     assert [item.memory_id for item in result.evidence] == ["m_assistant_image"]
 
@@ -467,7 +496,7 @@ def test_repeated_retrieve_always_searches_original_memory_store() -> None:
     assert not result.error
     assert retriever.source_pool_ids[0] == ["m_text_old", "m_cat_text", "m_cat_image", "m_assistant_image"]
     assert retriever.source_pool_ids[1] == ["m_text_old", "m_cat_text", "m_cat_image", "m_assistant_image"]
-    assert result.final_memory_ids == ["m_text_old"]
+    assert result.final_memory_ids == ["m_text_old", "m_cat_text"]
 
 
 def test_executor_composes_generic_tools_to_latest_user_image() -> None:
@@ -734,6 +763,8 @@ async def test_verl_native_opd_tools_share_hidden_state_and_hide_ids() -> None:
     assert observation["pool_preview"][0]["content"] == "A tabby cat sitting on a sofa."
     assert observation["pool_preview"][0]["image_id"] == "D1:IMG_001"
     assert observation["evidence_preview"][0]["image_id"] == "D1:IMG_001"
+    assert observation["pool_preview"][0]["evidence_id"] == "E1"
+    assert observation["evidence_preview"][0]["evidence_id"] == "E1"
     assert "raw_pointer" not in observation["pool_preview"][0]
     assert "summary" not in observation["pool_preview"][0]
     assert "source_type" not in observation["pool_preview"][0]
@@ -743,13 +774,14 @@ async def test_verl_native_opd_tools_share_hidden_state_and_hide_ids() -> None:
     assert agent_data.extra_fields["opd_mm"]["pool_count"] == 1
     assert agent_data.extra_fields["opd_mm"]["evidence_count"] == 1
     assert agent_data.extra_fields["opd_mm"]["evidence"][0]["image_id"] == "D1:IMG_001"
+    assert agent_data.extra_fields["opd_mm"]["evidence"][0]["evidence_id"] == "E1"
     assert "source" not in agent_data.extra_fields["opd_mm"]["evidence"][0]
     assert "author" not in agent_data.extra_fields["opd_mm"]["evidence"][0]
     assert "memory_id" not in json.dumps(agent_data.extra_fields["opd_mm"])
 
 
 @pytest.mark.asyncio
-async def test_verl_native_filter_scope_can_restart_hidden_pool() -> None:
+async def test_verl_native_full_memory_filter_merges_into_hidden_pool() -> None:
     records = [record.to_dict() for record in _records()]
     agent_data = FakeAgentData(
         messages=[{"role": "user", "content": "Find user memories."}],
@@ -774,8 +806,8 @@ async def test_verl_native_filter_scope_can_restart_hidden_pool() -> None:
     )
 
     observation = json.loads(response.text)
-    assert observation["pool_count"] == 1
-    assert observation["evidence_count"] == 1
+    assert observation["pool_count"] == 2
+    assert observation["evidence_count"] == 2
 
 
 @pytest.mark.asyncio
@@ -797,6 +829,10 @@ async def test_retrieve_tool_adds_public_evidence_before_inspect_raw() -> None:
     assert observation["evidence_count"] == 2
     assert metrics["opd_mm_evidence_count"] == 2
     assert observation["new_evidence_count"] == 2
+    assert observation["new_evidence_ids"] == ["E1", "E2"]
+    assert observation["evidence_revision"] == 1
+    assert observation["last_drop_revision"] == 0
+    assert [item["evidence_id"] for item in observation["evidence_catalog"]] == ["E1", "E2"]
     assert all("source" not in item and "author" not in item for item in observation["evidence_preview"])
     assert {item["modality"] for item in observation["evidence_preview"]} == {"text", "image"}
     image_preview = [item for item in observation["evidence_preview"] if item["modality"] == "image"]
@@ -812,6 +848,123 @@ async def test_retrieve_tool_adds_public_evidence_before_inspect_raw() -> None:
 
 
 @pytest.mark.asyncio
+async def test_verl_native_retrieve_merges_and_drop_is_atomic() -> None:
+    records = [record.to_dict() for record in _records()]
+    agent_data = FakeAgentData(
+        messages=[{"role": "user", "content": "Find the cat and assistant image."}],
+        tools_kwargs={
+            "opd_mm": {
+                "query": "Find the cat and assistant image.",
+                "records": records,
+                "retriever": QuerySwitchRetriever(),
+                "vector_store_dir": None,
+            }
+        },
+    )
+    retrieve_tool = OPDRetrieveTool(config={"type": "native"}, tool_schema=None)
+    drop_tool = OPDDropTool(config={"type": "native"}, tool_schema=None)
+    agent_data._active_tools = {"retrieve": retrieve_tool, "drop": drop_tool}
+
+    first, _, _ = await retrieve_tool.execute(
+        "instance", {"method": "hybrid", "top_k": 1, "query": "cat"}, agent_data=agent_data
+    )
+    second, _, _ = await retrieve_tool.execute(
+        "instance", {"method": "hybrid", "top_k": 1, "query": "assistant"}, agent_data=agent_data
+    )
+    first_observation = json.loads(first.text)
+    second_observation = json.loads(second.text)
+    assert first_observation["evidence_catalog"][0]["evidence_id"] == "E1"
+    assert [item["evidence_id"] for item in second_observation["evidence_catalog"]] == ["E2", "E1"]
+    dynamic_drop_schema = next(
+        schema for schema in agent_data._active_tool_schemas if schema["function"]["name"] == "drop"
+    )
+    assert dynamic_drop_schema["function"]["parameters"]["properties"]["evidence_ids"]["items"]["enum"] == [
+        "E2",
+        "E1",
+    ]
+
+    failed, _, failed_metrics = await drop_tool.execute(
+        "instance", {"evidence_ids": ["E1", "E999"]}, agent_data=agent_data
+    )
+    failed_observation = json.loads(failed.text)
+    assert "unknown current evidence IDs" in failed_observation["error"]
+    assert failed_observation["pool_count"] == 2
+    assert failed_metrics["agent_loop_terminate"] is True
+
+    clean_agent_data = FakeAgentData(
+        messages=[{"role": "user", "content": "Find the cat and assistant image."}],
+        tools_kwargs={
+            "opd_mm": {
+                "query": "Find the cat and assistant image.",
+                "records": records,
+                "retriever": QuerySwitchRetriever(),
+                "vector_store_dir": None,
+            }
+        },
+    )
+    await retrieve_tool.execute(
+        "instance", {"method": "hybrid", "top_k": 1, "query": "cat"}, agent_data=clean_agent_data
+    )
+    await retrieve_tool.execute(
+        "instance", {"method": "hybrid", "top_k": 1, "query": "assistant"}, agent_data=clean_agent_data
+    )
+    dropped, _, _ = await drop_tool.execute(
+        "instance", {"evidence_ids": ["E1"]}, agent_data=clean_agent_data
+    )
+    dropped_observation = json.loads(dropped.text)
+    assert dropped_observation["pool_count"] == 1
+    assert dropped_observation["evidence_count"] == 1
+    assert dropped_observation["dropped_evidence_ids"] == ["E1"]
+    assert dropped_observation["last_drop_revision"] == dropped_observation["evidence_revision"]
+    assert dropped_observation["evidence_catalog"][0]["evidence_id"] == "E2"
+    repeated, _, repeated_metrics = await drop_tool.execute(
+        "instance", {"evidence_ids": ["E2"]}, agent_data=clean_agent_data
+    )
+    repeated_observation = json.loads(repeated.text)
+    assert "requires evidence added or enriched" in repeated_observation["error"]
+    assert repeated_observation["pool_count"] == 1
+    assert repeated_metrics["agent_loop_terminate"] is True
+
+
+@pytest.mark.asyncio
+async def test_bounded_merge_prioritizes_latest_discovery_results() -> None:
+    records = [record.to_dict() for record in _records()]
+    agent_data = FakeAgentData(
+        messages=[{"role": "user", "content": "Find multiple memories."}],
+        tools_kwargs={
+            "opd_mm": {
+                "query": "Find multiple memories.",
+                "records": records,
+                "retriever": QuerySwitchRetriever(),
+                "vector_store_dir": None,
+                "max_pool_size": 1,
+            }
+        },
+    )
+    retrieve_tool = OPDRetrieveTool(config={"type": "native"}, tool_schema=None)
+
+    await retrieve_tool.execute(
+        "instance", {"method": "hybrid", "top_k": 1, "query": "cat"}, agent_data=agent_data
+    )
+    response, _, _ = await retrieve_tool.execute(
+        "instance", {"method": "hybrid", "top_k": 1, "query": "assistant"}, agent_data=agent_data
+    )
+
+    observation = json.loads(response.text)
+    assert observation["pool_count"] == 1
+    assert observation["pool_overflow_count"] == 1
+    assert observation["evidence_catalog"] == [
+        {
+            "evidence_id": "E2",
+            "content": "An assistant-generated chart.",
+            "image_id": "D1:IMG_002",
+            "timestamp": "2026-01-01T11:00:00",
+            "modality": "image",
+        }
+    ]
+
+
+@pytest.mark.asyncio
 async def test_tool_observation_stays_bounded_when_refreshed_evidence_grows() -> None:
     records = [
         MemoryRecord(
@@ -824,7 +977,7 @@ async def test_tool_observation_stays_bounded_when_refreshed_evidence_grows() ->
             summary=f"summary {index}",
             content=f"memory {index} " + ("x" * 1000),
         ).to_dict()
-        for index in range(20)
+        for index in range(30)
     ]
     agent_data = FakeAgentData(
         messages=[{"role": "user", "content": "Find all memories."}],
@@ -839,15 +992,18 @@ async def test_tool_observation_stays_bounded_when_refreshed_evidence_grows() ->
     )
 
     observation = json.loads(response.text)
-    assert observation["pool_count"] == 20
-    assert observation["evidence_count"] == 20
+    assert observation["pool_count"] == 24
+    assert observation["pool_capacity"] == 24
+    assert observation["pool_overflow_count"] == 6
+    assert observation["evidence_count"] == 24
     assert len(observation["pool_preview"]) == 3
     assert len(observation["evidence_preview"]) == 4
+    assert len(observation["evidence_catalog"]) == 24
     assert all(len(item["content"]) <= 234 for item in observation["pool_preview"])
     assert all(len(item["content"]) <= 234 for item in observation["evidence_preview"])
     assert "new_evidence" not in observation
     assert "last_action" not in observation
-    assert len(response.text) < 4000
+    assert len(response.text) < 8000
 
 
 @pytest.mark.asyncio
@@ -894,6 +1050,8 @@ async def test_inspect_raw_can_use_async_teacher_service_callback() -> None:
     assert calls[0]["query"] == "What is in the cat image?"
     assert observation["error"] == ""
     assert observation["new_evidence_count"] == 1
+    assert observation["evidence_revision"] == 2
+    assert observation["last_drop_revision"] == 0
     assert "source" not in observation["evidence_preview"][-1]
     assert "author" not in observation["evidence_preview"][-1]
     assert observation["evidence_preview"][-1]["image_id"] == "D1:IMG_001"
@@ -965,7 +1123,7 @@ async def test_verl_native_max_action_forces_stop() -> None:
     )
     retrieve_tool = OPDRetrieveTool(config={"type": "native"}, tool_schema=None)
 
-    for _ in range(7):
+    for _ in range(9):
         response, _, metrics = await retrieve_tool.execute(
             "instance",
             {"method": "bm25", "top_k": 1},
@@ -985,7 +1143,7 @@ async def test_verl_native_max_action_forces_stop() -> None:
     assert observation["stopped"] is True
     assert observation["error"] == ""
     assert metrics["agent_loop_terminate"] is True
-    assert len(agent_data.extra_fields["opd_mm"]["trace"]) == 8
+    assert len(agent_data.extra_fields["opd_mm"]["trace"]) == 10
     assert agent_data.extra_fields["opd_mm"]["trace"][-1]["tool"] == "STOP"
 
 
@@ -1154,11 +1312,14 @@ def test_tool_config_loads_verl_native_opd_tools() -> None:
         "topk",
         "retrieve",
         "expand_neighbors",
+        "drop",
         "inspect_raw",
         "stop",
     ]
     inspect_tool = next(tool for tool in tools if tool.name == "inspect_raw")
     assert inspect_tool.config["raw_inspector_backend"] == "teacher"
+    assert inspect_tool.config["max_actions"] == 10
+    assert inspect_tool.config["max_pool_size"] == 24
     assert "raw_inspector_url" not in inspect_tool.config
 
 
@@ -1185,6 +1346,7 @@ def test_sft_converter_can_emit_native_tool_call_records() -> None:
         "topk",
         "retrieve",
         "expand_neighbors",
+        "drop",
         "inspect_raw",
         "stop",
     ]
@@ -1210,13 +1372,17 @@ def test_opd_sample_converts_to_on_policy_distillation_row() -> None:
         {"role": "system", "content": OPD_MM_SYSTEM_PROMPT},
         {"role": "user", "content": sample.query},
     ]
-    for tool_name in ("RETRIEVE", "FILTER", "SORT", "TOPK", "EXPAND_NEIGHBORS", "INSPECT_RAW", "STOP"):
-        assert tool_name in row["prompt"][0]["content"]
-    assert "scope=full_memory" in row["prompt"][0]["content"]
+    system_prompt = row["prompt"][0]["content"]
+    assert "Discovery actions add deduplicated memories" in system_prompt
+    assert "Use DROP once" in system_prompt
+    assert "do not repeat DROP until the evidence revision" in system_prompt
+    assert "hidden memory IDs" in system_prompt
     assert "READ" not in row["prompt"][0]["content"]
     assert row["extra_info"]["need_tools_kwargs"] is True
     assert row["extra_info"]["teacher_privilege_mode"] == "opd_mm"
     assert row["extra_info"]["tools_kwargs"]["opd_mm"]["query"] == sample.query
+    assert row["extra_info"]["tools_kwargs"]["opd_mm"]["max_actions"] == 10
+    assert row["extra_info"]["tools_kwargs"]["opd_mm"]["max_pool_size"] == 24
     assert row["extra_info"]["tools_kwargs"]["opd_mm"]["records"][0]["memory_id"] == "m_text_old"
     assert row["extra_info"]["gold_answer"] == sample.gold_answer
     assert row["extra_info"]["opd_mm_online_self_distill"] is True
@@ -1526,6 +1692,47 @@ def test_teacher_xml_correction_accepts_expand_neighbors_tool_call() -> None:
     assert "<function=expand_neighbors>" in target_xml
 
 
+def test_teacher_xml_correction_accepts_drop_id_array() -> None:
+    teacher_xml = (
+        "<tool_call>\n"
+        "<function=drop>\n"
+        "<parameter=evidence_ids>\n[\"E1\", \"E3\"]\n</parameter>\n"
+        "</function>\n"
+        "</tool_call>"
+    )
+    parsed = extract_canonical_tool_call_xml(teacher_xml)
+
+    assert parsed is not None
+    target_xml, action, _ = parsed
+    assert action == ToolAction("DROP", {"evidence_ids": ["E1", "E3"]})
+    assert '["E1","E3"]' in target_xml
+
+    request = {
+        "sample_id": "drop-correction",
+        "step_index": 2,
+        "allow_inspect_raw": True,
+        "tool_format": "qwen3_coder",
+        "observation": {
+            "evidence_revision": 2,
+            "last_drop_revision": 1,
+            "evidence_catalog": [{"evidence_id": "E1"}, {"evidence_id": "E3"}],
+        },
+        "verifier_feedback": {
+            "evidence_sufficient": False,
+            "missing_evidence_type": "candidate_set_too_broad",
+        },
+    }
+    correction = finalize_online_step_correction(request, teacher_raw_response=teacher_xml)
+    assert correction is not None
+    assert correction["teacher_actions"] == [{"tool": "DROP", "evidence_ids": ["E1", "E3"]}]
+
+    request["observation"]["evidence_catalog"] = [{"evidence_id": "E1"}]
+    assert finalize_online_step_correction(request, teacher_raw_response=teacher_xml) is None
+    request["observation"]["evidence_catalog"] = [{"evidence_id": "E1"}, {"evidence_id": "E3"}]
+    request["observation"]["last_drop_revision"] = 2
+    assert finalize_online_step_correction(request, teacher_raw_response=teacher_xml) is None
+
+
 def test_teacher_xml_correction_recovers_unclosed_rewritten_retrieve_query() -> None:
     parsed = extract_canonical_tool_call_xml(
         "<tool_call>\n"
@@ -1825,6 +2032,7 @@ async def test_agent_loop_worker_generates_verifier_and_teacher_for_one_live_sta
         "topk",
         "retrieve",
         "expand_neighbors",
+        "drop",
         "inspect_raw",
         "stop",
     ]
@@ -2256,6 +2464,7 @@ def test_helpers_build_hidden_store_from_dicts_and_schemas() -> None:
         "topk",
         "retrieve",
         "expand_neighbors",
+        "drop",
         "stop",
     ]
     filter_scope = schemas[0]["function"]["parameters"]["properties"]["scope"]
@@ -2266,6 +2475,15 @@ def test_helpers_build_hidden_store_from_dicts_and_schemas() -> None:
     assert "MEMORY/user/assistant" not in filter_value_description
     assert "scope" in schemas[0]["function"]["parameters"]["required"]
     assert schemas[3]["function"]["parameters"]["required"] == ["method", "top_k"]
-    inspect_schema = openai_tool_schemas(include_inspect_raw=True)[5]
+    drop_schema = schemas[5]
+    assert drop_schema["function"]["parameters"]["required"] == ["evidence_ids"]
+    assert drop_schema["function"]["parameters"]["properties"]["evidence_ids"]["items"]["pattern"] == "^E[1-9][0-9]*$"
+    dynamic_schemas = openai_tool_schemas(include_inspect_raw=False, evidence_ids=["E2", "E7"])
+    dynamic_drop_schema = dynamic_schemas[5]
+    assert dynamic_drop_schema["function"]["parameters"]["properties"]["evidence_ids"]["items"]["enum"] == [
+        "E2",
+        "E7",
+    ]
+    inspect_schema = openai_tool_schemas(include_inspect_raw=True)[6]
     assert inspect_schema["function"]["parameters"]["required"] == ["target", "instruction"]
     assert "scope" not in schemas[3]["function"]["parameters"]["properties"]

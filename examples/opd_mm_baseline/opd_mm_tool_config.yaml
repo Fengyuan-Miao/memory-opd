@@ -8,6 +8,8 @@ opd_mm_common_config: &opd_mm_common_config
   raw_inspector_backend: teacher
   raw_inspector_max_tokens: 256
   raw_inspector_temperature: 0.0
+  max_actions: 10
+  max_pool_size: 24
 
 tools:
   - class_name: "verl.experimental.opd_mm.tools.OPDFilterTool"
@@ -19,6 +21,8 @@ tools:
   - class_name: "verl.experimental.opd_mm.tools.OPDRetrieveTool"
     config: *opd_mm_common_config
   - class_name: "verl.experimental.opd_mm.tools.OPDExpandNeighborsTool"
+    config: *opd_mm_common_config
+  - class_name: "verl.experimental.opd_mm.tools.OPDDropTool"
     config: *opd_mm_common_config
   - class_name: "verl.experimental.opd_mm.tools.OPDInspectRawTool"
     config: *opd_mm_common_config

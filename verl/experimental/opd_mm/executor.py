@@ -41,6 +41,7 @@ TIMESTAMP_DATE_PATTERN = re.compile(
 DATE_ONLY_PATTERN = re.compile(
     r"^\s*(?P<year>\d{4})[-/](?P<month>\d{1,2})[-/](?P<day>\d{1,2})\s*$"
 )
+DEFAULT_MAX_POOL_SIZE = 24
 
 
 class RawInspector(Protocol):
@@ -61,11 +62,13 @@ class ToolExecutor:
         raw_inspector: Optional[RawInspector] = None,
         validator: Optional[TrajectoryValidator] = None,
         max_raw_inspections: int = 3,
+        max_pool_size: int = DEFAULT_MAX_POOL_SIZE,
     ):
         self.retriever = retriever or HybridRetriever()
         self.raw_inspector = raw_inspector
         self.validator = validator or TrajectoryValidator()
         self.max_raw_inspections = max(0, int(max_raw_inspections))
+        self.max_pool_size = max(1, int(max_pool_size))
 
     def run(
         self,
@@ -82,6 +85,9 @@ class ToolExecutor:
         stopped = False
         raw_calls = 0
         error = ""
+        evidence_ids_by_memory: dict[str, str] = {}
+        evidence_revision = 0
+        last_drop_revision = 0
 
         for index, action in enumerate(actions):
             before = len(pool)
@@ -89,10 +95,11 @@ class ToolExecutor:
             evidence_added = 0
             try:
                 if action.tool == "FILTER":
+                    scope = action.arguments["scope"]
                     source_pool = self._filter_source_pool(
                         pool,
                         memory_store,
-                        action.arguments["scope"],
+                        scope,
                     )
                     filtered = self._filter(
                         source_pool,
@@ -100,7 +107,10 @@ class ToolExecutor:
                         op=action.arguments["op"],
                         value=action.arguments["value"],
                     )
-                    pool = filtered
+                    if scope == "full_memory":
+                        pool, _ = self._merge_discovery_pool(pool, filtered, pool_has_candidates)
+                    else:
+                        pool = filtered[: self.max_pool_size]
                     pool_has_candidates = True
                     evidence_added = len(self._refresh_evidence_from_pool(evidence, pool, source="FILTER"))
                 elif action.tool == "SORT":
@@ -121,7 +131,7 @@ class ToolExecutor:
                         top_k=action.arguments.get("top_k", 5),
                         question_image=question_image,
                     )
-                    pool = retrieved
+                    pool, _ = self._merge_discovery_pool(pool, retrieved, pool_has_candidates)
                     pool_has_candidates = True
                     evidence_added = len(self._refresh_evidence_from_pool(evidence, pool, source="RETRIEVE"))
                 elif action.tool == "EXPAND_NEIGHBORS":
@@ -132,9 +142,21 @@ class ToolExecutor:
                         memory_store,
                         action.arguments["window"],
                     )
-                    pool = self._merge_pools(pool, expanded)
+                    pool, _ = self._merge_discovery_pool(
+                        pool,
+                        expanded,
+                        pool_has_candidates,
+                        prioritize_incoming=False,
+                    )
                     pool_has_candidates = True
                     evidence_added = len(self._refresh_evidence_from_pool(evidence, pool, source="EXPAND_NEIGHBORS"))
+                elif action.tool == "DROP":
+                    if evidence_revision <= last_drop_revision:
+                        raise ValueError("DROP requires evidence added or enriched since the previous DROP")
+                    pool = self._drop_pool(pool, action.arguments["evidence_ids"], evidence_ids_by_memory)
+                    pool_has_candidates = True
+                    self._refresh_evidence_from_pool(evidence, pool, source="DROP")
+                    last_drop_revision = evidence_revision
                 elif action.tool == "INSPECT_RAW":
                     remaining = max(0, self.max_raw_inspections - raw_calls)
                     inspected = self._inspect_raw(
@@ -151,6 +173,10 @@ class ToolExecutor:
             except Exception as exc:
                 step_error = str(exc)
                 error = f"action {index} {action.tool}: {exc}"
+            if pool_has_candidates:
+                self._ensure_public_evidence_ids(pool, evidence_ids_by_memory)
+            if evidence_added:
+                evidence_revision += 1
             steps.append(
                 ExecutionStep(
                     index=index,
@@ -163,7 +189,7 @@ class ToolExecutor:
             )
             if stopped or step_error:
                 break
-        if not evidence and not error:
+        if not evidence and not error and pool_has_candidates:
             evidence = self._pool_evidence(pool, source="FINAL_POOL")
 
         return ExecutionResult(
@@ -200,6 +226,58 @@ class ToolExecutor:
             positions[memory_id] = len(merged)
             merged.append(item)
         return merged
+
+    def _merge_discovery_pool(
+        self,
+        existing: List[PoolItem],
+        incoming: List[PoolItem],
+        has_existing_candidates: bool,
+        *,
+        prioritize_incoming: bool = True,
+    ) -> tuple[List[PoolItem], int]:
+        """Merge discovery results into the bounded working pool, prioritizing the latest result set."""
+        merged = self._merge_pools(existing, incoming) if has_existing_candidates else list(incoming)
+        overflow = max(0, len(merged) - self.max_pool_size)
+        if not has_existing_candidates or not prioritize_incoming:
+            return merged[: self.max_pool_size], overflow
+
+        merged_by_id = {item.memory.memory_id: item for item in merged}
+        prioritized_ids = list(
+            dict.fromkeys(
+                [item.memory.memory_id for item in incoming]
+                + [item.memory.memory_id for item in existing]
+            )
+        )
+        prioritized = [merged_by_id[memory_id] for memory_id in prioritized_ids]
+        return prioritized[: self.max_pool_size], overflow
+
+    @staticmethod
+    def _ensure_public_evidence_ids(pool: List[PoolItem], evidence_ids_by_memory: dict[str, str]) -> None:
+        """Assign stable trajectory-local IDs only to memories exposed in the working pool."""
+        next_id = len(evidence_ids_by_memory) + 1
+        for item in pool:
+            memory_id = item.memory.memory_id
+            if memory_id in evidence_ids_by_memory:
+                continue
+            evidence_ids_by_memory[memory_id] = f"E{next_id}"
+            next_id += 1
+
+    @staticmethod
+    def _drop_pool(
+        pool: List[PoolItem],
+        evidence_ids: List[str],
+        evidence_ids_by_memory: dict[str, str],
+    ) -> List[PoolItem]:
+        """Atomically remove current candidates referenced by public evidence IDs."""
+        current_memory_by_evidence_id = {
+            evidence_ids_by_memory.get(item.memory.memory_id): item.memory.memory_id for item in pool
+        }
+        normalized_ids = [value.strip() for value in evidence_ids]
+        unknown = [value for value in normalized_ids if value not in current_memory_by_evidence_id]
+        if unknown:
+            raise ValueError(f"DROP references unknown current evidence IDs: {unknown}")
+        dropped_memory_ids = {current_memory_by_evidence_id[value] for value in normalized_ids}
+        return [item for item in pool if item.memory.memory_id not in dropped_memory_ids]
 
     @staticmethod
     def _topk_turns(pool: List[PoolItem], k: int) -> List[PoolItem]:
@@ -495,11 +573,10 @@ class ToolExecutor:
         pool: List[PoolItem],
         source: str,
     ) -> List[EvidenceItem]:
-        """Refresh answer evidence from the current candidate pool.
+        """Synchronize answer evidence with the current candidate pool.
 
-        Pool-mutating tools should expose the latest candidate view instead of
-        an ever-growing union of stale candidates. Preserve raw visual
-        inspection evidence only for memories that remain in the current pool.
+        The candidate pool owns accumulation and pruning semantics. Preserve
+        raw visual inspection evidence only for memories that remain in it.
         """
         pool_ids = {item.memory.memory_id for item in pool}
         preserved_raw = [

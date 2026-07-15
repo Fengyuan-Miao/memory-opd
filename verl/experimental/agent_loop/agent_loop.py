@@ -946,7 +946,16 @@ class AgentLoopWorker:
             allow_inspect_raw=bool(request.get("allow_inspect_raw", True)),
             tool_format=str(request.get("tool_format") or self.rollout_config.multi_turn.format),
         )
-        teacher_tool_schemas = openai_tool_schemas(include_inspect_raw=bool(request.get("allow_inspect_raw", True)))
+        observation = request.get("observation") or {}
+        teacher_evidence_ids = [
+            str(item.get("evidence_id"))
+            for item in observation.get("evidence_catalog", [])
+            if isinstance(item, dict) and item.get("evidence_id")
+        ]
+        teacher_tool_schemas = openai_tool_schemas(
+            include_inspect_raw=bool(request.get("allow_inspect_raw", True)),
+            evidence_ids=teacher_evidence_ids,
+        )
         teacher_prompt_ids = self._encode_opd_mm_teacher_prompt(
             request["teacher_prompt"], tools=teacher_tool_schemas
         )

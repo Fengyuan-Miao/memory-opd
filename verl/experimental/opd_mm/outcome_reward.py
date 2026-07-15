@@ -357,6 +357,8 @@ async def compute_outcome_score(
             "max_actions_reached": max_actions_reached,
             "trajectory_error": state.get("error") or "",
             "repeat_count": repeats,
+            "drop_calls": int(state.get("drop_calls") or 0),
+            "dropped_evidence_count": int(state.get("dropped_evidence_count") or 0),
         }
     )
 
@@ -368,6 +370,8 @@ async def compute_outcome_score(
         "opd_mm/evidence_count": float(len(evidence)),
         "opd_mm/empty_evidence": float(not evidence),
         "opd_mm/repeated_actions": float(repeats),
+        "opd_mm/drop_calls": float(state.get("drop_calls") or 0),
+        "opd_mm/dropped_evidence_count": float(state.get("dropped_evidence_count") or 0),
         "opd_mm/max_actions_reached": float(max_actions_reached),
         "opd_mm/trajectory_error": float(trajectory_error),
     }

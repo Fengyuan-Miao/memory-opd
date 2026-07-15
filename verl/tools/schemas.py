@@ -27,6 +27,9 @@ class OpenAIFunctionPropertySchema(BaseModel):
     # JSON Schema's ``enum`` accepts any JSON value, not just strings, so
     # ``Literal[1, 2, 3]`` -> ``enum: [1, 2, 3]`` is a valid schema.
     enum: list[Any] | None = None
+    items: dict[str, Any] | None = None
+    minItems: int | None = None
+    uniqueItems: bool | None = None
 
 
 class OpenAIFunctionParametersSchema(BaseModel):

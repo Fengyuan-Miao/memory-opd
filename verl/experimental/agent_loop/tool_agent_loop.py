@@ -639,10 +639,9 @@ class ToolAgentLoop(AgentLoopBase):
         if terminate_after_tools:
             return AgentState.TERMINATED
 
-        # OPD-MM refreshes its retrieval state after every action. Rebuild the
-        # next prompt from the compact action history and latest observation,
-        # rather than retaining earlier retrieval observations in token history.
-        opd_prompt_state = agent_data.extra_fields.get("opd_mm_prompt_state")
+        # Rebuild OPD-MM prompts from compact action history and the latest
+        # accumulated observation instead of retaining older observations.
+        opd_prompt_state = getattr(agent_data, "extra_fields", {}).get("opd_mm_prompt_state")
         if not self.enable_continuous_token and not new_images_this_turn and isinstance(opd_prompt_state, dict):
             from verl.experimental.opd_mm.dataset import opd_messages_for_state
 

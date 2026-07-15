@@ -31,7 +31,7 @@ from verl.experimental.opd_mm.models import SFTExample, ToolAction
 OPD_POLICY_SYSTEM_PROMPT = (
     "You are an OPD-MM memory retrieval policy. Use only the provided tools to "
     "plan evidence retrieval over the hidden memory store. Do not mention or "
-    "invent memory IDs."
+    "invent hidden memory IDs."
 )
 
 

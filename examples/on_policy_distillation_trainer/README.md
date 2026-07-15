@@ -53,11 +53,11 @@ gold answer, then judges that generated answer against the private gold answer.
 Only the terminal correctness and small trajectory penalties become the GRPO
 reward; the judge output is never added to the student context.
 
-Because OPD-MM refreshes rather than accumulates observations, the rollout also
-stores the exact prompt, sampled action, and rollout log-probability at every
-visited state. The PPO update expands these state-action pairs and applies their
-trajectory's terminal GRPO advantage, instead of recomputing later actions from
-an observation-free concatenated history.
+Because OPD-MM rebuilds each prompt from the latest bounded accumulated state,
+the rollout stores the exact prompt, sampled action, and rollout log-probability
+at every visited state. The PPO update expands these state-action pairs and
+applies their trajectory's terminal GRPO advantage, instead of recomputing later
+actions from an observation-free concatenated history.
 
 ```bash
 bash examples/on_policy_distillation_trainer/run_opd_mm_grpo_fsdp.sh
