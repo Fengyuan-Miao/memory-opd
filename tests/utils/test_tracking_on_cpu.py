@@ -16,7 +16,32 @@ import sys
 import types
 from unittest.mock import MagicMock, patch
 
-from verl.utils.tracking import ValidationGenerationsLogger
+from verl.utils.tracking import Tracking, ValidationGenerationsLogger
+
+
+def test_tracking_filters_only_wandb_metrics():
+    tracker = Tracking.__new__(Tracking)
+    tracker.logger = {"wandb": MagicMock(), "console": MagicMock()}
+    tracker.wandb_metric_patterns = ["reward/*", "actor/loss", "training/global_step"]
+    metrics = {
+        "training/global_step": 3,
+        "reward/opd_mm/answer_correct/mean": 0.5,
+        "actor/loss": 0.1,
+        "perf/throughput": 10.0,
+        "timing_s/step": 2.0,
+    }
+
+    tracker.log(metrics, step=3)
+
+    tracker.logger["wandb"].log.assert_called_once_with(
+        data={
+            "training/global_step": 3,
+            "reward/opd_mm/answer_correct/mean": 0.5,
+            "actor/loss": 0.1,
+        },
+        step=3,
+    )
+    tracker.logger["console"].log.assert_called_once_with(data=metrics, step=3)
 
 
 def test_validation_generations_logger_logs_trackio_traces():

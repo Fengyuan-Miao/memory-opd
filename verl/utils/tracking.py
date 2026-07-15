@@ -16,6 +16,7 @@ A unified tracking interface that supports logging data to different backend
 """
 
 import dataclasses
+import fnmatch
 import json
 import logging
 import os
@@ -67,15 +68,21 @@ class Tracking:
                 assert backend in self.supported_backend, f"{backend} is not supported"
 
         self.logger = {}
+        trainer_config = (config or {}).get("trainer", {})
+        metric_patterns = trainer_config.get("wandb_metric_patterns") or []
+        self.wandb_metric_patterns = [str(pattern) for pattern in metric_patterns]
 
         if "tracking" in default_backend or "wandb" in default_backend:
             import os
 
             import wandb
 
-            settings = None
-            if config and config["trainer"].get("wandb_proxy", None):
-                settings = wandb.Settings(https_proxy=config["trainer"]["wandb_proxy"])
+            settings_kwargs = {}
+            if trainer_config.get("wandb_proxy"):
+                settings_kwargs["https_proxy"] = trainer_config["wandb_proxy"]
+            if trainer_config.get("wandb_disable_stats", False):
+                settings_kwargs["x_disable_stats"] = True
+            settings = wandb.Settings(**settings_kwargs) if settings_kwargs else None
             entity = os.environ.get("WANDB_ENTITY", None)
             wandb.init(project=project_name, name=experiment_name, entity=entity, config=config, settings=settings)
             self.logger["wandb"] = wandb
@@ -183,7 +190,15 @@ class Tracking:
     def log(self, data, step, backend=None):
         for default_backend, logger_instance in self.logger.items():
             if backend is None or default_backend in backend:
-                logger_instance.log(data=data, step=step)
+                backend_data = data
+                if default_backend == "wandb" and self.wandb_metric_patterns:
+                    backend_data = {
+                        key: value
+                        for key, value in data.items()
+                        if any(fnmatch.fnmatchcase(key, pattern) for pattern in self.wandb_metric_patterns)
+                    }
+                if backend_data:
+                    logger_instance.log(data=backend_data, step=step)
 
     def __del__(self):
         if "wandb" in self.logger:

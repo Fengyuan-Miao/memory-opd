@@ -31,31 +31,15 @@ from verl.experimental.opd_mm.retrieval import HiddenMemoryStore
 
 DEFAULT_DATA_SOURCE = "opd_mm"
 DEFAULT_AGENT_NAME = "tool_agent"
-OPD_MM_SYSTEM_PROMPT = """You are an OPD-MM multimodal memory retrieval planner. Select one tool action per turn to
+OPD_MM_SYSTEM_PROMPT = """You are an OPD-MM multimodal memory retrieval planner. Select exactly one available tool action per turn to
 gather enough public evidence for the user's question from a hidden memory store. Use only the user question,
 executed action history, and current public observation. Do not invent or expose hidden memory IDs.
 
-The current observation is authoritative: pool-changing tools replace the candidate pool and answer evidence;
-earlier evidence is not accumulated. Choose an action whose effect addresses the unresolved evidence need. If an
-action with the same arguments did not change the state, do not repeat it without a state-based reason.
-
-Tool semantics:
-- RETRIEVE searches the original memory store and replaces the current pool. method=bm25 is lexical text search;
-  dense is semantic text search; vision is image-similarity search; hybrid combines text/caption and visual signals.
-  Set top_k according to the required precision or coverage (1-50). query is an optional public-state-based rewrite;
-  omit it when the user question already expresses the search target.
-- FILTER selects records by public metadata only; it is not semantic content or entity search. Valid fields are
-  modality, source_type, timestamp, and status. scope=full_memory applies an independent filter to the original
-  store; scope=current_pool intersects the current candidates. Either scope replaces the pool and evidence.
-  Mem-Gallery source_type values are dialogue_turn and dialogue_image; date-only timestamps match that whole date.
-- SORT orders the current pool; TOPK truncates it; EXPAND_NEIGHBORS adds same-session turns around existing
-  candidates. These actions require a useful current pool.
-- INSPECT_RAW obtains visual details from image/media records in the current pool. It is not a search tool, cannot
-  inspect an empty pool, and cannot inspect the user's question image directly.
-- STOP ends retrieval. Use it when current public evidence is sufficient, or when an observation reports an
-  unrecoverable error. Inference has no gold-aware validator.
-
-Base all decisions on public state. A public image_id may be used when the question asks for an image or image ID.
+Treat the current observation as authoritative: current pool and evidence supersede earlier observations rather than
+accumulating across steps. Choose an action that addresses the unresolved evidence need, and do not repeat an
+unchanged action without a state-based reason. Stop only when current evidence is sufficient or the observation
+reports an unrecoverable error; inference has no gold-aware validator. A public image_id may be used when the
+question asks for an image or image ID.
 """
 
 

@@ -45,6 +45,8 @@ from verl.trainer.ppo import core_algos
 from verl.trainer.ppo.core_algos import AdvantageEstimator, agg_loss
 from verl.trainer.ppo.metric_utils import (
     compute_data_metrics,
+    compute_grpo_group_metrics,
+    compute_reward_extra_metrics,
     compute_throughout_metrics,
     compute_timing_metrics,
     compute_variance_proxy_metrics,
@@ -1302,6 +1304,7 @@ class RayPPOTrainer:
             if opd_mm_grpo_batch is not None:
                 batch = opd_mm_grpo_batch
                 opd_mm_grpo_states = len(batch)
+                batch = self._attach_opd_mm_grpo_ref_log_prob(batch)
             elif state_column_present:
                 has_policy_states = False
                 for value in batch.non_tensor_batch["opd_mm_policy_states"]:
@@ -1379,6 +1382,14 @@ class RayPPOTrainer:
         actor_output = DataProto.from_single_dict(data={}, meta_info={"metrics": actor_output})
 
         return actor_output
+
+    def _attach_opd_mm_grpo_ref_log_prob(self, batch: DataProto) -> DataProto:
+        """Compute KL reference scores on the exact refreshed state/action batch."""
+        if not self.config.actor_rollout_ref.actor.use_kl_loss:
+            return batch
+        if not self.use_reference_policy:
+            raise RuntimeError("OPD-MM GRPO KL loss requires an initialized reference policy")
+        return batch.union(self._compute_ref_log_prob(batch))
 
     def _build_opd_mm_grpo_state_batch(self, batch: DataProto) -> Optional[DataProto]:
         """Expand refreshed OPD-MM state/action pairs with their trajectory advantage.
@@ -1888,7 +1899,12 @@ class RayPPOTrainer:
                                 metrics.update(calculate_debug_metrics(batch))
 
                     assert "old_log_probs" in batch.batch, f'"old_log_prob" not in {batch.batch.keys()=}'
-                    if self.use_reference_policy:
+                    defer_ref_to_opd_mm_states = (
+                        self.config.actor_rollout_ref.actor.use_kl_loss
+                        and not self.config.algorithm.use_kl_in_reward
+                        and "opd_mm_policy_states" in batch.non_tensor_batch
+                    )
+                    if self.use_reference_policy and not defer_ref_to_opd_mm_states:
                         # compute reference log_prob
                         with marked_timer(str(Role.RefPolicy), timing_raw, color="olive"):
                             ref_log_prob = self._compute_ref_log_prob(batch)
@@ -2032,6 +2048,9 @@ class RayPPOTrainer:
                 )
                 # collect metrics
                 metrics.update(compute_data_metrics(batch=batch, use_critic=self.use_critic))
+                metrics.update(compute_reward_extra_metrics(reward_extra_infos_dict))
+                if self.config.algorithm.adv_estimator in ("grpo", AdvantageEstimator.GRPO):
+                    metrics.update(compute_grpo_group_metrics(batch))
                 # GDPO per-component reward metrics
                 gdpo_reward_keys = self.config.algorithm.get("gdpo_reward_keys", None)
                 if gdpo_reward_keys and self.config.algorithm.adv_estimator in ("gdpo", AdvantageEstimator.GDPO):

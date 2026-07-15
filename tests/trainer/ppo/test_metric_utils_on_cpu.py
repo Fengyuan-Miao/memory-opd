@@ -25,6 +25,8 @@ from verl.trainer.ppo.metric_utils import (
     bootstrap_metric,
     calc_maj_val,
     compute_data_metrics,
+    compute_grpo_group_metrics,
+    compute_reward_extra_metrics,
     compute_throughout_metrics,
     compute_timing_metrics,
     process_validation_metrics,
@@ -348,6 +350,44 @@ class TestComputeDataMetrics(unittest.TestCase):
         self.assertIn("critic/score/mean", metrics)
         self.assertIn("critic/rewards/mean", metrics)
         self.assertIn("response_length/mean", metrics)
+
+
+class TestRewardMonitoringMetrics(unittest.TestCase):
+    def test_reward_extra_metrics_only_aggregate_finite_numeric_values(self):
+        metrics = compute_reward_extra_metrics(
+            {
+                "opd_mm/answer_correct": [1.0, 0.0, None, float("nan")],
+                "opd_mm/evidence_count": np.array([2, 6, 4]),
+                "opd_mm/debug": ["ignored", None],
+            }
+        )
+
+        self.assertEqual(metrics["reward/opd_mm/answer_correct/mean"], 0.5)
+        self.assertEqual(metrics["reward/opd_mm/answer_correct/min"], 0.0)
+        self.assertEqual(metrics["reward/opd_mm/answer_correct/max"], 1.0)
+        self.assertEqual(metrics["reward/opd_mm/evidence_count/mean"], 4.0)
+        self.assertNotIn("reward/opd_mm/debug/mean", metrics)
+
+    def test_grpo_group_metrics_report_reward_and_outcome_diversity(self):
+        batch = MagicMock()
+        batch.batch = {
+            "token_level_scores": torch.tensor(
+                [[1.0, 0.0], [0.0, 0.0], [0.5, 0.0], [0.5, 0.0], [1.0, 0.0], [1.0, 0.0]]
+            )
+        }
+        batch.non_tensor_batch = {
+            "uid": np.array(["a", "a", "b", "b", "c", "c"], dtype=object),
+            "opd_mm/answer_correct": np.array([1.0, 0.0, 0.0, 0.0, 1.0, 1.0]),
+        }
+
+        metrics = compute_grpo_group_metrics(batch)
+
+        self.assertEqual(metrics["grpo/group_size/mean"], 2.0)
+        self.assertAlmostEqual(metrics["grpo/group_nonzero_reward_std/rate"], 1 / 3)
+        self.assertAlmostEqual(metrics["grpo/group_all_equal_reward/rate"], 2 / 3)
+        self.assertAlmostEqual(metrics["grpo/group_mixed_answer_correct/rate"], 1 / 3)
+        self.assertAlmostEqual(metrics["grpo/group_all_correct/rate"], 1 / 3)
+        self.assertAlmostEqual(metrics["grpo/group_all_incorrect/rate"], 1 / 3)
 
 
 class TestComputeTimingMetrics(unittest.TestCase):

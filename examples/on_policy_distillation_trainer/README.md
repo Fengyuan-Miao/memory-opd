@@ -46,12 +46,14 @@ python3 examples/data_preprocess/build_mem_gallery_opd_mm_train_subset.py \
   --reserve-eval-samples 100 --reserve-eval-seed 20260705
 ```
 
-The script reserves GPUs 0-5 for actor training and starts a fixed outcome VLM
-on GPUs 6-7. Each query receives four rollouts by default. After a real `STOP`,
+The script reserves GPUs 0-5 for actor training and starts a fixed
+Qwen3-VL-8B outcome/`INSPECT_RAW` service on GPUs 6-7. Each query receives eight
+rollouts at temperature 1.0 by default. After a real `STOP`,
 the outcome VLM first answers from the final public evidence without seeing the
 gold answer, then judges that generated answer against the private gold answer.
-Only the terminal correctness and small trajectory penalties become the GRPO
-reward; the judge output is never added to the student context.
+Only terminal answer correctness contributes to the GRPO reward by default;
+trajectory and evidence diagnostics are still logged. The penalty environment
+variables can be set explicitly to re-enable reward shaping.
 
 Because OPD-MM refreshes rather than accumulates observations, the rollout also
 stores the exact prompt, sampled action, and rollout log-probability at every
@@ -62,6 +64,11 @@ an observation-free concatenated history.
 ```bash
 bash examples/on_policy_distillation_trainer/run_opd_mm_grpo_fsdp.sh
 ```
+
+GRPO health metrics are uploaded to W&B by default, with hardware monitoring
+disabled. The launcher tries direct access, then `http://127.0.0.1:7896`, and
+falls back to offline logs under `wandb/`. Set `ENABLE_WANDB=0`,
+`WANDB_PROXY_FALLBACK`, or `WANDB_MODE` to override this.
 
 For an already running OpenAI-compatible outcome service, set
 `START_OUTCOME_SERVER=0`, `OUTCOME_SERVER_BASE_URL`, and

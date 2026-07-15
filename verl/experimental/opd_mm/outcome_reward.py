@@ -34,6 +34,18 @@ import aiohttp
 
 DEFAULT_OUTCOME_BASE_URL = "http://127.0.0.1:8011"
 DEFAULT_OUTCOME_MODEL = "opd-mm-outcome"
+JUDGE_RESPONSE_FORMAT = {
+    "type": "json_schema",
+    "json_schema": {
+        "name": "opd_mm_answer_judgment",
+        "schema": {
+            "type": "object",
+            "properties": {"correct": {"type": "boolean"}},
+            "required": ["correct"],
+            "additionalProperties": False,
+        },
+    },
+}
 
 
 def _plain(value: Any) -> Any:
@@ -152,7 +164,7 @@ def _judge_messages(
             "content": (
                 "Judge a memory-QA answer. Mark correct only when the candidate semantically answers the question, "
                 "matches the gold answer, and is supported by the public evidence. A correct guess without evidence "
-                "is incorrect. Return only JSON: {\"correct\":true|false,\"reason\":\"short reason\"}."
+                "is incorrect. Return only JSON: {\"correct\":true|false}."
             ),
         },
         {
@@ -174,6 +186,7 @@ async def _chat_completion(
     timeout: float,
     max_tokens: int,
     retries: int,
+    response_format: dict[str, Any] | None = None,
 ) -> str:
     payload = {
         "model": model,
@@ -183,6 +196,8 @@ async def _chat_completion(
         "max_tokens": int(max_tokens),
         "chat_template_kwargs": {"enable_thinking": False},
     }
+    if response_format is not None:
+        payload["response_format"] = response_format
     headers = {"Content-Type": "application/json"}
     if api_key:
         headers["Authorization"] = f"Bearer {api_key}"
@@ -233,6 +248,21 @@ def _repeat_count(trace: list[Any]) -> int:
     return repeats
 
 
+def _evidence_penalty(
+    evidence_count: int,
+    *,
+    free_budget: int,
+    per_item_penalty: float,
+    max_penalty: float,
+) -> tuple[int, float]:
+    excess_count = max(0, int(evidence_count) - max(0, int(free_budget)))
+    penalty = min(
+        max(0.0, float(max_penalty)),
+        excess_count * max(0.0, float(per_item_penalty)),
+    )
+    return excess_count, penalty
+
+
 async def _dump_result(payload: dict[str, Any]) -> None:
     dump_dir = str(os.getenv("OPD_MM_OUTCOME_REWARD_DUMP_DIR") or "").strip()
     if not dump_dir:
@@ -261,13 +291,16 @@ async def compute_outcome_score(
     api_key: str | None = None,
     timeout: float = 180.0,
     answer_max_tokens: int = 256,
-    judge_max_tokens: int = 192,
+    judge_max_tokens: int = 64,
     retries: int = 3,
     repeat_penalty: float = 0.02,
     max_action_penalty: float = 0.1,
     error_penalty: float = 0.1,
     non_stop_penalty: float = 0.1,
     empty_evidence_penalty: float = 0.1,
+    evidence_free_budget: int = 10,
+    evidence_count_penalty: float = 0.005,
+    max_evidence_count_penalty: float = 0.25,
     **kwargs: Any,
 ) -> dict[str, float]:
     """Generate and judge a final answer from an OPD-MM terminal state."""
@@ -294,6 +327,7 @@ async def compute_outcome_score(
     candidate_answer = ""
     judge_raw = ""
     judge_reason = ""
+    judge_format_error = ""
 
     if stopped and evidence and query and gold_answer and not trajectory_error:
         outcome_url = answer_base_url or os.getenv("OPD_MM_OUTCOME_BASE_URL") or DEFAULT_OUTCOME_BASE_URL
@@ -321,6 +355,7 @@ async def compute_outcome_score(
                 timeout=float(timeout),
                 max_tokens=int(judge_max_tokens),
                 retries=int(retries),
+                response_format=JUDGE_RESPONSE_FORMAT,
             )
             try:
                 correct, judge_reason = _parse_correct(judge_raw)
@@ -331,15 +366,24 @@ async def compute_outcome_score(
                 if judge_attempt + 1 < max(1, int(retries)):
                     await asyncio.sleep(min(2**judge_attempt, 4))
         if parse_error is not None:
-            raise RuntimeError(f"judge output remained invalid after {max(1, int(retries))} attempts: {parse_error}")
-        evaluated = True
+            judge_format_error = str(parse_error)
+            judge_reason = f"judge_format_error: {parse_error}"
+        else:
+            evaluated = True
 
+    evidence_excess_count, applied_evidence_penalty = _evidence_penalty(
+        len(evidence),
+        free_budget=evidence_free_budget,
+        per_item_penalty=evidence_count_penalty,
+        max_penalty=max_evidence_count_penalty,
+    )
     score = float(correct)
     score -= float(repeat_penalty) * repeats
     score -= float(max_action_penalty) if max_actions_reached else 0.0
     score -= float(error_penalty) if trajectory_error else 0.0
     score -= float(non_stop_penalty) if not stopped else 0.0
     score -= float(empty_evidence_penalty) if stopped and not evidence else 0.0
+    score -= applied_evidence_penalty
     score = max(-1.0, min(1.0, score))
 
     await _dump_result(
@@ -351,12 +395,16 @@ async def compute_outcome_score(
             "candidate_answer": candidate_answer,
             "judge_raw": judge_raw,
             "judge_reason": judge_reason,
+            "judge_format_error": judge_format_error,
             "correct": correct,
             "score": score,
             "stopped": stopped,
             "max_actions_reached": max_actions_reached,
             "trajectory_error": state.get("error") or "",
             "repeat_count": repeats,
+            "evidence_count": len(evidence),
+            "evidence_excess_count": evidence_excess_count,
+            "evidence_count_penalty": applied_evidence_penalty,
         }
     )
 
@@ -364,8 +412,11 @@ async def compute_outcome_score(
         "score": score,
         "opd_mm/answer_correct": float(correct),
         "opd_mm/outcome_evaluated": float(evaluated),
+        "opd_mm/judge_format_error": float(bool(judge_format_error)),
         "opd_mm/terminal_stopped": float(stopped),
         "opd_mm/evidence_count": float(len(evidence)),
+        "opd_mm/evidence_excess_count": float(evidence_excess_count),
+        "opd_mm/evidence_count_penalty": applied_evidence_penalty,
         "opd_mm/empty_evidence": float(not evidence),
         "opd_mm/repeated_actions": float(repeats),
         "opd_mm/max_actions_reached": float(max_actions_reached),

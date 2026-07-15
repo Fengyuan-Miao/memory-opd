@@ -1102,7 +1102,8 @@ async def test_opd_tool_session_marks_forced_max_action_stop() -> None:
     assert metrics["agent_loop_terminate"] is True
 
 
-def test_raw_inspector_backend_environment_overrides_tool_config(monkeypatch) -> None:
+@pytest.mark.asyncio
+async def test_raw_inspector_backend_environment_overrides_tool_config(monkeypatch) -> None:
     monkeypatch.setenv("OPD_MM_RAW_INSPECTOR_BACKEND", "vllm")
     monkeypatch.setenv("OPD_MM_RAW_INSPECTOR_URL", "http://outcome-model:8011")
     monkeypatch.setenv("OPD_MM_RAW_INSPECTOR_MODEL", "opd-mm-outcome")
@@ -1118,6 +1119,36 @@ def test_raw_inspector_backend_environment_overrides_tool_config(monkeypatch) ->
     assert isinstance(session.executor.raw_inspector, RemoteVLLMRawInspector)
     assert session.executor.raw_inspector.base_url == "http://outcome-model:8011"
     assert session.executor.raw_inspector.model == "opd-mm-outcome"
+
+    calls: list[tuple[str, str]] = []
+
+    def inspect(_: RemoteVLLMRawInspector, image_path: str, query: str, **__: Any) -> str:
+        calls.append((image_path, query))
+        return "The remote VLM sees a tabby cat sitting on a sofa."
+
+    monkeypatch.setattr(RemoteVLLMRawInspector, "inspect", inspect)
+    retrieve_tool = OPDRetrieveTool(config={"type": "native", "raw_inspector_backend": "teacher"}, tool_schema=None)
+    await retrieve_tool.execute(
+        "instance",
+        {"method": "bm25", "top_k": 1, "query": "tabby cat sofa"},
+        agent_data=agent_data,
+    )
+    response, _, _ = await tool.execute(
+        "instance",
+        {
+            "target": "current_pool",
+            "instruction": "answer_query_related_visual_details",
+        },
+        agent_data=agent_data,
+    )
+
+    observation = json.loads(response.text)
+    assert calls == [("images/cat.png", "Inspect the image.")]
+    assert observation["error"] == ""
+    assert observation["new_evidence_count"] == 1
+    assert observation["evidence_preview"][-1]["visual_observation"] == (
+        "The remote VLM sees a tabby cat sitting on a sofa."
+    )
 
 
 def test_tool_agent_records_exact_opd_policy_state(monkeypatch) -> None:
@@ -1210,10 +1241,13 @@ def test_opd_sample_converts_to_on_policy_distillation_row() -> None:
         {"role": "system", "content": OPD_MM_SYSTEM_PROMPT},
         {"role": "user", "content": sample.query},
     ]
-    for tool_name in ("RETRIEVE", "FILTER", "SORT", "TOPK", "EXPAND_NEIGHBORS", "INSPECT_RAW", "STOP"):
-        assert tool_name in row["prompt"][0]["content"]
-    assert "scope=full_memory" in row["prompt"][0]["content"]
-    assert "READ" not in row["prompt"][0]["content"]
+    system_prompt = row["prompt"][0]["content"]
+    assert "current observation as authoritative" in system_prompt
+    assert "current pool and evidence supersede earlier observations" in system_prompt
+    assert "Stop only when current evidence is sufficient" in system_prompt
+    assert "public image_id" in system_prompt
+    assert "Tool semantics" not in system_prompt
+    assert "scope=full_memory" not in system_prompt
     assert row["extra_info"]["need_tools_kwargs"] is True
     assert row["extra_info"]["teacher_privilege_mode"] == "opd_mm"
     assert row["extra_info"]["tools_kwargs"]["opd_mm"]["query"] == sample.query
@@ -2244,6 +2278,34 @@ def test_opd_grpo_batch_uses_each_refreshed_state_and_terminal_advantage() -> No
         "trajectory-a",
         "trajectory-b",
     ]
+
+
+def test_opd_grpo_kl_scores_the_refreshed_state_batch() -> None:
+    batch = DataProto.from_dict(
+        tensors={"responses": torch.tensor([[10, 11], [20, 0]])},
+        non_tensors={"opd_mm_grpo_state_batch": np.array([True, True], dtype=object)},
+    )
+    expected_ref_log_prob = torch.tensor([[-0.1, -0.2], [-0.3, 0.0]])
+    seen_batches = []
+    trainer = SimpleNamespace(
+        config=SimpleNamespace(
+            actor_rollout_ref=SimpleNamespace(actor=SimpleNamespace(use_kl_loss=True))
+        ),
+        use_reference_policy=True,
+        _compute_ref_log_prob=lambda state_batch: (
+            seen_batches.append(state_batch)
+            or DataProto.from_dict(tensors={"ref_log_prob": expected_ref_log_prob})
+        ),
+    )
+
+    scored = RayPPOTrainer._attach_opd_mm_grpo_ref_log_prob(trainer, batch)
+
+    assert seen_batches == [batch]
+    assert torch.equal(scored.batch["ref_log_prob"], expected_ref_log_prob)
+
+    trainer.use_reference_policy = False
+    with pytest.raises(RuntimeError, match="requires an initialized reference policy"):
+        RayPPOTrainer._attach_opd_mm_grpo_ref_log_prob(trainer, batch)
 
 
 def test_helpers_build_hidden_store_from_dicts_and_schemas() -> None:

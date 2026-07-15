@@ -590,6 +590,101 @@ def compute_data_metrics(batch: DataProto, use_critic: bool = True) -> dict[str,
     return metrics
 
 
+def compute_reward_extra_metrics(
+    reward_extra_infos: dict[str, Any], prefix: str = "reward"
+) -> dict[str, float]:
+    """Aggregate numeric per-sample reward details for experiment tracking."""
+    metrics: dict[str, float] = {}
+    for key, raw_values in reward_extra_infos.items():
+        values = []
+        for value in np.asarray(raw_values, dtype=object).reshape(-1):
+            if isinstance(value, (bool, int, float, np.number)):
+                numeric_value = float(value)
+                if np.isfinite(numeric_value):
+                    values.append(numeric_value)
+        if not values:
+            continue
+
+        values_array = np.asarray(values, dtype=np.float64)
+        metric_prefix = f"{prefix}/{key}"
+        metrics[f"{metric_prefix}/mean"] = float(np.mean(values_array))
+        metrics[f"{metric_prefix}/std"] = float(np.std(values_array))
+        metrics[f"{metric_prefix}/max"] = float(np.max(values_array))
+        metrics[f"{metric_prefix}/min"] = float(np.min(values_array))
+    return metrics
+
+
+def compute_grpo_group_metrics(batch: DataProto) -> dict[str, float]:
+    """Measure whether repeated GRPO rollouts provide within-prompt learning signal."""
+    if "uid" not in batch.non_tensor_batch or "token_level_scores" not in batch.batch:
+        return {}
+
+    uids = np.asarray(batch.non_tensor_batch["uid"], dtype=object).reshape(-1)
+    scores = batch.batch["token_level_scores"].sum(-1).detach().float().cpu().numpy().reshape(-1)
+    if len(uids) != len(scores):
+        return {}
+
+    grouped_scores: dict[Any, list[float]] = defaultdict(list)
+    for uid, score in zip(uids, scores, strict=True):
+        if np.isfinite(score):
+            grouped_scores[uid].append(float(score))
+    if not grouped_scores:
+        return {}
+
+    group_sizes = np.asarray([len(values) for values in grouped_scores.values()], dtype=np.float64)
+    group_stds = np.asarray([np.std(values) for values in grouped_scores.values()], dtype=np.float64)
+    metrics = {
+        "grpo/group_size/mean": float(np.mean(group_sizes)),
+        "grpo/group_size/max": float(np.max(group_sizes)),
+        "grpo/group_size/min": float(np.min(group_sizes)),
+        "grpo/group_reward_std/mean": float(np.mean(group_stds)),
+        "grpo/group_reward_std/max": float(np.max(group_stds)),
+        "grpo/group_reward_std/min": float(np.min(group_stds)),
+        "grpo/group_nonzero_reward_std/rate": float(np.mean(group_stds > 1e-8)),
+        "grpo/group_all_equal_reward/rate": float(np.mean(group_stds <= 1e-8)),
+    }
+
+    answer_correct = batch.non_tensor_batch.get("opd_mm/answer_correct")
+    if answer_correct is None:
+        return metrics
+
+    answer_correct = np.asarray(answer_correct, dtype=object).reshape(-1)
+    if len(answer_correct) != len(uids):
+        return metrics
+
+    grouped_correctness: dict[Any, list[float]] = defaultdict(list)
+    for uid, value in zip(uids, answer_correct, strict=True):
+        if isinstance(value, (bool, int, float, np.number)):
+            numeric_value = float(value)
+            if np.isfinite(numeric_value):
+                grouped_correctness[uid].append(numeric_value)
+    if not grouped_correctness:
+        return metrics
+
+    correctness_groups = list(grouped_correctness.values())
+    correctness_stds = np.asarray([np.std(values) for values in correctness_groups], dtype=np.float64)
+    metrics.update(
+        {
+            "grpo/group_answer_correct_std/mean": float(np.mean(correctness_stds)),
+            "grpo/group_mixed_answer_correct/rate": float(
+                np.mean(
+                    [
+                        any(value >= 0.5 for value in values) and any(value < 0.5 for value in values)
+                        for values in correctness_groups
+                    ]
+                )
+            ),
+            "grpo/group_all_correct/rate": float(
+                np.mean([all(value >= 0.5 for value in values) for values in correctness_groups])
+            ),
+            "grpo/group_all_incorrect/rate": float(
+                np.mean([all(value < 0.5 for value in values) for values in correctness_groups])
+            ),
+        }
+    )
+    return metrics
+
+
 def compute_timing_metrics(batch: DataProto, timing_raw: dict[str, float]) -> dict[str, Any]:
     """
     Computes timing metrics for different processing stages in PPO training.

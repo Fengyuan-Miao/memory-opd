@@ -63,7 +63,7 @@ OUTCOME_SERVER_GPU_MEMORY_UTIL=${OUTCOME_SERVER_GPU_MEMORY_UTIL:-0.9}
 OUTCOME_SERVER_MAX_MODEL_LEN=${OUTCOME_SERVER_MAX_MODEL_LEN:-40000}
 OUTCOME_SERVER_START_TIMEOUT=${OUTCOME_SERVER_START_TIMEOUT:-900}
 
-rollout_n=${ROLLOUT_N:-4}
+rollout_n=${ROLLOUT_N:-8}
 train_batch_size=${TRAIN_BATCH_SIZE:-12}
 ppo_mini_batch_size=${PPO_MINI_BATCH_SIZE:-$train_batch_size}
 max_prompt_length=${MAX_PROMPT_LENGTH:-4096}
@@ -71,23 +71,35 @@ max_response_length=${MAX_RESPONSE_LENGTH:-2048}
 ppo_max_token_len_per_gpu=${PPO_MAX_TOKEN_LEN_PER_GPU:-8192}
 actor_lr=${ACTOR_LR:-5e-7}
 entropy_coeff=${ENTROPY_COEFF:-0.0}
+kl_loss_coef=${KL_LOSS_COEF:-0.01}
+kl_loss_type=${KL_LOSS_TYPE:-low_var_kl}
 rollout_tp=${ROLLOUT_TP:-2}
 rollout_gpu_mem_util=${ROLLOUT_GPU_MEM_UTIL:-0.4}
-rollout_temperature=${ROLLOUT_TEMPERATURE:-0.8}
+rollout_temperature=${ROLLOUT_TEMPERATURE:-1.0}
 rollout_top_p=${ROLLOUT_TOP_P:-0.95}
 total_epochs=${TOTAL_EPOCHS:-3}
-save_freq=${SAVE_FREQ:-25}
+save_freq=${SAVE_FREQ:-50}
 test_freq=${TEST_FREQ:--1}
 reward_workers=${REWARD_WORKERS:-8}
 
-REPEAT_PENALTY=${REPEAT_PENALTY:-0.02}
-MAX_ACTION_PENALTY=${MAX_ACTION_PENALTY:-0.1}
-ERROR_PENALTY=${ERROR_PENALTY:-0.1}
-NON_STOP_PENALTY=${NON_STOP_PENALTY:-0.1}
-EMPTY_EVIDENCE_PENALTY=${EMPTY_EVIDENCE_PENALTY:-0.1}
+REPEAT_PENALTY=${REPEAT_PENALTY:-0.0}
+MAX_ACTION_PENALTY=${MAX_ACTION_PENALTY:-0.0}
+ERROR_PENALTY=${ERROR_PENALTY:-0.0}
+NON_STOP_PENALTY=${NON_STOP_PENALTY:-0.0}
+EMPTY_EVIDENCE_PENALTY=${EMPTY_EVIDENCE_PENALTY:-0.0}
+EVIDENCE_FREE_BUDGET=${EVIDENCE_FREE_BUDGET:-20}
+EVIDENCE_COUNT_PENALTY=${EVIDENCE_COUNT_PENALTY:-0.0}
+MAX_EVIDENCE_COUNT_PENALTY=${MAX_EVIDENCE_COUNT_PENALTY:-0.0}
+
+ENABLE_WANDB=${ENABLE_WANDB:-1}
+WANDB_MODE=${WANDB_MODE:-online}
+WANDB_PROXY_FALLBACK=${WANDB_PROXY_FALLBACK:-http://127.0.0.1:7896}
+WANDB_DIR=${WANDB_DIR:-$REPO_ROOT/wandb}
+WANDB_ANONYMOUS=${WANDB_ANONYMOUS:-allow}
+WANDB_METRIC_PATTERNS=${WANDB_METRIC_PATTERNS:-'["training/global_step","training/epoch","actor/loss","actor/pg_loss","actor/ppo_kl","actor/kl_loss","actor/kl_coef","actor/grad_norm","actor/lr","actor/pg_clipfrac","actor/opd_mm_grpo_states","reward/score/mean","reward/score/std","reward/opd_mm/answer_correct/mean","reward/opd_mm/answer_correct/std","reward/opd_mm/outcome_evaluated/mean","reward/opd_mm/judge_format_error/mean","reward/opd_mm/terminal_stopped/mean","reward/opd_mm/evidence_count/mean","reward/opd_mm/repeated_actions/mean","reward/opd_mm/max_actions_reached/mean","reward/opd_mm/trajectory_error/mean","grpo/group_reward_std/mean","grpo/group_nonzero_reward_std/rate","grpo/group_all_equal_reward/rate","grpo/group_mixed_answer_correct/rate","grpo/group_all_correct/rate","grpo/group_all_incorrect/rate","num_turns/mean","num_turns/max","response_length/mean","response_length/max","response_length/clip_ratio","response/aborted_ratio"]'}
 
 project_name=${PROJECT_NAME:-verl_grpo_opd_mm}
-experiment_name=${EXPERIMENT_NAME:-opd_mm_qwen35_4b_opd_warmstart_outcome_grpo_${RUN_TIMESTAMP}}
+experiment_name=${EXPERIMENT_NAME:-opd_mm_qwen35_4b_opd_warmstart_grpo_answeronly_n8_temp1p0_kl0p01_${RUN_TIMESTAMP}}
 CHECKPOINT_ROOT=${CHECKPOINT_ROOT:-checkpoints/${project_name}/${experiment_name}}
 LOG_DIR=${LOG_DIR:-logs}
 TRAIN_LOG_PATH=${TRAIN_LOG_PATH:-${LOG_DIR}/${experiment_name}.log}
@@ -106,7 +118,8 @@ RAY_TMP_ROOT=${RAY_TMP_ROOT:-/home/miaofy/rt}
 RAY_TMPDIR=${RAY_TMPDIR:-${RAY_TMP_ROOT}/grpo${RUN_TIMESTAMP:9}}
 TMPDIR=${TMPDIR:-$RAY_TMPDIR}
 
-mkdir -p "$LOG_DIR" "$OPD_MM_STUDENT_ROLLOUT_DUMP_DIR" "$OPD_MM_OUTCOME_REWARD_DUMP_DIR" "$RAY_TMPDIR"
+mkdir -p "$LOG_DIR" "$OPD_MM_STUDENT_ROLLOUT_DUMP_DIR" "$OPD_MM_OUTCOME_REWARD_DUMP_DIR" \
+    "$RAY_TMPDIR" "$WANDB_DIR"
 export PYTHONUNBUFFERED=${PYTHONUNBUFFERED:-1}
 export HYDRA_FULL_ERROR=${HYDRA_FULL_ERROR:-1}
 export RAY_TMPDIR TMPDIR
@@ -123,6 +136,52 @@ export OPD_MM_RAW_INSPECTOR_URL="$OUTCOME_SERVER_BASE_URL"
 export OPD_MM_RAW_INSPECTOR_MODEL="$OUTCOME_SERVED_MODEL"
 export OPD_MM_RAW_INSPECTOR_MAX_TOKENS=${OPD_MM_RAW_INSPECTOR_MAX_TOKENS:-256}
 export OPD_MM_RAW_INSPECTOR_TEMPERATURE=0.0
+export WANDB_MODE WANDB_DIR WANDB_ANONYMOUS
+
+WANDB_LOGGER='["console"]'
+WANDB_TRAINER_ARGS=()
+case "${ENABLE_WANDB,,}" in
+    1|true|yes|on)
+        WANDB_LOGGER='["console","wandb"]'
+        WANDB_TRAINER_ARGS+=(+trainer.wandb_disable_stats=True)
+        WANDB_TRAINER_ARGS+=(+trainer.wandb_metric_patterns="$WANDB_METRIC_PATTERNS")
+        if [[ "${WANDB_MODE,,}" == "online" ]]; then
+            wandb_http_code=$(env \
+                -u HTTP_PROXY -u HTTPS_PROXY -u ALL_PROXY \
+                -u http_proxy -u https_proxy -u all_proxy \
+                curl -sS -o /dev/null -w '%{http_code}' \
+                --connect-timeout 3 --max-time 8 https://api.wandb.ai 2>/dev/null || true)
+            if [[ "$wandb_http_code" != "000" && -n "$wandb_http_code" ]]; then
+                echo "W&B network: direct (HTTP $wandb_http_code)"
+            else
+                wandb_http_code=$(env \
+                    -u HTTP_PROXY -u HTTPS_PROXY -u ALL_PROXY \
+                    -u http_proxy -u https_proxy -u all_proxy \
+                    curl -sS -o /dev/null -w '%{http_code}' \
+                    --proxy "$WANDB_PROXY_FALLBACK" \
+                    --connect-timeout 3 --max-time 8 https://api.wandb.ai 2>/dev/null || true)
+                if [[ "$wandb_http_code" != "000" && -n "$wandb_http_code" ]]; then
+                    export HTTP_PROXY="$WANDB_PROXY_FALLBACK"
+                    export HTTPS_PROXY="$WANDB_PROXY_FALLBACK"
+                    export http_proxy="$WANDB_PROXY_FALLBACK"
+                    export https_proxy="$WANDB_PROXY_FALLBACK"
+                    WANDB_TRAINER_ARGS+=(+trainer.wandb_proxy="$WANDB_PROXY_FALLBACK")
+                    echo "W&B network: proxy $WANDB_PROXY_FALLBACK (HTTP $wandb_http_code)"
+                else
+                    WANDB_MODE=offline
+                    export WANDB_MODE
+                    echo "W&B network unavailable; logging offline under $WANDB_DIR" >&2
+                fi
+            fi
+        fi
+        ;;
+    0|false|no|off)
+        ;;
+    *)
+        echo "Invalid ENABLE_WANDB=$ENABLE_WANDB" >&2
+        exit 1
+        ;;
+esac
 
 outcome_server_pid=""
 cleanup() {
@@ -178,6 +237,14 @@ echo "OUTCOME_MODEL_PATH=${OUTCOME_MODEL_PATH}"
 echo "ROLLOUT_N=${rollout_n}"
 echo "TRAIN_LOG_PATH=${TRAIN_LOG_PATH}"
 echo "OPD_MM_OUTCOME_REWARD_DUMP_DIR=${OPD_MM_OUTCOME_REWARD_DUMP_DIR}"
+echo "EVIDENCE_FREE_BUDGET=${EVIDENCE_FREE_BUDGET}"
+echo "EVIDENCE_COUNT_PENALTY=${EVIDENCE_COUNT_PENALTY}"
+echo "MAX_EVIDENCE_COUNT_PENALTY=${MAX_EVIDENCE_COUNT_PENALTY}"
+echo "KL_LOSS_COEF=${kl_loss_coef}"
+echo "KL_LOSS_TYPE=${kl_loss_type}"
+echo "SAVE_FREQ=${save_freq}"
+echo "WANDB_MODE=${WANDB_MODE}"
+echo "WANDB_DIR=${WANDB_DIR}"
 
 max_num_tokens=$(( max_prompt_length + max_response_length + 1 ))
 
@@ -213,10 +280,18 @@ ACTOR=(
     actor_rollout_ref.actor.ppo_mini_batch_size=${ppo_mini_batch_size}
     actor_rollout_ref.actor.use_dynamic_bsz=True
     actor_rollout_ref.actor.ppo_max_token_len_per_gpu=${ppo_max_token_len_per_gpu}
-    actor_rollout_ref.actor.use_kl_loss=False
+    actor_rollout_ref.actor.use_kl_loss=True
+    actor_rollout_ref.actor.kl_loss_coef=${kl_loss_coef}
+    actor_rollout_ref.actor.kl_loss_type=${kl_loss_type}
     actor_rollout_ref.actor.entropy_coeff=${entropy_coeff}
     actor_rollout_ref.actor.fsdp_config.param_offload=True
     actor_rollout_ref.actor.fsdp_config.optimizer_offload=True
+)
+
+REF=(
+    actor_rollout_ref.ref.log_prob_use_dynamic_bsz=True
+    actor_rollout_ref.ref.log_prob_max_token_len_per_gpu=${ppo_max_token_len_per_gpu}
+    actor_rollout_ref.ref.fsdp_config.param_offload=True
 )
 
 ROLLOUT=(
@@ -243,7 +318,7 @@ ROLLOUT=(
 TRAINER=(
     trainer.use_v1=False
     trainer.balance_batch=True
-    trainer.logger='["console"]'
+    trainer.logger="$WANDB_LOGGER"
     trainer.project_name=${project_name}
     trainer.experiment_name=${experiment_name}
     trainer.n_gpus_per_node=${NGPUS_PER_NODE}
@@ -264,6 +339,9 @@ REWARD=(
     +reward.custom_reward_function.reward_kwargs.error_penalty=${ERROR_PENALTY}
     +reward.custom_reward_function.reward_kwargs.non_stop_penalty=${NON_STOP_PENALTY}
     +reward.custom_reward_function.reward_kwargs.empty_evidence_penalty=${EMPTY_EVIDENCE_PENALTY}
+    +reward.custom_reward_function.reward_kwargs.evidence_free_budget=${EVIDENCE_FREE_BUDGET}
+    +reward.custom_reward_function.reward_kwargs.evidence_count_penalty=${EVIDENCE_COUNT_PENALTY}
+    +reward.custom_reward_function.reward_kwargs.max_evidence_count_penalty=${MAX_EVIDENCE_COUNT_PENALTY}
 )
 
 set +e
@@ -271,8 +349,10 @@ CUDA_VISIBLE_DEVICES="$TRAIN_GPUS" python3 -m verl.trainer.main_ppo \
     "${DATA[@]}" \
     "${MODEL[@]}" \
     "${ACTOR[@]}" \
+    "${REF[@]}" \
     "${ROLLOUT[@]}" \
     "${TRAINER[@]}" \
+    "${WANDB_TRAINER_ARGS[@]}" \
     "${REWARD[@]}" \
     distillation.enabled=False \
     "$@"

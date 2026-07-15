@@ -69,6 +69,8 @@ def test_outcome_reward_generates_answer_before_gold_aware_judge(tmp_path, monke
     assert "bright red" in answer_prompt
     assert "It was red." in judge_prompt
     assert "The bicycle was red." in judge_prompt
+    assert calls[0].get("response_format") is None
+    assert calls[1]["response_format"] == outcome_reward.JUDGE_RESPONSE_FORMAT
     dumped = list(tmp_path.glob("outcome_reward_*.jsonl"))
     assert len(dumped) == 1
     row = json.loads(dumped[0].read_text(encoding="utf-8"))
@@ -130,6 +132,62 @@ def test_outcome_reward_applies_only_bounded_trajectory_penalties(monkeypatch) -
     assert result["score"] == pytest.approx(0.88)
     assert result["opd_mm/repeated_actions"] == 1.0
     assert result["opd_mm/max_actions_reached"] == 1.0
+
+
+def test_outcome_reward_penalizes_evidence_above_free_budget(monkeypatch) -> None:
+    replies = iter(["red", '{"correct": true, "reason": "supported"}'])
+
+    async def fake_chat_completion(**kwargs: Any) -> str:
+        del kwargs
+        return next(replies)
+
+    monkeypatch.setattr(outcome_reward, "_chat_completion", fake_chat_completion)
+    evidence = [{"content": f"evidence {index}"} for index in range(35)]
+    result = asyncio.run(
+        outcome_reward.compute_outcome_score(
+            data_source="opd_mm",
+            solution_str="",
+            ground_truth="red",
+            extra_info={"opd_mm": _state(evidence=evidence)},
+            evidence_free_budget=10,
+            evidence_count_penalty=0.01,
+            max_evidence_count_penalty=0.2,
+        )
+    )
+
+    assert result["score"] == pytest.approx(0.8)
+    assert result["opd_mm/evidence_count"] == 35.0
+    assert result["opd_mm/evidence_excess_count"] == 25.0
+    assert result["opd_mm/evidence_count_penalty"] == pytest.approx(0.2)
+
+
+def test_outcome_reward_marks_invalid_judge_json_without_aborting(tmp_path, monkeypatch) -> None:
+    replies = iter(["red", "not json", '{"correct":', "still not json"])
+
+    async def fake_chat_completion(**kwargs: Any) -> str:
+        del kwargs
+        return next(replies)
+
+    monkeypatch.setattr(outcome_reward, "_chat_completion", fake_chat_completion)
+    monkeypatch.setenv("OPD_MM_OUTCOME_REWARD_DUMP_DIR", str(tmp_path))
+    result = asyncio.run(
+        outcome_reward.compute_outcome_score(
+            data_source="opd_mm",
+            solution_str="",
+            ground_truth="red",
+            extra_info={"opd_mm": _state()},
+            retries=3,
+        )
+    )
+
+    assert result["score"] == 0.0
+    assert result["opd_mm/answer_correct"] == 0.0
+    assert result["opd_mm/outcome_evaluated"] == 0.0
+    assert result["opd_mm/judge_format_error"] == 1.0
+    dumped = list(tmp_path.glob("outcome_reward_*.jsonl"))
+    row = json.loads(dumped[0].read_text(encoding="utf-8"))
+    assert row["judge_raw"] == "still not json"
+    assert "did not return a JSON object" in row["judge_format_error"]
 
 
 def test_outcome_judge_requires_boolean_correct() -> None:

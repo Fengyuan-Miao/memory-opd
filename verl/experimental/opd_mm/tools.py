@@ -886,7 +886,7 @@ class OPDInspectRawTool(OPDBaseTool):
         agent_data = kwargs.get("agent_data")
         runtime = self._runtime(agent_data)
         backend = _optional_str(
-            runtime.get("raw_inspector_backend") or os.getenv("OPD_MM_RAW_INSPECTOR_BACKEND")
+            os.getenv("OPD_MM_RAW_INSPECTOR_BACKEND") or runtime.get("raw_inspector_backend")
         ).lower()
         if backend != "teacher":
             return await super().execute(instance_id, parameters, **kwargs)

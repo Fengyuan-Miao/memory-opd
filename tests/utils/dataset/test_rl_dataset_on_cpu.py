@@ -129,6 +129,7 @@ def test_build_messages_refreshes_opd_mm_system_prompt():
     assert messages[1] == {"role": "user", "content": "What is the latest OPD-MM question?"}
     assert "old OPD-MM prompt" not in str(messages)
     assert "public image_id" in messages[0]["content"]
+    assert "Tool semantics" not in messages[0]["content"]
 
 
 @pytest.mark.parametrize(
