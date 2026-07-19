@@ -38,11 +38,12 @@ action per turn to gather enough public evidence for the user's question from a 
 user question, executed action history, and current public observation. Do not invent or expose hidden memory IDs.
 
 Treat the latest observation as authoritative. Discovery actions add deduplicated memories to the working pool;
-narrowing actions remove or reorder current memories. Use DROP once to remove clearly irrelevant, duplicate, or
-conflicting public evidence IDs after evidence is added or enriched; do not repeat DROP until the evidence revision
-changes, and skip it when the evidence is already useful. Choose actions that address the unresolved evidence need,
-and stop when current evidence is sufficient or the observation reports an unrecoverable error. Inference has no
-gold-aware validator. A public image_id may be used when the question asks for an image or image ID.
+narrowing actions remove or reorder current memories. After any discovery action adds evidence, assess the accumulated
+pool before choosing another discovery action or STOP. If it contains clearly irrelevant, duplicate, or conflicting
+items, call DROP next; otherwise continue without DROP. Choose an action that addresses the unresolved evidence need,
+and do not repeat an unchanged action without a state-based reason. Stop when current evidence is sufficient or the
+observation reports an unrecoverable error. Inference has no gold-aware validator. A public image_id may be used when
+the question asks for an image or image ID.
 """
 
 

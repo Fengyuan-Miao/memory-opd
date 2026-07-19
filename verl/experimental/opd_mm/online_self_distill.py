@@ -92,6 +92,23 @@ def dump_online_step_correction(
     try:
         max_chars = int(os.getenv("OPD_MM_TEACHER_CORRECTION_DUMP_MAX_CHARS", "12000") or "12000")
         include_prompt = os.getenv("OPD_MM_TEACHER_CORRECTION_DUMP_INCLUDE_PROMPT", "1") != "0"
+        raw_kl_credit = correction.get("kl_credit", {}) if isinstance(correction, dict) else {}
+        kl_credit = (
+            {
+                key: raw_kl_credit.get(key)
+                for key in (
+                    "topk",
+                    "action_kl",
+                    "structured_disagreement",
+                    "disagreement_type",
+                )
+                if key in raw_kl_credit
+            }
+            if isinstance(raw_kl_credit, dict)
+            else {}
+        )
+        if isinstance(raw_kl_credit, dict):
+            kl_credit["tool_call_tokens"] = int(sum(raw_kl_credit.get("tool_call_mask") or []))
         record = {
             "time": time.time(),
             "pid": os.getpid(),
@@ -112,6 +129,7 @@ def dump_online_step_correction(
             "teacher_xml_span": correction.get("teacher_xml_span", "") if isinstance(correction, dict) else "",
             "sft_target_xml": correction.get("sft_target_xml", "") if isinstance(correction, dict) else "",
             "stop_gate_applied": correction.get("stop_gate_applied", False) if isinstance(correction, dict) else False,
+            "kl_credit": kl_credit,
         }
         if include_prompt:
             record["verifier_prompt"] = _truncate_for_dump(request.get("verifier_prompt", ""), max_chars)
@@ -757,7 +775,8 @@ Return JSON only:
 Choose exactly one evidence type:
 - none: public evidence is sufficient.
 - no_public_evidence: evidence_count is zero.
-- irrelevant_evidence: evidence exists but concerns the wrong topic, entity, event, or modality.
+- irrelevant_evidence: evidence concerns the wrong answer topic, event, or modality. Never use this type merely
+  because sanitized dialogue says "User" instead of repeating a person name already supplied by the question.
 - missing_metadata_constraint: a query-visible modality, source_type, timestamp, or status constraint is not isolated.
 - candidate_set_too_broad: evidence is relevant but too broad/noisy to answer confidently.
 - missing_neighbor_context: a relevant turn appears present but adjacent dialogue/event context is missing.
@@ -778,6 +797,11 @@ Private answer rubric:
 
 Current public evidence state and observations:
 {json.dumps(observation, ensure_ascii=False, indent=2, default=str)}
+
+Final mandatory check: Mem-Gallery query-to-memory speaker attribution is guaranteed by dataset construction and is
+outside this verifier's task. Do not evaluate or mention whether sanitized "User" matches a query-provided name.
+Evaluate only whether the evidence contains the requested factual content; a missing repeated speaker name cannot
+make evidence insufficient.
 """
 
 
@@ -879,6 +903,12 @@ def build_teacher_correction_prompt(
         "reason": "No verifier feedback was provided.",
         "parse_error": "missing_verifier_feedback",
     }
+    student_output_section = ""
+    if str(student_raw_response or "").strip():
+        student_output_section = f"""
+Student output to correct:
+{student_raw_response}
+"""
     return f"""You are the OPD-MM teacher for one online correction. Produce exactly one next tool action for the
 student-visible state. You are not answering the question or using hidden memory. The output is an SFT target, so
 all arguments must be derivable from the question, public history, and public observation.
@@ -905,9 +935,7 @@ Public action history:
 
 Current public observation:
 {json.dumps(observation, ensure_ascii=False, indent=2, default=str)}
-
-Student output to correct:
-{student_raw_response}
+{student_output_section}
 
 Output the corrected action now. Begin with <tool_call> and include nothing else.
 """
@@ -924,6 +952,8 @@ def build_online_state_correction_request(
     observation: dict[str, Any],
     tool_format: str = "qwen3_coder",
     request_id: str = "",
+    student_response_ids: list[int] | None = None,
+    student_tool_call_mask: list[int] | None = None,
 ) -> dict[str, Any] | None:
     """Build one correction request from the live student-visible state.
 
@@ -969,6 +999,8 @@ def build_online_state_correction_request(
         "student_next_action": next_action,
         "student_raw_response": str(student_raw_response or ""),
         "student_prompt_ids": [int(token) for token in student_prompt_ids],
+        "student_response_ids": [int(token) for token in (student_response_ids or [])],
+        "student_tool_call_mask": [int(bool(value)) for value in (student_tool_call_mask or [])],
         "verifier_prompt": build_state_verifier_prompt(
             query=query,
             gold_answer=gold_answer,

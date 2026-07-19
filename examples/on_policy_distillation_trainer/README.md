@@ -11,7 +11,7 @@ This trainer jointly trains a student model with policy-gradient on-policy rollo
 | `run_qwen3_vl_8b_fsdp.sh`       | single   | VL         | vLLM  | FSDP     | NVIDIA   |
 | `run_qwen3_8b_mopd_fsdp.sh`     | multi    | text + VL  | vLLM  | FSDP     | NVIDIA   |
 | `run_opd_mm_tool_agent_fsdp.sh` | single   | OPD-MM     | vLLM  | FSDP     | NVIDIA   |
-| `run_opd_mm_grpo_fsdp.sh`       | outcome  | OPD-MM     | vLLM  | FSDP     | NVIDIA   |
+| `run_opd_mm_grpo_fsdp.sh`       | privileged + outcome | OPD-MM | vLLM | FSDP | NVIDIA |
 
 Override `STUDENT_MODEL` and `TEACHER_MODEL` via env vars to swap model pairs in
 the single-teacher scripts. The MOPD script exposes per-teacher overrides.
@@ -25,7 +25,7 @@ the single-teacher scripts. The MOPD script exposes per-teacher overrides.
 - `distillation.distillation_loss.use_policy_gradient=True|False`
 - `distillation.distillation_loss.topk=64`
 
-## OPD-MM Warm Start Then GRPO
+## OPD-MM KL-Guided GRPO
 
 `run_opd_mm_grpo_fsdp.sh` starts a fresh GRPO optimizer from a merged OPD actor
 checkpoint. Set `OPD_MODEL_PATH` to a prepared HF directory, or
@@ -46,18 +46,23 @@ python3 examples/data_preprocess/build_mem_gallery_opd_mm_train_subset.py \
   --reserve-eval-samples 100 --reserve-eval-seed 20260705
 ```
 
-The script reserves GPUs 0-5 for actor training and starts a fixed outcome VLM
-on GPUs 6-7. Each query receives four rollouts by default. After a real `STOP`,
+The script reserves GPUs 0-3 for actor training, GPUs 4-5 for a Qwen3.5-9B
+privileged teacher, and GPUs 6-7 for a separate Qwen3.5-9B outcome/INSPECT_RAW
+service. Each query receives four rollouts by default. After a real `STOP`,
 the outcome VLM first answers from the final public evidence without seeing the
 gold answer, then judges that generated answer against the private gold answer.
 Only the terminal correctness and small trajectory penalties become the GRPO
 reward; the judge output is never added to the student context.
 
-Because OPD-MM rebuilds each prompt from the latest bounded accumulated state,
-the rollout stores the exact prompt, sampled action, and rollout log-probability
-at every visited state. The PPO update expands these state-action pairs and
-applies their trajectory's terminal GRPO advantage, instead of recomputing later
-actions from an observation-free concatenated history.
+Because OPD-MM rebuilds each prompt from the latest state, the rollout stores
+the exact prompt, sampled action, payload mask, and rollout log-probability at
+every visited state. Student and privileged teacher top-8 distributions are
+scored on the same student-generated action prefix. Structured tool/argument
+disagreement gates the candidates and the two highest mean-KL action spans per
+trajectory are selected. Groups containing an answer-correct rollout apply
+GRPO only on those spans; all-fail groups apply forward-KL distillation only on
+those spans. There is no full-trajectory loss floor and XML wrappers, prose,
+observations, and unselected actions receive no policy or distillation loss.
 
 ```bash
 bash examples/on_policy_distillation_trainer/run_opd_mm_grpo_fsdp.sh

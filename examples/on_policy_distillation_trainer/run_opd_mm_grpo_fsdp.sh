@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# OPD-MM stage 2 | answer-outcome GRPO from an OPD warm-start checkpoint
+# OPD-MM | KL-guided action-credit GRPO with all-fail privileged distillation
 
 set -xeuo pipefail
 
@@ -48,13 +48,20 @@ OPD_MM_REWARD_PATH=${OPD_MM_REWARD_PATH:-/home/miaofy/memory-opd/verl/experiment
 TRAIN_GPUS=${TRAIN_GPUS:-0,1,2,3,4,5}
 OUTCOME_SERVER_GPUS=${OUTCOME_SERVER_GPUS:-6,7}
 NNODES=${NNODES:-1}
-NGPUS_PER_NODE=${NGPUS_PER_NODE:-6}
+NGPUS_PER_NODE=${NGPUS_PER_NODE:-4}
+TEACHER_NGPUS_PER_NODE=${TEACHER_NGPUS_PER_NODE:-2}
+TEACHER_NNODES=${TEACHER_NNODES:-1}
+TEACHER_MODEL_PATH=${TEACHER_MODEL_PATH:-/home/guojr/data/pretrained_models/Qwen/Qwen3.5-9B}
+TEACHER_TP=${TEACHER_TP:-2}
+TEACHER_MAX_MODEL_LEN=${TEACHER_MAX_MODEL_LEN:-16384}
+OPD_MM_KL_TOPK=${OPD_MM_KL_TOPK:-8}
+OPD_MM_KL_TOP_ACTIONS=${OPD_MM_KL_TOP_ACTIONS:-2}
 
 # One fixed VLM serves INSPECT_RAW, terminal answer generation, and the private
 # correctness judge. Gold is sent only in the second, post-rollout judge call.
 START_OUTCOME_SERVER=${START_OUTCOME_SERVER:-1}
-OUTCOME_MODEL_PATH=${OUTCOME_MODEL_PATH:-/home/guojr/data/pretrained_models/Qwen/Qwen3-VL-8B-Instruct}
-OUTCOME_SERVED_MODEL=${OUTCOME_SERVED_MODEL:-opd-mm-outcome}
+OUTCOME_MODEL_PATH=${OUTCOME_MODEL_PATH:-/home/guojr/data/pretrained_models/Qwen/Qwen3.5-9B}
+OUTCOME_SERVED_MODEL=${OUTCOME_SERVED_MODEL:-qwen35-9b-outcome}
 OUTCOME_SERVER_HOST=${OUTCOME_SERVER_HOST:-127.0.0.1}
 OUTCOME_SERVER_PORT=${OUTCOME_SERVER_PORT:-8011}
 OUTCOME_SERVER_BASE_URL=${OUTCOME_SERVER_BASE_URL:-http://${OUTCOME_SERVER_HOST}:${OUTCOME_SERVER_PORT}}
@@ -87,12 +94,13 @@ NON_STOP_PENALTY=${NON_STOP_PENALTY:-0.1}
 EMPTY_EVIDENCE_PENALTY=${EMPTY_EVIDENCE_PENALTY:-0.1}
 
 project_name=${PROJECT_NAME:-verl_grpo_opd_mm}
-experiment_name=${EXPERIMENT_NAME:-opd_mm_qwen35_4b_opd_warmstart_outcome_grpo_${RUN_TIMESTAMP}}
+experiment_name=${EXPERIMENT_NAME:-opd_mm_qwen35_4b_klcredit_top2_grpo_teacher9b_${RUN_TIMESTAMP}}
 CHECKPOINT_ROOT=${CHECKPOINT_ROOT:-checkpoints/${project_name}/${experiment_name}}
 LOG_DIR=${LOG_DIR:-logs}
 TRAIN_LOG_PATH=${TRAIN_LOG_PATH:-${LOG_DIR}/${experiment_name}.log}
 OPD_MM_STUDENT_ROLLOUT_DUMP_DIR=${OPD_MM_STUDENT_ROLLOUT_DUMP_DIR:-${LOG_DIR}/opd_mm_grpo_rollouts_${RUN_TIMESTAMP}}
 OPD_MM_OUTCOME_REWARD_DUMP_DIR=${OPD_MM_OUTCOME_REWARD_DUMP_DIR:-${LOG_DIR}/opd_mm_grpo_outcomes_${RUN_TIMESTAMP}}
+OPD_MM_TEACHER_CORRECTION_DUMP_DIR=${OPD_MM_TEACHER_CORRECTION_DUMP_DIR:-${LOG_DIR}/opd_mm_kl_credit_${RUN_TIMESTAMP}}
 OUTCOME_SERVER_LOG=${OUTCOME_SERVER_LOG:-${LOG_DIR}/${experiment_name}_outcome_server.log}
 
 RUN_POST_TRAIN_EVAL=${RUN_POST_TRAIN_EVAL:-1}
@@ -106,13 +114,20 @@ RAY_TMP_ROOT=${RAY_TMP_ROOT:-/home/miaofy/rt}
 RAY_TMPDIR=${RAY_TMPDIR:-${RAY_TMP_ROOT}/grpo${RUN_TIMESTAMP:9}}
 TMPDIR=${TMPDIR:-$RAY_TMPDIR}
 
-mkdir -p "$LOG_DIR" "$OPD_MM_STUDENT_ROLLOUT_DUMP_DIR" "$OPD_MM_OUTCOME_REWARD_DUMP_DIR" "$RAY_TMPDIR"
+mkdir -p "$LOG_DIR" "$OPD_MM_STUDENT_ROLLOUT_DUMP_DIR" "$OPD_MM_OUTCOME_REWARD_DUMP_DIR" \
+    "$OPD_MM_TEACHER_CORRECTION_DUMP_DIR" "$RAY_TMPDIR"
 export PYTHONUNBUFFERED=${PYTHONUNBUFFERED:-1}
 export HYDRA_FULL_ERROR=${HYDRA_FULL_ERROR:-1}
 export RAY_TMPDIR TMPDIR
 export OPD_MM_STUDENT_ROLLOUT_DUMP_DIR
 export OPD_MM_STUDENT_ROLLOUT_DUMP_MAX_CHARS=${OPD_MM_STUDENT_ROLLOUT_DUMP_MAX_CHARS:-12000}
 export OPD_MM_RECORD_POLICY_STATES=1
+export OPD_MM_KL_TOPK
+export OPD_MM_KL_CREDIT_ASSIGNMENT=1
+export OPD_MM_SKIP_INITIAL_CORRECTION=0
+export OPD_MM_TEACHER_CORRECTION_DUMP_DIR
+export OPD_MM_TEACHER_CORRECTION_DUMP_MAX_CHARS=${OPD_MM_TEACHER_CORRECTION_DUMP_MAX_CHARS:-12000}
+export OPD_MM_TEACHER_CORRECTION_DUMP_INCLUDE_PROMPT=${OPD_MM_TEACHER_CORRECTION_DUMP_INCLUDE_PROMPT:-0}
 export OPD_MM_OUTCOME_REWARD_DUMP_DIR
 export OPD_MM_OUTCOME_BASE_URL="$OUTCOME_SERVER_BASE_URL"
 export OPD_MM_OUTCOME_MODEL="$OUTCOME_SERVED_MODEL"
@@ -175,6 +190,9 @@ echo "EXPERIMENT_NAME=${experiment_name}"
 echo "TRAIN_GPUS=${TRAIN_GPUS}"
 echo "OUTCOME_SERVER_BASE_URL=${OUTCOME_SERVER_BASE_URL}"
 echo "OUTCOME_MODEL_PATH=${OUTCOME_MODEL_PATH}"
+echo "TEACHER_MODEL_PATH=${TEACHER_MODEL_PATH}"
+echo "OPD_MM_KL_TOPK=${OPD_MM_KL_TOPK}"
+echo "OPD_MM_KL_TOP_ACTIONS=${OPD_MM_KL_TOP_ACTIONS}"
 echo "ROLLOUT_N=${rollout_n}"
 echo "TRAIN_LOG_PATH=${TRAIN_LOG_PATH}"
 echo "OPD_MM_OUTCOME_REWARD_DUMP_DIR=${OPD_MM_OUTCOME_REWARD_DUMP_DIR}"
@@ -184,6 +202,9 @@ max_num_tokens=$(( max_prompt_length + max_response_length + 1 ))
 DATA=(
     algorithm.adv_estimator=grpo
     algorithm.use_kl_in_reward=False
+    +algorithm.opd_mm_kl_credit.enabled=True
+    +algorithm.opd_mm_kl_credit.top_actions=${OPD_MM_KL_TOP_ACTIONS}
+    +algorithm.opd_mm_kl_credit.success_key=opd_mm/answer_correct
     algorithm.rollout_correction.bypass_mode=True
     algorithm.rollout_correction.loss_type=ppo_clip
     data.train_files="$OPD_MM_TRAIN_FILES"
@@ -266,6 +287,26 @@ REWARD=(
     +reward.custom_reward_function.reward_kwargs.empty_evidence_penalty=${EMPTY_EVIDENCE_PENALTY}
 )
 
+DISTILLATION=(
+    distillation.enabled=True
+    distillation.n_gpus_per_node=${TEACHER_NGPUS_PER_NODE}
+    distillation.nnodes=${TEACHER_NNODES}
+    distillation.teacher_key=data_source
+    distillation.distillation_loss.loss_mode=forward_kl_topk
+    distillation.distillation_loss.topk=${OPD_MM_KL_TOPK}
+    distillation.distillation_loss.use_task_rewards=True
+    distillation.distillation_loss.use_policy_gradient=False
+    distillation.distillation_loss.distillation_loss_coef=1.0
+    distillation.distillation_loss.log_prob_min_clamp=-10.0
+    distillation.teacher_models.teacher_model.model_path="$TEACHER_MODEL_PATH"
+    distillation.teacher_models.teacher_model.inference.tensor_model_parallel_size=${TEACHER_TP}
+    distillation.teacher_models.teacher_model.inference.gpu_memory_utilization=0.85
+    distillation.teacher_models.teacher_model.inference.max_model_len=${TEACHER_MAX_MODEL_LEN}
+    distillation.teacher_models.teacher_model.inference.max_num_batched_tokens=${TEACHER_MAX_MODEL_LEN}
+    distillation.teacher_models.teacher_model.inference.enable_prefix_caching=True
+    distillation.teacher_models.teacher_model.inference.enforce_eager=False
+)
+
 set +e
 CUDA_VISIBLE_DEVICES="$TRAIN_GPUS" python3 -m verl.trainer.main_ppo \
     "${DATA[@]}" \
@@ -274,7 +315,7 @@ CUDA_VISIBLE_DEVICES="$TRAIN_GPUS" python3 -m verl.trainer.main_ppo \
     "${ROLLOUT[@]}" \
     "${TRAINER[@]}" \
     "${REWARD[@]}" \
-    distillation.enabled=False \
+    "${DISTILLATION[@]}" \
     "$@"
 train_status=$?
 set -e

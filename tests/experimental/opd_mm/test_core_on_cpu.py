@@ -181,6 +181,24 @@ def _neighbor_records() -> list[MemoryRecord]:
     ]
 
 
+def test_public_evidence_resolves_mem_gallery_profile_speaker() -> None:
+    record = MemoryRecord(
+        memory_id="julian_turn",
+        turn_id="D5:5",
+        timestamp="2024-08-21T0005",
+        author="dialogue",
+        modality="text",
+        source_type="dialogue_turn",
+        content="User: Personalized therapy can match a person's needs.\nAssistant: That could help.",
+        metadata={"character_profile": {"name": "Julian Vance"}},
+    )
+
+    evidence = ToolExecutor._pool_evidence(HiddenMemoryStore([record]).initial_pool())
+
+    assert evidence[0].fields["content"].startswith("Julian Vance: Personalized therapy")
+    assert "User:" not in evidence[0].fields["content"]
+
+
 class FakeRawInspector:
     def __init__(self) -> None:
         self.calls: list[str] = []
@@ -833,6 +851,10 @@ async def test_retrieve_tool_adds_public_evidence_before_inspect_raw() -> None:
     assert observation["evidence_revision"] == 1
     assert observation["last_drop_revision"] == 0
     assert [item["evidence_id"] for item in observation["evidence_catalog"]] == ["E1", "E2"]
+    assert [item["evidence_id"] for item in observation["evidence"]] == ["E1", "E2"]
+    assert all("source" not in item and "author" not in item for item in observation["evidence"])
+    assert {item["modality"] for item in observation["evidence"]} == {"text", "image"}
+    assert any("tabby cat" in item["content"] for item in observation["evidence"])
     assert all("source" not in item and "author" not in item for item in observation["evidence_preview"])
     assert {item["modality"] for item in observation["evidence_preview"]} == {"text", "image"}
     image_preview = [item for item in observation["evidence_preview"] if item["modality"] == "image"]
@@ -965,7 +987,7 @@ async def test_bounded_merge_prioritizes_latest_discovery_results() -> None:
 
 
 @pytest.mark.asyncio
-async def test_tool_observation_stays_bounded_when_refreshed_evidence_grows() -> None:
+async def test_tool_observation_includes_complete_public_evidence() -> None:
     records = [
         MemoryRecord(
             memory_id=f"bounded_{index}",
@@ -999,11 +1021,13 @@ async def test_tool_observation_stays_bounded_when_refreshed_evidence_grows() ->
     assert len(observation["pool_preview"]) == 3
     assert len(observation["evidence_preview"]) == 4
     assert len(observation["evidence_catalog"]) == 24
+    assert len(observation["evidence"]) == 24
+    assert all(len(item["content"]) > 1000 for item in observation["evidence"])
     assert all(len(item["content"]) <= 234 for item in observation["pool_preview"])
     assert all(len(item["content"]) <= 234 for item in observation["evidence_preview"])
     assert "new_evidence" not in observation
     assert "last_action" not in observation
-    assert len(response.text) < 8000
+    assert "memory_id" not in response.text
 
 
 @pytest.mark.asyncio
@@ -1290,13 +1314,18 @@ def test_tool_agent_records_exact_opd_policy_state(monkeypatch) -> None:
         state_prompt_ids=[1, 2, 3],
         response_ids=[4, 5],
         response_logprobs=[-0.1, -0.2],
+        tool_call_mask=[1, 1],
+        student_next_action={"tool": "STOP"},
     )
 
     assert agent_data.extra_fields["opd_mm_policy_states"] == [
         {
+            "step_index": 0,
             "prompt_ids": [1, 2, 3],
             "response_ids": [4, 5],
             "response_logprobs": [-0.1, -0.2],
+            "tool_call_mask": [1, 1],
+            "student_next_action": {"tool": "STOP"},
         }
     ]
 
@@ -1374,8 +1403,9 @@ def test_opd_sample_converts_to_on_policy_distillation_row() -> None:
     ]
     system_prompt = row["prompt"][0]["content"]
     assert "Discovery actions add deduplicated memories" in system_prompt
-    assert "Use DROP once" in system_prompt
-    assert "do not repeat DROP until the evidence revision" in system_prompt
+    assert "assess the accumulated" in system_prompt
+    assert "call DROP next; otherwise continue without DROP" in system_prompt
+    assert "do not repeat an unchanged action without a state-based reason" in system_prompt
     assert "hidden memory IDs" in system_prompt
     assert "READ" not in row["prompt"][0]["content"]
     assert row["extra_info"]["need_tools_kwargs"] is True
@@ -1898,6 +1928,9 @@ def test_live_online_state_request_uses_current_state_without_snapshot_replay() 
     assert request["observation"]["evidence_count"] == 1
     assert request["student_next_action"] == {"tool": "STOP"}
     assert "SECRET_GOLD_ANSWER" in request["verifier_prompt"]
+    assert "speaker attribution is guaranteed by dataset construction" in request["verifier_prompt"]
+    assert "Do not evaluate or mention whether sanitized" in request["verifier_prompt"]
+    assert "a missing repeated speaker name cannot" in request["verifier_prompt"]
 
 
 def test_live_online_state_request_includes_initial_state_by_default() -> None:
@@ -2478,6 +2511,7 @@ def test_helpers_build_hidden_store_from_dicts_and_schemas() -> None:
     drop_schema = schemas[5]
     assert drop_schema["function"]["parameters"]["required"] == ["evidence_ids"]
     assert drop_schema["function"]["parameters"]["properties"]["evidence_ids"]["items"]["pattern"] == "^E[1-9][0-9]*$"
+    assert "Other useful evidence does not prevent removing such items" in drop_schema["function"]["description"]
     dynamic_schemas = openai_tool_schemas(include_inspect_raw=False, evidence_ids=["E2", "E7"])
     dynamic_drop_schema = dynamic_schemas[5]
     assert dynamic_drop_schema["function"]["parameters"]["properties"]["evidence_ids"]["items"]["enum"] == [

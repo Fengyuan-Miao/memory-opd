@@ -436,7 +436,7 @@ def _sanitize_pool_preview(
     preview = []
     for item in items[:max_items]:
         memory = item.memory
-        content = memory.content or memory.summary
+        content = ToolExecutor._public_content(memory)
         entry = {
             "evidence_id": evidence_ids_by_memory[memory.memory_id],
             "image_id": memory.public_image_id(),
@@ -468,7 +468,7 @@ def _sanitize_evidence_catalog(
         entry: dict[str, Any] = {
             "evidence_id": evidence_ids_by_memory[memory.memory_id],
             "content": _clip_text(
-                fields.get("content") or memory.content or memory.summary,
+                fields.get("content") or ToolExecutor._public_content(memory),
                 OBSERVATION_CATALOG_TEXT_MAX_CHARS,
             ),
             "visual_observation": _clip_text(
@@ -780,6 +780,14 @@ class OPDToolSession:
                 self.evidence,
                 self.evidence_ids_by_memory,
             ),
+            # The next student action, verifier, and correction teacher must
+            # judge the same answer-bearing public evidence.  Keep compact
+            # previews for quick pool inspection and DROP selection, but do
+            # not make them the only evidence available to the policy.
+            "evidence": _sanitize_evidence(
+                self.evidence,
+                self.evidence_ids_by_memory,
+            ),
             "evidence_preview": _sanitize_evidence_preview(
                 self.evidence,
                 self.evidence_ids_by_memory,
@@ -1020,8 +1028,9 @@ class OPDDropTool(OPDBaseTool):
     tool_name = "drop"
     description = (
         "Remove clearly irrelevant, duplicate, or conflicting memories from the current candidate pool using "
-        "their public evidence_id values. Submit all removals in one call. Do not call again until a later action "
-        "adds or enriches evidence; omit this action when the current evidence is already useful."
+        "their public evidence_id values. Other useful evidence does not prevent removing such items. Submit all "
+        "removals in one call; skip this action when no item is clearly removable, and do not call again until a "
+        "later action adds or enriches evidence."
     )
     properties = {
         "evidence_ids": {

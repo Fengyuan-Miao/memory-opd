@@ -513,6 +513,25 @@ class ToolExecutor:
         )
 
     @staticmethod
+    def _public_content(memory: Any) -> str:
+        """Return answer-bearing content with the public dialogue speaker name.
+
+        Mem-Gallery stores the profile person's utterance under the generic
+        ``User:`` label.  Queries use the profile name, so leaving that label
+        generic creates a false speaker-attribution gap for both the policy and
+        verifier.  Resolving the public label does not expose an internal ID or
+        hidden answer; it only makes the stored dialogue attribution explicit.
+        """
+        content = str(memory.content or memory.summary or "")
+        if not content or str(memory.modality).lower() != "text":
+            return content
+        profile = (memory.metadata or {}).get("character_profile")
+        speaker_name = str(profile.get("name") or "").strip() if isinstance(profile, dict) else ""
+        if not speaker_name:
+            return content
+        return re.sub(r"(?m)^User:", f"{speaker_name}:", content)
+
+    @staticmethod
     def _pool_evidence(
         pool: List[PoolItem],
         fields: tuple[str, ...] = PUBLIC_EVIDENCE_FIELDS,
@@ -526,7 +545,7 @@ class ToolExecutor:
                     # Public observations expose one answer-useful text field.
                     # Some image records store their caption in summary only,
                     # so fall back to it without duplicating the same text.
-                    values[field] = item.memory.content or item.memory.summary
+                    values[field] = ToolExecutor._public_content(item.memory)
                 else:
                     values[field] = item.memory.field_value(field)
             if "session_date" not in values:
@@ -657,11 +676,7 @@ class ToolExecutor:
             memory = item.memory
             if memory.raw_pointer:
                 continue
-            text = " ".join(
-                value
-                for value in [memory.summary, memory.content]
-                if value
-            ).strip()
+            text = ToolExecutor._public_content(memory).strip()
             if not text:
                 continue
             contexts.setdefault(memory.turn_id, []).append(text)

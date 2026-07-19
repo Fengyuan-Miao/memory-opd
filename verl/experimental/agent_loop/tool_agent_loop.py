@@ -48,6 +48,7 @@ SPEC_DECODE_EXTRA_KEYS = (
 )
 
 TOOL_CALL_XML_RE = re.compile(r"<tool_call>.*?</tool_call>", re.DOTALL)
+TOOL_CALL_PAYLOAD_RE = re.compile(r"<tool_call>(.*?)</tool_call>", re.DOTALL)
 
 
 def _last_user_text(messages: list[dict[str, Any]]) -> str:
@@ -165,6 +166,41 @@ def build_tool_call_xml_span_mask(tokenizer: Any, response_ids: list[int]) -> li
         return mask
 
     # Fallback for tokenizers without offset mappings.
+    for span_start, span_end in spans:
+        start = len(tokenizer.encode(text[:span_start], add_special_tokens=False))
+        end = start + len(tokenizer.encode(text[span_start:span_end], add_special_tokens=False))
+        for index in range(max(0, start), min(len(mask), end)):
+            mask[index] = 1
+    return mask
+
+
+def build_tool_call_payload_mask(tokenizer: Any, response_ids: list[int]) -> list[int]:
+    """Keep the serialized function payload while excluding prose and XML wrappers."""
+    if not response_ids:
+        return []
+
+    text = tokenizer.decode(response_ids, skip_special_tokens=False)
+    spans = [match.span(1) for match in TOOL_CALL_PAYLOAD_RE.finditer(text)]
+    last_open = text.rfind("<tool_call>")
+    last_close = text.rfind("</tool_call>")
+    if last_open >= 0 and last_open > last_close:
+        spans.append((last_open + len("<tool_call>"), len(text)))
+    if not spans:
+        return [0] * len(response_ids)
+
+    try:
+        encoded = tokenizer(text, add_special_tokens=False, return_offsets_mapping=True)
+        offsets = encoded.get("offset_mapping")
+    except Exception:
+        offsets = None
+
+    mask = [0] * len(response_ids)
+    if offsets is not None:
+        for index, (start, end) in enumerate(offsets[: len(response_ids)]):
+            if any(start < span_end and end > span_start for span_start, span_end in spans):
+                mask[index] = 1
+        return mask
+
     for span_start, span_end in spans:
         start = len(tokenizer.encode(text[:span_start], add_special_tokens=False))
         end = start + len(tokenizer.encode(text[span_start:span_end], add_special_tokens=False))
@@ -443,11 +479,22 @@ class ToolAgentLoop(AgentLoopBase):
             agent_data.response_ids, tools
         )
         agent_data.last_assistant_content = assistant_content or ""
+        student_next_action = None
+        if agent_data.tool_calls:
+            tool_call = agent_data.tool_calls[0]
+            try:
+                arguments = json.loads(tool_call.arguments)
+            except (TypeError, json.JSONDecodeError):
+                arguments = {"raw_arguments": tool_call.arguments}
+            if isinstance(arguments, dict):
+                student_next_action = {"tool": str(tool_call.name).upper(), **arguments}
         self._record_opd_mm_policy_state(
             agent_data=agent_data,
             state_prompt_ids=state_prompt_ids,
             response_ids=agent_data.response_ids,
             response_logprobs=output.log_probs,
+            tool_call_mask=build_tool_call_payload_mask(self.tokenizer, agent_data.response_ids),
+            student_next_action=student_next_action,
         )
         await self._collect_online_state_correction(
             agent_data=agent_data,
@@ -478,6 +525,8 @@ class ToolAgentLoop(AgentLoopBase):
         state_prompt_ids: list[int],
         response_ids: list[int],
         response_logprobs: Optional[list[float]],
+        tool_call_mask: list[int],
+        student_next_action: Optional[dict[str, Any]],
     ) -> None:
         """Keep the actual refreshed state/action pair for a later GRPO update."""
         enabled = str(os.getenv("OPD_MM_RECORD_POLICY_STATES") or "").strip().lower()
@@ -487,11 +536,17 @@ class ToolAgentLoop(AgentLoopBase):
         if not isinstance(opd_runtime, dict) or not response_ids:
             return
         logprobs = list(response_logprobs or [])
+        if len(tool_call_mask) != len(response_ids):
+            raise RuntimeError("OPD-MM tool-call mask is not aligned with the sampled action")
+        step_index = len(agent_data.extra_fields.get("opd_mm_policy_states", []))
         agent_data.extra_fields.setdefault("opd_mm_policy_states", []).append(
             {
+                "step_index": step_index,
                 "prompt_ids": [int(token) for token in state_prompt_ids],
                 "response_ids": [int(token) for token in response_ids],
                 "response_logprobs": [float(value) for value in logprobs],
+                "tool_call_mask": [int(bool(value)) for value in tool_call_mask],
+                "student_next_action": student_next_action,
             }
         )
 
@@ -542,12 +597,22 @@ class ToolAgentLoop(AgentLoopBase):
             multi_modal_data["audios"] = agent_data.audio_data
 
         try:
+            latest_policy_state = None
+            policy_states = agent_data.extra_fields.get("opd_mm_policy_states")
+            if isinstance(policy_states, list) and policy_states:
+                latest_policy_state = policy_states[-1]
             correction = await corrector(
                 {
                     "request_id": agent_data.request_id,
                     "step_index": max(0, agent_data.assistant_turns - 1),
                     "student_prompt_ids": list(state_prompt_ids),
                     "student_raw_response": self.tokenizer.decode(response_ids, skip_special_tokens=False),
+                    "student_response_ids": list(response_ids),
+                    "student_tool_call_mask": (
+                        list(latest_policy_state.get("tool_call_mask") or [])
+                        if isinstance(latest_policy_state, dict)
+                        else build_tool_call_payload_mask(self.tokenizer, response_ids)
+                    ),
                     "student_next_action": student_next_action,
                     "history": observation.get("trace") or [],
                     "observation": observation,
