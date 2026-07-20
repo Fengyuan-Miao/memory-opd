@@ -16,7 +16,35 @@ import sys
 import types
 from unittest.mock import MagicMock, patch
 
-from verl.utils.tracking import ValidationGenerationsLogger
+from verl.utils.tracking import Tracking, ValidationGenerationsLogger
+
+
+def test_tracking_configures_wandb_proxy_and_disables_hardware_stats():
+    mock_wandb = MagicMock()
+    mock_settings = object()
+    mock_wandb.Settings.return_value = mock_settings
+    config = {
+        "trainer": {
+            "wandb_proxy": "http://127.0.0.1:7896",
+            "wandb_disable_stats": True,
+        }
+    }
+
+    with patch.dict(sys.modules, {"wandb": mock_wandb}):
+        tracker = Tracking("opd-mm", "health-test", ["wandb"], config=config)
+
+    mock_wandb.Settings.assert_called_once_with(
+        https_proxy="http://127.0.0.1:7896",
+        x_disable_stats=True,
+    )
+    mock_wandb.init.assert_called_once_with(
+        project="opd-mm",
+        name="health-test",
+        entity=None,
+        config=config,
+        settings=mock_settings,
+    )
+    tracker.logger.clear()
 
 
 def test_validation_generations_logger_logs_trackio_traces():

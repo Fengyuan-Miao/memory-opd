@@ -38,7 +38,6 @@ from verl.experimental.opd_mm.schema import (
     EXPAND_NEIGHBOR_WINDOWS,
     FILTER_FIELDS,
     FILTER_OPS,
-    FILTER_SCOPES,
     INSPECT_INSTRUCTIONS,
     INSPECT_TARGETS,
     RETRIEVAL_METHODS,
@@ -58,9 +57,6 @@ DEFAULT_HYBRID_MODEL_PATH = "/home/miaofy/data/pretrained_models/gme-Qwen2-VL-2B
 DEFAULT_RAW_INSPECTOR_TIMEOUT = 60.0
 DEFAULT_RAW_INSPECTOR_MAX_TOKENS = 256
 OBSERVATION_TEXT_MAX_CHARS = 220
-OBSERVATION_CATALOG_TEXT_MAX_CHARS = 96
-OBSERVATION_POOL_PREVIEW_ITEMS = 3
-OBSERVATION_EVIDENCE_PREVIEW_ITEMS = 4
 
 
 def _property(type_: str | list[str], description: str, enum: Optional[list[Any]] = None) -> dict[str, Any]:
@@ -381,106 +377,30 @@ def hidden_store_from_records(
 def _sanitize_evidence(
     items: list[EvidenceItem], evidence_ids_by_memory: dict[str, str]
 ) -> list[dict[str, Any]]:
-    sanitized = []
+    """Expose one complete public record per memory.
+
+    A memory can have both a MEMORY item and an INSPECT_RAW item internally.
+    Merge those fields into the same public entry so the model never receives
+    duplicate copies of one memory.
+    """
+    sanitized_by_memory: dict[str, dict[str, Any]] = {}
     for item in items:
         data = item.to_dict()
         data.pop("memory_id", None)
         data.pop("source", None)
         data.pop("author", None)
-        data["evidence_id"] = evidence_ids_by_memory[item.memory_id]
-        sanitized.append(data)
-    return sanitized
+        entry = sanitized_by_memory.setdefault(
+            item.memory_id,
+            {"evidence_id": evidence_ids_by_memory[item.memory_id]},
+        )
+        entry.update({key: value for key, value in data.items() if value not in (None, "")})
+    return list(sanitized_by_memory.values())
 
 
 def _clip_text(value: Any, max_chars: int = OBSERVATION_TEXT_MAX_CHARS) -> Any:
     if not isinstance(value, str) or len(value) <= max_chars:
         return value
     return value[:max_chars].rstrip() + "...(truncated)"
-
-
-def _sanitize_evidence_preview(
-    items: list[EvidenceItem],
-    evidence_ids_by_memory: dict[str, str],
-    max_items: int = OBSERVATION_EVIDENCE_PREVIEW_ITEMS,
-) -> list[dict[str, Any]]:
-    """Return a compact evidence preview with trajectory-local public IDs."""
-    preview = []
-    for item in items[-max_items:]:
-        data = item.to_dict()
-        data.pop("memory_id", None)
-        fields = data.get("fields") if isinstance(data.get("fields"), dict) else data
-        entry: dict[str, Any] = {"evidence_id": evidence_ids_by_memory[item.memory_id]}
-        for key in (
-            "image_id",
-            "content",
-            "visual_observation",
-            "linked_text_context",
-            "timestamp",
-            "session_date",
-            "modality",
-            "retrieval_score",
-        ):
-            value = fields.get(key)
-            if value not in (None, ""):
-                entry[key] = _clip_text(value)
-        preview.append({key: value for key, value in entry.items() if value not in (None, "")})
-    return preview
-
-
-def _sanitize_pool_preview(
-    items: list[PoolItem],
-    evidence_ids_by_memory: dict[str, str],
-    max_items: int = OBSERVATION_POOL_PREVIEW_ITEMS,
-) -> list[dict[str, Any]]:
-    """Return an internal-ID-free preview of the current working pool."""
-    preview = []
-    for item in items[:max_items]:
-        memory = item.memory
-        content = ToolExecutor._public_content(memory)
-        entry = {
-            "evidence_id": evidence_ids_by_memory[memory.memory_id],
-            "image_id": memory.public_image_id(),
-            "content": _clip_text(content) if content else None,
-            "timestamp": memory.timestamp,
-            "modality": memory.modality,
-            "session_date": memory.metadata.get("session_date"),
-        }
-        if item.score:
-            entry["retrieval_score"] = item.score
-        preview.append({key: value for key, value in entry.items() if value is not None})
-    return preview
-
-
-def _sanitize_evidence_catalog(
-    pool: list[PoolItem],
-    evidence: list[EvidenceItem],
-    evidence_ids_by_memory: dict[str, str],
-) -> list[dict[str, Any]]:
-    """Return every droppable candidate with enough public content for relevance decisions."""
-    fields_by_memory: dict[str, dict[str, Any]] = {}
-    for item in evidence:
-        fields_by_memory.setdefault(item.memory_id, {}).update(item.fields)
-
-    catalog = []
-    for item in pool:
-        memory = item.memory
-        fields = fields_by_memory.get(memory.memory_id, {})
-        entry: dict[str, Any] = {
-            "evidence_id": evidence_ids_by_memory[memory.memory_id],
-            "content": _clip_text(
-                fields.get("content") or ToolExecutor._public_content(memory),
-                OBSERVATION_CATALOG_TEXT_MAX_CHARS,
-            ),
-            "visual_observation": _clip_text(
-                fields.get("visual_observation"),
-                OBSERVATION_CATALOG_TEXT_MAX_CHARS,
-            ),
-            "image_id": memory.public_image_id(),
-            "timestamp": memory.timestamp,
-            "modality": memory.modality,
-        }
-        catalog.append({key: value for key, value in entry.items() if value not in (None, "")})
-    return catalog
 
 
 def _update_dynamic_drop_schema(agent_data: Any, evidence_ids: list[str]) -> None:
@@ -542,24 +462,15 @@ class OPDToolSession:
                 action = ToolAction("STOP")
             self.executor.validator._validate_action(action, len(self.trace))
             if action.tool == "FILTER":
-                scope = action.arguments["scope"]
-                source_pool = self.executor._filter_source_pool(
-                    self.pool,
-                    self.memory_store,
-                    scope,
-                )
                 filtered = self.executor._filter(
-                    source_pool,
+                    self.memory_store.initial_pool(),
                     field=action.arguments["field"],
                     op=action.arguments["op"],
                     value=action.arguments["value"],
                 )
-                if scope == "full_memory":
-                    self.pool, self.pool_overflow_count = self.executor._merge_discovery_pool(
-                        self.pool, filtered, self.pool_has_candidates
-                    )
-                else:
-                    self.pool = filtered[: self.executor.max_pool_size]
+                self.pool, self.pool_overflow_count = self.executor._merge_discovery_pool(
+                    self.pool, filtered, self.pool_has_candidates
+                )
                 self.pool_has_candidates = True
                 new_evidence = self.executor._refresh_evidence_from_pool(
                     self.evidence, self.pool, source="FILTER"
@@ -744,12 +655,11 @@ class OPDToolSession:
         return self._observation(action, inspected, step_error)
 
     def _observation(self, action: ToolAction, new_evidence: list[EvidenceItem], error: str) -> dict[str, Any]:
-        """Return a bounded snapshot of the current accumulated state.
+        """Return the current accumulated state with one entry per memory.
 
         ToolAgentLoop already keeps the assistant tool call in message history,
-        so repeating its full arguments here only grows the prompt.  Candidate
-        and evidence previews have fixed item and text limits regardless of the
-        size of the current pool.
+        so repeating its full arguments here only grows the prompt. The pool's
+        capacity bounds this complete evidence list without text truncation.
         """
         visible_pool = self.pool if self.pool_has_candidates else []
         self.executor._ensure_public_evidence_ids(visible_pool, self.evidence_ids_by_memory)
@@ -760,38 +670,24 @@ class OPDToolSession:
                 if item.memory_id in self.evidence_ids_by_memory
             )
         )
+        public_evidence = _sanitize_evidence(self.evidence, self.evidence_ids_by_memory)
         observation = {
             "refresh_state": False,
             "tool": action.tool,
             "pool_count": len(visible_pool),
             "pool_capacity": self.executor.max_pool_size,
             "pool_overflow_count": self.pool_overflow_count,
-            "evidence_count": len(self.evidence),
+            "evidence_count": len(public_evidence),
             "evidence_memory_count": len(visible_pool),
-            "pool_preview": _sanitize_pool_preview(visible_pool, self.evidence_ids_by_memory),
-            "new_evidence_count": len(new_evidence),
+            "new_evidence_count": len(new_evidence_ids),
             "new_evidence_ids": new_evidence_ids,
             "evidence_revision": self.evidence_revision,
             "last_drop_revision": self.last_drop_revision,
             "drop_calls": self.drop_calls,
             "dropped_evidence_count": self.dropped_evidence_count,
-            "evidence_catalog": _sanitize_evidence_catalog(
-                visible_pool,
-                self.evidence,
-                self.evidence_ids_by_memory,
-            ),
-            # The next student action, verifier, and correction teacher must
-            # judge the same answer-bearing public evidence.  Keep compact
-            # previews for quick pool inspection and DROP selection, but do
-            # not make them the only evidence available to the policy.
-            "evidence": _sanitize_evidence(
-                self.evidence,
-                self.evidence_ids_by_memory,
-            ),
-            "evidence_preview": _sanitize_evidence_preview(
-                self.evidence,
-                self.evidence_ids_by_memory,
-            ),
+            # This is the sole model-visible representation of the current
+            # pool. Each memory appears once with its complete public fields.
+            "evidence": public_evidence,
             "stopped": self.stopped,
             "error": _clip_text(error),
         }
@@ -805,20 +701,15 @@ class OPDToolSession:
         """Return serializable public state for AgentLoopOutput.extra_fields."""
         visible_pool = self.pool if self.pool_has_candidates else []
         self.executor._ensure_public_evidence_ids(visible_pool, self.evidence_ids_by_memory)
+        public_evidence = _sanitize_evidence(self.evidence, self.evidence_ids_by_memory)
         return {
             "query": self.query,
             "pool_count": len(visible_pool),
             "pool_capacity": self.executor.max_pool_size,
             "pool_overflow_count": self.pool_overflow_count,
-            "evidence_count": len(self.evidence),
+            "evidence_count": len(public_evidence),
             "evidence_memory_count": len(visible_pool),
-            "pool_preview": _sanitize_pool_preview(visible_pool, self.evidence_ids_by_memory),
-            "evidence_catalog": _sanitize_evidence_catalog(
-                visible_pool,
-                self.evidence,
-                self.evidence_ids_by_memory,
-            ),
-            "evidence": _sanitize_evidence(self.evidence, self.evidence_ids_by_memory),
+            "evidence": public_evidence,
             "evidence_revision": self.evidence_revision,
             "last_drop_revision": self.last_drop_revision,
             "drop_calls": self.drop_calls,
@@ -853,7 +744,7 @@ class OPDBaseTool(BaseTool):
         if agent_data is not None:
             _update_dynamic_drop_schema(
                 agent_data,
-                [item["evidence_id"] for item in observation.get("evidence_catalog", [])],
+                [item["evidence_id"] for item in observation.get("evidence", [])],
             )
         if agent_data is not None and hasattr(agent_data, "extra_fields"):
             agent_data.extra_fields["opd_mm"] = session.public_state()
@@ -941,8 +832,8 @@ class OPDBaseTool(BaseTool):
 class OPDFilterTool(OPDBaseTool):
     tool_name = "filter"
     description = (
-        "Filter hidden memories by metadata. current_pool narrows the working pool; "
-        "full_memory collects matching candidates from the original memory when the current pool is too narrow."
+        "Select hidden memories from the original memory store by metadata and merge deduplicated matches into the "
+        "working pool. Use DROP to remove current evidence."
     )
     properties = {
         "field": _property("string", "The memory field to filter.", sorted(FILTER_FIELDS)),
@@ -953,15 +844,8 @@ class OPDFilterTool(OPDBaseTool):
             "dialogue_image; status uses active; timestamp uses a public YYYY-MM-DD date or timestamp. "
             "Do not use memory IDs.",
         ),
-        "scope": _property(
-            "string",
-            "Required filter scope. Use full_memory for an independent metadata/date filter over the original "
-            "memory store. Use current_pool only to intentionally intersect the existing candidates; unrelated "
-            "or mutually exclusive current_pool filters can empty the pool.",
-            sorted(FILTER_SCOPES),
-        ),
     }
-    required = ["field", "op", "value", "scope"]
+    required = ["field", "op", "value"]
 
 
 class OPDSortTool(OPDBaseTool):
@@ -1035,7 +919,7 @@ class OPDDropTool(OPDBaseTool):
     properties = {
         "evidence_ids": {
             "type": "array",
-            "description": "Non-empty unique list of public E1/E2/... IDs from the current evidence_catalog.",
+            "description": "Non-empty unique list of public E1/E2/... IDs from the current evidence list.",
             "items": {"type": "string", "pattern": "^E[1-9][0-9]*$"},
             "minItems": 1,
             "uniqueItems": True,
@@ -1078,7 +962,7 @@ class OPDInspectRawTool(OPDBaseTool):
         if agent_data is not None:
             _update_dynamic_drop_schema(
                 agent_data,
-                [item["evidence_id"] for item in observation.get("evidence_catalog", [])],
+                [item["evidence_id"] for item in observation.get("evidence", [])],
             )
         if agent_data is not None and hasattr(agent_data, "extra_fields"):
             agent_data.extra_fields["opd_mm"] = session.public_state()

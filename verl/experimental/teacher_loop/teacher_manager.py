@@ -118,6 +118,7 @@ class AsyncTeacherLLMServerManager:
         multi_modal_data: Optional[dict[str, Any]] = None,
         mm_processor_kwargs: Optional[dict[str, Any]] = None,
         routing_key: Optional[str] = None,
+        allow_processed_length_mismatch: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Compute teacher log probabilities for a single unpadded sequence."""
         multi_modal_data = multi_modal_data or {}
@@ -137,7 +138,16 @@ class AsyncTeacherLLMServerManager:
         # the distillation loss settings.
         teacher_ids = torch.tensor(teacher_output.extra_fields["prompt_ids"], dtype=torch.int32)
         teacher_logprobs = torch.tensor(teacher_output.extra_fields["prompt_logprobs"])
-        assert teacher_ids.shape[0] == teacher_logprobs.shape[0] == len(sequence_ids)
+        if teacher_ids.shape[0] != teacher_logprobs.shape[0]:
+            raise RuntimeError(
+                "teacher prompt token IDs and log-probabilities have different processed lengths: "
+                f"{teacher_ids.shape[0]} != {teacher_logprobs.shape[0]}"
+            )
+        if not allow_processed_length_mismatch and teacher_ids.shape[0] != len(sequence_ids):
+            raise RuntimeError(
+                "teacher prompt-logprob output length differs from the serialized sequence length: "
+                f"{teacher_ids.shape[0]} != {len(sequence_ids)}"
+            )
         return teacher_ids, teacher_logprobs
 
     async def generate_teacher_response_single(

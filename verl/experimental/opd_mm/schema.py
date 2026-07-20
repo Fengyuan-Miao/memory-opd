@@ -36,7 +36,6 @@ ALLOWED_TOOLS = {
 DEFAULT_MAX_ACTIONS = 10
 FILTER_FIELDS = {"modality", "source_type", "timestamp", "status"}
 FILTER_OPS = {"eq", "neq", "before", "after", "contains"}
-FILTER_SCOPES = {"current_pool", "full_memory"}
 FILTER_VALUE_ENUMS = {
     "modality": {"image", "text"},
     "source_type": {"dialogue_image", "dialogue_turn"},
@@ -60,8 +59,7 @@ EVIDENCE_ID_PATTERN = re.compile(r"^E[1-9]\d*$")
 
 TOOL_SCHEMA_TEXT = """Allowed executable tools:
 FILTER(field=modality|source_type|timestamp|status,
-       op=eq|neq|before|after|contains, value=...,
-       scope=current_pool|full_memory)
+       op=eq|neq|before|after|contains, value=...)
 SORT(field=timestamp|turn_id|score, order=asc|desc)
 TOPK(k=positive integer)
 RETRIEVE(method=bm25|dense|vision|hybrid, top_k=positive integer,
@@ -75,10 +73,9 @@ the original user query by default; optionally provide query to rewrite the
 search text for the current retrieval step. Every RETRIEVE searches the
 original hidden memory store and merges deduplicated results into the current
 candidate pool. For timestamp filters, date-only values
-such as YYYY-MM-DD match all memory timestamps from that date. FILTER scope is
-required: use full_memory for an independent metadata/date filter over the
-original store and merge its results; use current_pool only for an intentional
-intersection with the current candidates. Chaining unrelated current_pool filters can empty the pool.
+such as YYYY-MM-DD match all memory timestamps from that date. Every FILTER
+searches the original hidden memory store and merges deduplicated matches into
+the current pool. Use DROP to remove evidence from the current pool.
 For Mem-Gallery, source_type values are dialogue_turn and dialogue_image;
 modality values are text and image; status value is active.
 EXPAND_NEIGHBORS adds
@@ -186,7 +183,7 @@ class TrajectoryValidator:
             )
 
     def _validate_filter(self, args: Dict[str, Any], index: int) -> None:
-        self._require_exact_keys(args, {"field", "op", "value", "scope"}, set(), index)
+        self._require_exact_keys(args, {"field", "op", "value"}, set(), index)
         if args["field"] not in FILTER_FIELDS:
             raise TrajectoryValidationError(f"action {index}: invalid FILTER field")
         if args["op"] not in FILTER_OPS:
@@ -201,9 +198,6 @@ class TrajectoryValidator:
             )
         if args["field"] == "timestamp" and (not isinstance(args["value"], str) or not args["value"].strip()):
             raise TrajectoryValidationError(f"action {index}: invalid FILTER timestamp value")
-        if args["scope"] not in FILTER_SCOPES:
-            raise TrajectoryValidationError(f"action {index}: invalid FILTER scope")
-
     def _validate_sort(self, args: Dict[str, Any], index: int) -> None:
         self._require_exact_keys(args, {"field", "order"}, set(), index)
         if args["field"] not in SORT_FIELDS or args["order"] not in SORT_ORDERS:

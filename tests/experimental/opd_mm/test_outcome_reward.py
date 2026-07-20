@@ -114,8 +114,8 @@ def test_outcome_reward_applies_only_bounded_trajectory_penalties(monkeypatch) -
 
     monkeypatch.setattr(outcome_reward, "_chat_completion", fake_chat_completion)
     repeated_trace = [
-        {"tool": "FILTER", "field": "modality", "op": "eq", "value": "text", "scope": "full_memory"},
-        {"tool": "FILTER", "field": "modality", "op": "eq", "value": "text", "scope": "full_memory"},
+        {"tool": "FILTER", "field": "modality", "op": "eq", "value": "text"},
+        {"tool": "FILTER", "field": "modality", "op": "eq", "value": "text"},
         {"tool": "STOP"},
     ]
     result = asyncio.run(
@@ -135,3 +135,107 @@ def test_outcome_reward_applies_only_bounded_trajectory_penalties(monkeypatch) -
 def test_outcome_judge_requires_boolean_correct() -> None:
     with pytest.raises(ValueError, match="must be a boolean"):
         outcome_reward._parse_correct('{"correct": "TRUE", "reason": "invalid type"}')
+
+
+def test_outcome_judge_recovers_unambiguous_boolean_from_truncated_json(monkeypatch) -> None:
+    replies = iter(
+        [
+            "electric bass",
+            '{"correct":true,"reason":"supported by E5"',
+        ]
+    )
+
+    async def fake_chat_completion(**kwargs: Any) -> str:
+        del kwargs
+        return next(replies)
+
+    monkeypatch.setattr(outcome_reward, "_chat_completion", fake_chat_completion)
+    result = asyncio.run(
+        outcome_reward.compute_outcome_score(
+            data_source="opd_mm",
+            solution_str="",
+            ground_truth="electric bass",
+            extra_info={"opd_mm": _state(), "gold_answer": "electric bass"},
+        )
+    )
+
+    assert result["score"] == 1.0
+    assert result["opd_mm/answer_correct"] == 1.0
+    assert result["opd_mm/outcome_evaluated"] == 1.0
+    assert result["opd_mm/judge_parse_recovered"] == 1.0
+    assert result["opd_mm/judge_parse_failed"] == 0.0
+
+
+def test_outcome_judge_invalid_output_is_conservative_not_fatal(monkeypatch) -> None:
+    calls = 0
+
+    async def fake_chat_completion(**kwargs: Any) -> str:
+        nonlocal calls
+        del kwargs
+        calls += 1
+        return "red" if calls == 1 else "I cannot produce JSON"
+
+    monkeypatch.setattr(outcome_reward, "_chat_completion", fake_chat_completion)
+    result = asyncio.run(
+        outcome_reward.compute_outcome_score(
+            data_source="opd_mm",
+            solution_str="",
+            ground_truth="red",
+            extra_info={"opd_mm": _state(), "gold_answer": "red"},
+            retries=2,
+        )
+    )
+
+    assert result["score"] == 0.0
+    assert result["opd_mm/answer_correct"] == 0.0
+    assert result["opd_mm/outcome_evaluated"] == 0.0
+    assert result["opd_mm/judge_parse_failed"] == 1.0
+    assert result["opd_mm/judge_request_failed"] == 0.0
+
+
+def test_outcome_service_failure_is_conservative_not_fatal(monkeypatch) -> None:
+    async def failed_chat_completion(**kwargs: Any) -> str:
+        del kwargs
+        raise RuntimeError("service unavailable")
+
+    monkeypatch.setattr(outcome_reward, "_chat_completion", failed_chat_completion)
+    result = asyncio.run(
+        outcome_reward.compute_outcome_score(
+            data_source="opd_mm",
+            solution_str="",
+            ground_truth="red",
+            extra_info={"opd_mm": _state(), "gold_answer": "red"},
+        )
+    )
+
+    assert result["score"] == 0.0
+    assert result["opd_mm/outcome_evaluated"] == 0.0
+    assert result["opd_mm/answer_request_failed"] == 1.0
+
+
+def test_outcome_dump_failure_does_not_fail_reward(tmp_path, monkeypatch) -> None:
+    replies = iter(["red", '{"correct":true,"reason":"supported"}'])
+
+    async def fake_chat_completion(**kwargs: Any) -> str:
+        del kwargs
+        return next(replies)
+
+    def failed_open(*args: Any, **kwargs: Any) -> None:
+        del args, kwargs
+        raise OSError("disk full")
+
+    monkeypatch.setattr(outcome_reward, "_chat_completion", fake_chat_completion)
+    monkeypatch.setattr(outcome_reward.Path, "open", failed_open)
+    monkeypatch.setenv("OPD_MM_OUTCOME_REWARD_DUMP_DIR", str(tmp_path))
+
+    result = asyncio.run(
+        outcome_reward.compute_outcome_score(
+            data_source="opd_mm",
+            solution_str="",
+            ground_truth="red",
+            extra_info={"opd_mm": _state(), "gold_answer": "red"},
+        )
+    )
+
+    assert result["score"] == 1.0
+    assert result["opd_mm/answer_correct"] == 1.0

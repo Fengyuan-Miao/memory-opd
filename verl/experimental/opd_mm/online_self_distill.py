@@ -41,7 +41,7 @@ HERMES_TOOL_CALL_XML_RE = re.compile(r"<tool_call>(.*?)</tool_call>", re.DOTALL)
 QWEN3_FUNCTION_RE = re.compile(r"<function=(.*?)</function>|<function=(.*)$", re.DOTALL)
 QWEN3_PARAMETER_START_RE = re.compile(r"<parameter=([^>\n]+)>", re.DOTALL)
 QWEN3_INLINE_XML_ARG_RE = re.compile(
-    r"<(field|op|value|scope|method|top_k|query|target|instruction|window|k|order|evidence_ids)=([^>\n]+)>",
+    r"<(field|op|value|method|top_k|query|target|instruction|window|k|order|evidence_ids)=([^>\n]+)>",
     re.IGNORECASE,
 )
 QWEN3_KEY_VALUE_ARG_RE = re.compile(
@@ -101,6 +101,7 @@ def dump_online_step_correction(
                     "action_kl",
                     "structured_disagreement",
                     "disagreement_type",
+                    "failure_reason",
                 )
                 if key in raw_kl_credit
             }
@@ -626,8 +627,6 @@ def _normalize_teacher_tool_action(action: ToolAction) -> ToolAction:
         op_aliases = {"=": "eq", "==": "eq", "equals": "eq", "equal": "eq", "not_equal": "neq", "!=": "neq"}
         if op:
             args["op"] = op_aliases.get(op, op)
-        if "scope" in args:
-            args["scope"] = str(args["scope"]).strip().lower()
     elif tool == "SORT":
         if "field" in args:
             field = str(args["field"]).strip().lower()

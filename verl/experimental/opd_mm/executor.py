@@ -95,22 +95,13 @@ class ToolExecutor:
             evidence_added = 0
             try:
                 if action.tool == "FILTER":
-                    scope = action.arguments["scope"]
-                    source_pool = self._filter_source_pool(
-                        pool,
-                        memory_store,
-                        scope,
-                    )
                     filtered = self._filter(
-                        source_pool,
+                        memory_store.initial_pool(),
                         field=action.arguments["field"],
                         op=action.arguments["op"],
                         value=action.arguments["value"],
                     )
-                    if scope == "full_memory":
-                        pool, _ = self._merge_discovery_pool(pool, filtered, pool_has_candidates)
-                    else:
-                        pool = filtered[: self.max_pool_size]
+                    pool, _ = self._merge_discovery_pool(pool, filtered, pool_has_candidates)
                     pool_has_candidates = True
                     evidence_added = len(self._refresh_evidence_from_pool(evidence, pool, source="FILTER"))
                 elif action.tool == "SORT":
@@ -384,16 +375,6 @@ class ToolExecutor:
         if match:
             return int(match.group(1))
         return None
-
-    @staticmethod
-    def _filter_source_pool(
-        pool: List[PoolItem],
-        memory_store: HiddenMemoryStore,
-        scope: str = "current_pool",
-    ) -> List[PoolItem]:
-        if scope == "full_memory":
-            return memory_store.initial_pool()
-        return pool
 
     @staticmethod
     def _filter(

@@ -268,11 +268,11 @@ def _format_prompt(tokenizer: Any, messages: list[dict[str, Any]], tool_schemas:
     )
 
 
-def _make_session(qa: dict[str, Any], records: list[dict[str, Any]]) -> OPDToolSession:
+def _make_session(qa: dict[str, Any], records: list[dict[str, Any]], max_turns: int) -> OPDToolSession:
     return OPDToolSession(
         executor=ToolExecutor(
             retriever=TurnAwareHybridRetriever(),
-            validator=TrajectoryValidator(max_actions=args.max_turns, max_top_k=50, allow_inspect_raw=True),
+            validator=TrajectoryValidator(max_actions=max_turns, max_top_k=50, allow_inspect_raw=True),
             max_raw_inspections=3,
         ),
         memory_store=hidden_store_from_records(records),
@@ -326,7 +326,7 @@ def rollout_student(args: argparse.Namespace, qas: list[dict[str, Any]]) -> list
 
         base_messages = _messages_for_query(str(qa.get("question") or ""))
         messages = list(base_messages)
-        session = _make_session(qa, records)
+        session = _make_session(qa, records, args.max_turns)
         final_answer = ""
         raw_generations = []
         generation_error = ""

@@ -9,6 +9,25 @@ cd "$REPO_ROOT"
 
 # ---- user-adjustable ----
 RUN_TIMESTAMP=${RUN_TIMESTAMP:-$(date +%Y%m%d_%H%M%S)}
+WANDB_MODE=${WANDB_MODE:-online}
+WANDB_DISABLE_STATS=${WANDB_DISABLE_STATS:-True}
+WANDB_PROXY=${WANDB_PROXY:-}
+WANDB_PROXY_FALLBACK=${WANDB_PROXY_FALLBACK:-http://127.0.0.1:7896}
+WANDB_CONNECTIVITY_TIMEOUT=${WANDB_CONNECTIVITY_TIMEOUT:-5}
+if [[ "${WANDB_MODE,,}" == "online" && -z "$WANDB_PROXY" ]] \
+    && ! curl -sS --max-time "$WANDB_CONNECTIVITY_TIMEOUT" -o /dev/null https://api.wandb.ai; then
+    if curl -sS --max-time "$WANDB_CONNECTIVITY_TIMEOUT" --proxy "$WANDB_PROXY_FALLBACK" \
+        -o /dev/null https://api.wandb.ai; then
+        WANDB_PROXY=$WANDB_PROXY_FALLBACK
+    else
+        echo "W&B is unreachable directly and through $WANDB_PROXY_FALLBACK" >&2
+    fi
+fi
+export WANDB_MODE
+WANDB_TRAINER_ARGS=(+trainer.wandb_disable_stats=${WANDB_DISABLE_STATS})
+if [[ -n "$WANDB_PROXY" ]]; then
+    WANDB_TRAINER_ARGS+=(+trainer.wandb_proxy="$WANDB_PROXY")
+fi
 STUDENT_MODEL=${STUDENT_MODEL:-/home/guojr/data/pretrained_models/Qwen/Qwen3.5-4B}
 # Frozen-teacher OPD-MM path. The same teacher vLLM service is also used by the
 # verifier and INSPECT_RAW when OPD_MM_RAW_INSPECTOR_BACKEND=teacher.
@@ -111,6 +130,9 @@ echo "RUN_POST_TRAIN_EVAL=${RUN_POST_TRAIN_EVAL}"
 echo "POST_TRAIN_CHECKPOINT_ROOT=${POST_TRAIN_CHECKPOINT_ROOT}"
 echo "POST_TRAIN_EVAL_GPUS=${POST_TRAIN_EVAL_GPUS}"
 echo "POST_TRAIN_EVAL_JUDGE_MODEL=${POST_TRAIN_EVAL_JUDGE_MODEL}"
+echo "WANDB_MODE=${WANDB_MODE}"
+echo "WANDB_PROXY=${WANDB_PROXY:-direct}"
+echo "WANDB_DISABLE_STATS=${WANDB_DISABLE_STATS}"
 
 max_num_tokens=$(( max_prompt_length + max_response_length + 1 ))
 
@@ -170,7 +192,7 @@ ROLLOUT=(
 TRAINER=(
     trainer.use_v1=False
     trainer.balance_batch=True
-    trainer.logger='["console"]'
+    trainer.logger='["console","wandb"]'
     trainer.project_name=${project_name}
     trainer.experiment_name=${experiment_name}
     trainer.n_gpus_per_node=${NGPUS_PER_NODE}
@@ -213,6 +235,7 @@ python3 -m verl.trainer.main_ppo \
     "${ACTOR[@]}" \
     "${ROLLOUT[@]}" \
     "${TRAINER[@]}" \
+    "${WANDB_TRAINER_ARGS[@]}" \
     "${REWARD[@]}" \
     "${EXTRA[@]}" \
     "$@"

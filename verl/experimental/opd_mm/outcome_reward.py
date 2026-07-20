@@ -25,7 +25,9 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import os
+import re
 from pathlib import Path
 from typing import Any
 
@@ -34,6 +36,7 @@ import aiohttp
 
 DEFAULT_OUTCOME_BASE_URL = "http://127.0.0.1:8011"
 DEFAULT_OUTCOME_MODEL = "opd-mm-outcome"
+logger = logging.getLogger(__name__)
 
 
 def _plain(value: Any) -> Any:
@@ -114,11 +117,30 @@ def _json_object(text: str) -> dict[str, Any]:
 
 
 def _parse_correct(text: str) -> tuple[bool, str]:
-    value = _json_object(text)
-    correct = value.get("correct")
-    if not isinstance(correct, bool):
-        raise ValueError("judge JSON field 'correct' must be a boolean")
-    return correct, str(value.get("reason") or "")
+    correct, reason, _ = _parse_correct_with_recovery(text)
+    return correct, reason
+
+
+def _parse_correct_with_recovery(text: str) -> tuple[bool, str, bool]:
+    """Parse the judge verdict, recovering only an unambiguous boolean.
+
+    The judge sometimes truncates the final closing brace while still emitting
+    a complete ``correct`` field. First try strict JSON, then accept a single,
+    unambiguous JSON-style boolean literal. Never coerce quoted strings such as
+    ``"TRUE"`` because that can hide prompt-following failures.
+    """
+    try:
+        value = _json_object(text)
+        correct = value.get("correct")
+        if not isinstance(correct, bool):
+            raise ValueError("judge JSON field 'correct' must be a boolean")
+        return correct, str(value.get("reason") or ""), False
+    except ValueError as strict_error:
+        matches = re.findall(r'["\']correct["\']\s*:\s*(true|false)\b', str(text or ""), flags=re.IGNORECASE)
+        verdicts = {match.lower() == "true" for match in matches}
+        if len(verdicts) != 1:
+            raise strict_error
+        return verdicts.pop(), "", True
 
 
 def _answer_messages(query: str, evidence: list[Any]) -> list[dict[str, str]]:
@@ -245,7 +267,12 @@ async def _dump_result(payload: dict[str, Any]) -> None:
         with path.open("a", encoding="utf-8") as handle:
             handle.write(line)
 
-    await asyncio.to_thread(write)
+    try:
+        await asyncio.to_thread(write)
+    except OSError as exc:
+        # Reward dumps are diagnostic only. A full or temporarily unavailable
+        # filesystem must not discard the computed reward or stop training.
+        logger.warning("Failed to write OPD-MM outcome reward dump %s: %s", path, exc)
 
 
 async def compute_outcome_score(
@@ -294,6 +321,11 @@ async def compute_outcome_score(
     candidate_answer = ""
     judge_raw = ""
     judge_reason = ""
+    outcome_error = ""
+    answer_request_failed = False
+    judge_request_failed = False
+    judge_parse_recovered = False
+    judge_parse_failed = False
 
     if stopped and evidence and query and gold_answer and not trajectory_error:
         outcome_url = answer_base_url or os.getenv("OPD_MM_OUTCOME_BASE_URL") or DEFAULT_OUTCOME_BASE_URL
@@ -302,37 +334,48 @@ async def compute_outcome_score(
         judge_model_name = judge_model or os.getenv("OPD_MM_JUDGE_MODEL") or outcome_model
         outcome_api_key = api_key or os.getenv("OPD_MM_OUTCOME_API_KEY") or ""
 
-        candidate_answer = await _chat_completion(
-            base_url=outcome_url,
-            model=outcome_model,
-            messages=_answer_messages(query, evidence),
-            api_key=outcome_api_key,
-            timeout=float(timeout),
-            max_tokens=int(answer_max_tokens),
-            retries=int(retries),
-        )
-        parse_error: Exception | None = None
-        for judge_attempt in range(max(1, int(retries))):
-            judge_raw = await _chat_completion(
-                base_url=judge_url,
-                model=judge_model_name,
-                messages=_judge_messages(query, gold_answer, evidence, candidate_answer),
+        try:
+            candidate_answer = await _chat_completion(
+                base_url=outcome_url,
+                model=outcome_model,
+                messages=_answer_messages(query, evidence),
                 api_key=outcome_api_key,
                 timeout=float(timeout),
-                max_tokens=int(judge_max_tokens),
+                max_tokens=int(answer_max_tokens),
                 retries=int(retries),
             )
-            try:
-                correct, judge_reason = _parse_correct(judge_raw)
-                parse_error = None
-                break
-            except ValueError as exc:
-                parse_error = exc
+        except Exception as exc:
+            answer_request_failed = True
+            outcome_error = f"answer_request_failed:{type(exc).__name__}:{exc}"[:500]
+
+        if candidate_answer:
+            parse_error: Exception | None = None
+            for judge_attempt in range(max(1, int(retries))):
+                try:
+                    judge_raw = await _chat_completion(
+                        base_url=judge_url,
+                        model=judge_model_name,
+                        messages=_judge_messages(query, gold_answer, evidence, candidate_answer),
+                        api_key=outcome_api_key,
+                        timeout=float(timeout),
+                        max_tokens=int(judge_max_tokens),
+                        retries=int(retries),
+                    )
+                    correct, judge_reason, recovered = _parse_correct_with_recovery(judge_raw)
+                    judge_parse_recovered = judge_parse_recovered or recovered
+                    parse_error = None
+                    evaluated = True
+                    break
+                except ValueError as exc:
+                    parse_error = exc
+                except Exception as exc:
+                    judge_request_failed = True
+                    parse_error = exc
                 if judge_attempt + 1 < max(1, int(retries)):
                     await asyncio.sleep(min(2**judge_attempt, 4))
-        if parse_error is not None:
-            raise RuntimeError(f"judge output remained invalid after {max(1, int(retries))} attempts: {parse_error}")
-        evaluated = True
+            if parse_error is not None:
+                judge_parse_failed = not judge_request_failed
+                outcome_error = f"judge_failed:{type(parse_error).__name__}:{parse_error}"[:500]
 
     score = float(correct)
     score -= float(repeat_penalty) * repeats
@@ -351,6 +394,7 @@ async def compute_outcome_score(
             "candidate_answer": candidate_answer,
             "judge_raw": judge_raw,
             "judge_reason": judge_reason,
+            "outcome_error": outcome_error,
             "correct": correct,
             "score": score,
             "stopped": stopped,
@@ -359,6 +403,10 @@ async def compute_outcome_score(
             "repeat_count": repeats,
             "drop_calls": int(state.get("drop_calls") or 0),
             "dropped_evidence_count": int(state.get("dropped_evidence_count") or 0),
+            "answer_request_failed": answer_request_failed,
+            "judge_request_failed": judge_request_failed,
+            "judge_parse_recovered": judge_parse_recovered,
+            "judge_parse_failed": judge_parse_failed,
         }
     )
 
@@ -374,6 +422,10 @@ async def compute_outcome_score(
         "opd_mm/dropped_evidence_count": float(state.get("dropped_evidence_count") or 0),
         "opd_mm/max_actions_reached": float(max_actions_reached),
         "opd_mm/trajectory_error": float(trajectory_error),
+        "opd_mm/answer_request_failed": float(answer_request_failed),
+        "opd_mm/judge_request_failed": float(judge_request_failed),
+        "opd_mm/judge_parse_recovered": float(judge_parse_recovered),
+        "opd_mm/judge_parse_failed": float(judge_parse_failed),
     }
 
 

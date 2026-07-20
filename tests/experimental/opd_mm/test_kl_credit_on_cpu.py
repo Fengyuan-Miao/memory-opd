@@ -65,6 +65,8 @@ async def test_state_kl_scores_teacher_and_student_on_the_student_action_prefix(
             )
 
     class TeacherClient:
+        distillation_loss_config = SimpleNamespace(topk=2, log_prob_min_clamp=-10.0)
+
         def __init__(self) -> None:
             self.sequence = None
 
@@ -111,7 +113,7 @@ def _state(step: int, base: int) -> dict:
         "response_ids": [base + 2, base + 3],
         "response_logprobs": [-0.1, -0.2],
         "tool_call_mask": [1, 0],
-        "student_next_action": {"tool": "FILTER", "field": "modality", "op": "eq", "value": "text", "scope": "current_pool"},
+        "student_next_action": {"tool": "FILTER", "field": "modality", "op": "eq", "value": "text"},
     }
 
 

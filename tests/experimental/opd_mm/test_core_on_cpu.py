@@ -35,6 +35,7 @@ from verl.experimental.opd_mm.dataset import (
     opd_messages_for_state,
     opd_sample_to_rlhf_record,
 )
+from verl.experimental.opd_mm.kl_credit import response_prediction_rows
 from verl.experimental.opd_mm.online_self_distill import (
     build_online_state_correction_request,
     build_teacher_correction_prompt,
@@ -72,6 +73,125 @@ from verl.tools.schemas import ToolResponse
 from verl.utils import tensordict_utils as tu
 from verl.tools.tool_registry import load_all_tools
 from verl.workers.config import ActorConfig, DistillationConfig
+
+
+def test_kl_credit_response_rows_are_tail_aligned_after_multimodal_prefix_processing() -> None:
+    rows = [[0], [1], [2], [30], [31], [0]]
+    assert response_prediction_rows(rows, response_length=2) == [[30], [31]]
+
+
+@pytest.mark.asyncio
+async def test_state_kl_credit_tolerates_processed_prefix_length_mismatch() -> None:
+    student_ids = [[1, 2], [1, 2], [30, 40], [31, 41], [0, 0]]
+    student_logprobs = [[-0.1, -2.0], [-0.1, -2.0], [-0.2, -1.8], [-0.3, -1.7], [0.0, 0.0]]
+    teacher_ids = [[1, 2], [1, 2], [1, 2], [40, 30], [41, 31], [0, 0]]
+    teacher_logprobs = [
+        [-0.1, -2.0],
+        [-0.1, -2.0],
+        [-0.1, -2.0],
+        [-0.2, -1.8],
+        [-0.3, -1.7],
+        [0.0, 0.0],
+    ]
+
+    class FakeStudentClient:
+        async def generate(self, **kwargs: Any) -> Any:
+            del kwargs
+            return SimpleNamespace(
+                extra_fields={
+                    "prompt_ids": student_ids,
+                    "prompt_logprobs": student_logprobs,
+                }
+            )
+
+    class FakeTeacherManager:
+        distillation_loss_config = SimpleNamespace(topk=2, log_prob_min_clamp=-10.0)
+
+        async def compute_teacher_logprobs_single(self, **kwargs: Any) -> tuple[list[list[int]], list[list[float]]]:
+            assert kwargs["allow_processed_length_mismatch"] is True
+            return teacher_ids, teacher_logprobs
+
+    worker = SimpleNamespace(
+        llm_client=FakeStudentClient(),
+        teacher_server_manager=FakeTeacherManager(),
+    )
+    result = await AgentLoopWorker._compute_opd_mm_state_kl_credit(
+        worker,
+        request={
+            "student_response_ids": [30, 31],
+            "student_tool_call_mask": [1, 1],
+            "student_prompt_ids": [10, 11, 12],
+        },
+        teacher_prompt_ids=[20, 21, 22, 23],
+        multi_modal_data={},
+        mm_processor_kwargs={},
+        routing_key=None,
+    )
+
+    assert "failure_reason" not in result
+    assert result["action_kl"] >= 0.0
+    assert len(result["teacher_ids"]) == 2
+
+
+def test_kl_credit_batch_populates_grpo_and_all_fail_distillation_states() -> None:
+    config = SimpleNamespace(
+        algorithm=SimpleNamespace(opd_mm_kl_credit={"top_actions": 2, "success_key": "opd_mm/answer_correct"}),
+        actor_rollout_ref=SimpleNamespace(
+            rollout=SimpleNamespace(prompt_length=4, response_length=3, n=1),
+            actor=SimpleNamespace(ppo_mini_batch_size=1),
+        ),
+    )
+    trainer = SimpleNamespace(
+        config=config,
+        tokenizer=SimpleNamespace(pad_token_id=0),
+        actor_rollout_wg=object(),
+        _get_dp_size=lambda worker_group, role: 1,
+    )
+    states = np.empty(2, dtype=object)
+    corrections = np.empty(2, dtype=object)
+    for index in range(2):
+        states[index] = [
+            {
+                "step_index": 0,
+                "prompt_ids": [10 + index],
+                "response_ids": [20 + index, 30 + index],
+                "response_logprobs": [-0.2, -0.3],
+            }
+        ]
+        corrections[index] = [
+            {
+                "step_index": 0,
+                "kl_credit": {
+                    "structured_disagreement": True,
+                    "action_kl": 0.5 + index,
+                    "tool_call_mask": [1, 1],
+                    "teacher_ids": [[40, 41], [42, 43]],
+                    "teacher_logprobs": [[-0.1, -2.0], [-0.2, -1.8]],
+                },
+            }
+        ]
+    batch = DataProto.from_dict(
+        tensors={
+            "advantages": torch.tensor([[1.0, 1.0, 0.0], [-1.0, -1.0, 0.0]]),
+            "response_mask": torch.tensor([[1, 1, 0], [1, 1, 0]]),
+        },
+        non_tensors={
+            "uid": np.array(["successful-group", "all-fail-group"], dtype=object),
+            "opd_mm/answer_correct": np.array([1.0, 0.0], dtype=object),
+            "opd_mm_policy_states": states,
+            "opd_mm_step_corrections": corrections,
+        },
+    )
+
+    result = RayPPOTrainer._build_opd_mm_kl_credit_batch(trainer, batch)
+
+    assert result is not None
+    credit_batch, metrics = result
+    assert metrics["opd_mm_kl_selected_actions"] == 2.0
+    assert metrics["opd_mm_grpo_states"] == 1.0
+    assert metrics["opd_mm_distill_states"] == 1.0
+    assert credit_batch.batch["response_mask"].sum().item() == 2
+    assert credit_batch.batch["distillation_mask"].sum().item() == 2
 
 
 def _records() -> list[MemoryRecord]:
@@ -321,17 +441,19 @@ def test_validator_rejects_memory_ids_and_accepts_rewritten_retrieve_query() -> 
         validator.validate([{"tool": "FILTER", "field": "status", "op": "eq", "value": "m_001"}])
 
     validated_filter = validator.validate(
-        [{"tool": "FILTER", "field": "modality", "op": "eq", "value": "image", "scope": "full_memory"}]
+        [{"tool": "FILTER", "field": "modality", "op": "eq", "value": "image"}]
     )
-    assert validated_filter[0].arguments["scope"] == "full_memory"
+    assert validated_filter[0].arguments == {"field": "modality", "op": "eq", "value": "image"}
 
     with pytest.raises(TrajectoryValidationError, match="invalid FILTER field"):
         validator.validate(
-            [{"tool": "FILTER", "field": "author", "op": "eq", "value": "user", "scope": "full_memory"}]
+            [{"tool": "FILTER", "field": "author", "op": "eq", "value": "user"}]
         )
 
-    with pytest.raises(TrajectoryValidationError, match="invalid FILTER scope"):
-        validator.validate([{"tool": "FILTER", "field": "modality", "op": "eq", "value": "image", "scope": "all"}])
+    with pytest.raises(TrajectoryValidationError, match="unknown arguments"):
+        validator.validate(
+            [{"tool": "FILTER", "field": "modality", "op": "eq", "value": "image", "scope": "full_memory"}]
+        )
 
     invalid_filter_values = (
         ("modality", "dialogue"),
@@ -344,7 +466,7 @@ def test_validator_rejects_memory_ids_and_accepts_rewritten_retrieve_query() -> 
     for field, value in invalid_filter_values:
         with pytest.raises(TrajectoryValidationError, match=f"invalid FILTER value for {field}"):
             validator.validate(
-                [{"tool": "FILTER", "field": field, "op": "eq", "value": value, "scope": "full_memory"}]
+                [{"tool": "FILTER", "field": field, "op": "eq", "value": value}]
             )
 
     validated = validator.validate([{"tool": "RETRIEVE", "query": "custom query", "top_k": 3}])
@@ -397,7 +519,7 @@ def test_opd_state_prompt_keeps_action_history_and_only_latest_observation() -> 
         base,
         [
             {"tool": "RETRIEVE", "method": "bm25", "top_k": 5},
-            {"tool": "FILTER", "field": "timestamp", "op": "eq", "value": "2024-09-01", "scope": "full_memory"},
+            {"tool": "FILTER", "field": "timestamp", "op": "eq", "value": "2024-09-01"},
         ],
         {"pool_count": 2, "evidence_preview": [{"content": "latest refreshed result"}]},
     )
@@ -421,51 +543,30 @@ def test_executor_uses_rewritten_retrieve_query_when_provided() -> None:
     assert retriever.queries == ["rewritten cat sofa"]
 
 
-def test_filter_scope_can_restart_from_full_memory_pool() -> None:
+def test_repeated_filters_always_search_full_memory_and_merge_results() -> None:
     store = HiddenMemoryStore(_records())
 
-    narrowed_result = ToolExecutor().run(
+    result = ToolExecutor().run(
         [
-            {"tool": "FILTER", "field": "modality", "op": "eq", "value": "image", "scope": "full_memory"},
-            {
-                "tool": "FILTER",
-                "field": "source_type",
-                "op": "eq",
-                "value": "dialogue_turn",
-                "scope": "current_pool",
-            },
-            {
-                "tool": "FILTER",
-                "field": "source_type",
-                "op": "eq",
-                "value": "dialogue_image",
-                "scope": "current_pool",
-            },
+            {"tool": "FILTER", "field": "modality", "op": "eq", "value": "image"},
+            {"tool": "FILTER", "field": "source_type", "op": "eq", "value": "dialogue_turn"},
+            {"tool": "FILTER", "field": "source_type", "op": "eq", "value": "dialogue_image"},
         ],
-        query="Show user memories after a wrong narrow filter.",
+        query="Collect several independently filtered memory sets.",
         memory_store=store,
     )
-    assert narrowed_result.final_memory_ids == []
-
-    reset_result = ToolExecutor().run(
-        [
-            {"tool": "FILTER", "field": "modality", "op": "eq", "value": "image", "scope": "full_memory"},
-            {
-                "tool": "FILTER",
-                "field": "source_type",
-                "op": "eq",
-                "value": "dialogue_turn",
-                "scope": "current_pool",
-            },
-            {"tool": "FILTER", "field": "source_type", "op": "eq", "value": "dialogue_image", "scope": "full_memory"},
-        ],
-        query="Show user memories after resetting the filter scope.",
-        memory_store=store,
-    )
-    assert reset_result.final_memory_ids == ["m_cat_image", "m_assistant_image"]
-    assert reset_result.steps[2].pool_before == 1
-    assert reset_result.steps[2].pool_after == 2
-    assert len({item.memory_id for item in reset_result.evidence}) == len(reset_result.evidence)
+    assert result.steps[0].pool_after == 2
+    assert result.steps[1].pool_before == 2
+    assert result.steps[1].pool_after == 4
+    assert result.steps[2].pool_before == 4
+    assert result.steps[2].pool_after == 4
+    assert set(result.final_memory_ids) == {
+        "m_text_old",
+        "m_cat_text",
+        "m_cat_image",
+        "m_assistant_image",
+    }
+    assert len({item.memory_id for item in result.evidence}) == len(result.evidence)
 
 
 def test_repeated_retrieve_merges_pool_by_default() -> None:
@@ -521,14 +622,7 @@ def test_executor_composes_generic_tools_to_latest_user_image() -> None:
     store = HiddenMemoryStore(_records())
     result = ToolExecutor().run(
         [
-            {"tool": "FILTER", "field": "modality", "op": "eq", "value": "image", "scope": "full_memory"},
-            {
-                "tool": "FILTER",
-                "field": "source_type",
-                "op": "eq",
-                "value": "dialogue_image",
-                "scope": "current_pool",
-            },
+            {"tool": "FILTER", "field": "source_type", "op": "eq", "value": "dialogue_image"},
             {"tool": "SORT", "field": "timestamp", "order": "desc"},
             {"tool": "TOPK", "k": 1},
         ],
@@ -563,7 +657,7 @@ def test_timestamp_filter_accepts_date_only_model_values() -> None:
     store = HiddenMemoryStore(records)
 
     eq_result = ToolExecutor().run(
-        [{"tool": "FILTER", "field": "timestamp", "op": "eq", "value": "2026-01-01", "scope": "full_memory"}],
+        [{"tool": "FILTER", "field": "timestamp", "op": "eq", "value": "2026-01-01"}],
         query="Which memories are from 2026-01-01?",
         memory_store=store,
     )
@@ -581,7 +675,6 @@ def test_timestamp_filter_accepts_date_only_model_values() -> None:
                 "field": "timestamp",
                 "op": "contains",
                 "value": "2026/1/1",
-                "scope": "full_memory",
             }
         ],
         query="Which memories are from 2026-01-01?",
@@ -590,14 +683,14 @@ def test_timestamp_filter_accepts_date_only_model_values() -> None:
     assert set(contains_result.final_memory_ids) == set(eq_result.final_memory_ids)
 
     before_result = ToolExecutor().run(
-        [{"tool": "FILTER", "field": "timestamp", "op": "before", "value": "2026-01-02", "scope": "full_memory"}],
+        [{"tool": "FILTER", "field": "timestamp", "op": "before", "value": "2026-01-02"}],
         query="Which memories are before 2026-01-02?",
         memory_store=store,
     )
     assert set(before_result.final_memory_ids) == set(eq_result.final_memory_ids)
 
     after_result = ToolExecutor().run(
-        [{"tool": "FILTER", "field": "timestamp", "op": "after", "value": "2026-01-01", "scope": "full_memory"}],
+        [{"tool": "FILTER", "field": "timestamp", "op": "after", "value": "2026-01-01"}],
         query="Which memories are after 2026-01-01?",
         memory_store=store,
     )
@@ -660,7 +753,7 @@ def test_inspect_raw_only_reads_retrieved_candidate_pool() -> None:
 
     filtered_result = ToolExecutor(raw_inspector=inspector).run(
         [
-            {"tool": "FILTER", "field": "modality", "op": "eq", "value": "image", "scope": "full_memory"},
+            {"tool": "FILTER", "field": "modality", "op": "eq", "value": "image"},
             {"tool": "INSPECT_RAW"},
         ],
         query="What is in the cat image?",
@@ -765,28 +858,24 @@ async def test_verl_native_opd_tools_share_hidden_state_and_hide_ids() -> None:
     )
     filter_tool = OPDFilterTool(config={"type": "native"}, tool_schema=None)
 
-    await filter_tool.execute(
-        "instance",
-        {"field": "modality", "op": "eq", "value": "image", "scope": "full_memory"},
-        agent_data=agent_data,
-    )
     response, _, metrics = await filter_tool.execute(
         "instance",
-        {"field": "source_type", "op": "eq", "value": "dialogue_image", "scope": "current_pool"},
+        {"field": "source_type", "op": "eq", "value": "dialogue_image"},
         agent_data=agent_data,
     )
 
     observation = json.loads(response.text)
     assert observation["pool_count"] == 1
-    assert observation["pool_preview"][0]["content"] == "A tabby cat sitting on a sofa."
-    assert observation["pool_preview"][0]["image_id"] == "D1:IMG_001"
-    assert observation["evidence_preview"][0]["image_id"] == "D1:IMG_001"
-    assert observation["pool_preview"][0]["evidence_id"] == "E1"
-    assert observation["evidence_preview"][0]["evidence_id"] == "E1"
-    assert "raw_pointer" not in observation["pool_preview"][0]
-    assert "summary" not in observation["pool_preview"][0]
-    assert "source_type" not in observation["pool_preview"][0]
-    assert "turn_id" not in observation["pool_preview"][0]
+    assert observation["evidence"][0]["content"] == "A tabby cat sitting on a sofa."
+    assert observation["evidence"][0]["image_id"] == "D1:IMG_001"
+    assert observation["evidence"][0]["evidence_id"] == "E1"
+    assert "raw_pointer" not in observation["evidence"][0]
+    assert "summary" not in observation["evidence"][0]
+    assert "source_type" not in observation["evidence"][0]
+    assert "turn_id" not in observation["evidence"][0]
+    assert "pool_preview" not in observation
+    assert "evidence_preview" not in observation
+    assert "evidence_catalog" not in observation
     assert metrics["opd_mm_evidence_count"] == 1
     assert "memory_id" not in json.dumps(observation)
     assert agent_data.extra_fields["opd_mm"]["pool_count"] == 1
@@ -799,7 +888,7 @@ async def test_verl_native_opd_tools_share_hidden_state_and_hide_ids() -> None:
 
 
 @pytest.mark.asyncio
-async def test_verl_native_full_memory_filter_merges_into_hidden_pool() -> None:
+async def test_verl_native_filter_always_merges_from_full_memory() -> None:
     records = [record.to_dict() for record in _records()]
     agent_data = FakeAgentData(
         messages=[{"role": "user", "content": "Find user memories."}],
@@ -809,23 +898,24 @@ async def test_verl_native_full_memory_filter_merges_into_hidden_pool() -> None:
 
     await filter_tool.execute(
         "instance",
-        {"field": "modality", "op": "eq", "value": "image", "scope": "full_memory"},
+        {"field": "modality", "op": "eq", "value": "image"},
         agent_data=agent_data,
     )
     await filter_tool.execute(
         "instance",
-        {"field": "source_type", "op": "eq", "value": "dialogue_turn", "scope": "current_pool"},
+        {"field": "source_type", "op": "eq", "value": "dialogue_turn"},
         agent_data=agent_data,
     )
     response, _, _ = await filter_tool.execute(
         "instance",
-        {"field": "source_type", "op": "eq", "value": "dialogue_image", "scope": "full_memory"},
+        {"field": "source_type", "op": "eq", "value": "dialogue_image"},
         agent_data=agent_data,
     )
 
     observation = json.loads(response.text)
-    assert observation["pool_count"] == 2
-    assert observation["evidence_count"] == 2
+    assert observation["pool_count"] == 4
+    assert observation["evidence_count"] == 4
+    assert len({item["evidence_id"] for item in observation["evidence"]}) == 4
 
 
 @pytest.mark.asyncio
@@ -850,18 +940,15 @@ async def test_retrieve_tool_adds_public_evidence_before_inspect_raw() -> None:
     assert observation["new_evidence_ids"] == ["E1", "E2"]
     assert observation["evidence_revision"] == 1
     assert observation["last_drop_revision"] == 0
-    assert [item["evidence_id"] for item in observation["evidence_catalog"]] == ["E1", "E2"]
     assert [item["evidence_id"] for item in observation["evidence"]] == ["E1", "E2"]
     assert all("source" not in item and "author" not in item for item in observation["evidence"])
     assert {item["modality"] for item in observation["evidence"]} == {"text", "image"}
     assert any("tabby cat" in item["content"] for item in observation["evidence"])
-    assert all("source" not in item and "author" not in item for item in observation["evidence_preview"])
-    assert {item["modality"] for item in observation["evidence_preview"]} == {"text", "image"}
-    image_preview = [item for item in observation["evidence_preview"] if item["modality"] == "image"]
-    text_preview = [item for item in observation["evidence_preview"] if item["modality"] == "text"]
-    assert image_preview[0]["image_id"] == "D1:IMG_001"
-    assert "image_id" not in text_preview[0]
-    assert all("visual_observation" not in item for item in observation["evidence_preview"])
+    image_evidence = [item for item in observation["evidence"] if item["modality"] == "image"]
+    text_evidence = [item for item in observation["evidence"] if item["modality"] == "text"]
+    assert image_evidence[0]["image_id"] == "D1:IMG_001"
+    assert "image_id" not in text_evidence[0]
+    assert all("visual_observation" not in item for item in observation["evidence"])
     assert "memory_id" not in json.dumps(observation)
     assert "last_action" not in observation
     prompt_state = agent_data.extra_fields["opd_mm_prompt_state"]
@@ -895,8 +982,8 @@ async def test_verl_native_retrieve_merges_and_drop_is_atomic() -> None:
     )
     first_observation = json.loads(first.text)
     second_observation = json.loads(second.text)
-    assert first_observation["evidence_catalog"][0]["evidence_id"] == "E1"
-    assert [item["evidence_id"] for item in second_observation["evidence_catalog"]] == ["E2", "E1"]
+    assert first_observation["evidence"][0]["evidence_id"] == "E1"
+    assert [item["evidence_id"] for item in second_observation["evidence"]] == ["E2", "E1"]
     dynamic_drop_schema = next(
         schema for schema in agent_data._active_tool_schemas if schema["function"]["name"] == "drop"
     )
@@ -938,7 +1025,7 @@ async def test_verl_native_retrieve_merges_and_drop_is_atomic() -> None:
     assert dropped_observation["evidence_count"] == 1
     assert dropped_observation["dropped_evidence_ids"] == ["E1"]
     assert dropped_observation["last_drop_revision"] == dropped_observation["evidence_revision"]
-    assert dropped_observation["evidence_catalog"][0]["evidence_id"] == "E2"
+    assert dropped_observation["evidence"][0]["evidence_id"] == "E2"
     repeated, _, repeated_metrics = await drop_tool.execute(
         "instance", {"evidence_ids": ["E2"]}, agent_data=clean_agent_data
     )
@@ -975,7 +1062,7 @@ async def test_bounded_merge_prioritizes_latest_discovery_results() -> None:
     observation = json.loads(response.text)
     assert observation["pool_count"] == 1
     assert observation["pool_overflow_count"] == 1
-    assert observation["evidence_catalog"] == [
+    assert observation["evidence"] == [
         {
             "evidence_id": "E2",
             "content": "An assistant-generated chart.",
@@ -1009,7 +1096,7 @@ async def test_tool_observation_includes_complete_public_evidence() -> None:
 
     response, _, _ = await filter_tool.execute(
         "instance",
-        {"field": "modality", "op": "eq", "value": "text", "scope": "full_memory"},
+        {"field": "modality", "op": "eq", "value": "text"},
         agent_data=agent_data,
     )
 
@@ -1018,13 +1105,12 @@ async def test_tool_observation_includes_complete_public_evidence() -> None:
     assert observation["pool_capacity"] == 24
     assert observation["pool_overflow_count"] == 6
     assert observation["evidence_count"] == 24
-    assert len(observation["pool_preview"]) == 3
-    assert len(observation["evidence_preview"]) == 4
-    assert len(observation["evidence_catalog"]) == 24
     assert len(observation["evidence"]) == 24
+    assert len({item["evidence_id"] for item in observation["evidence"]}) == 24
     assert all(len(item["content"]) > 1000 for item in observation["evidence"])
-    assert all(len(item["content"]) <= 234 for item in observation["pool_preview"])
-    assert all(len(item["content"]) <= 234 for item in observation["evidence_preview"])
+    assert "pool_preview" not in observation
+    assert "evidence_preview" not in observation
+    assert "evidence_catalog" not in observation
     assert "new_evidence" not in observation
     assert "last_action" not in observation
     assert "memory_id" not in response.text
@@ -1076,10 +1162,12 @@ async def test_inspect_raw_can_use_async_teacher_service_callback() -> None:
     assert observation["new_evidence_count"] == 1
     assert observation["evidence_revision"] == 2
     assert observation["last_drop_revision"] == 0
-    assert "source" not in observation["evidence_preview"][-1]
-    assert "author" not in observation["evidence_preview"][-1]
-    assert observation["evidence_preview"][-1]["image_id"] == "D1:IMG_001"
-    assert observation["evidence_preview"][-1]["visual_observation"] == "Teacher sees a tabby cat sitting on a sofa."
+    evidence_ids = [item["evidence_id"] for item in observation["evidence"]]
+    assert len(evidence_ids) == len(set(evidence_ids))
+    inspected = next(item for item in observation["evidence"] if item.get("image_id") == "D1:IMG_001")
+    assert "source" not in inspected
+    assert "author" not in inspected
+    assert inspected["visual_observation"] == "Teacher sees a tabby cat sitting on a sofa."
     assert metrics["agent_loop_terminate"] is False
 
 
@@ -1107,8 +1195,8 @@ async def test_verl_native_expand_neighbors_observation_is_visible_next_step() -
     assert observation["pool_count"] == 3
     assert observation["evidence_count"] == 3
     assert observation["new_evidence_count"] == 2
-    assert all("source" not in item and "author" not in item for item in observation["evidence_preview"])
-    assert {item["content"] for item in observation["evidence_preview"]} == {
+    assert all("source" not in item and "author" not in item for item in observation["evidence"])
+    assert {item["content"] for item in observation["evidence"]} == {
         "The unique middle clue is here.",
         "Previous context before the middle clue.",
         "Follow-up context after the middle clue.",
@@ -1402,7 +1490,8 @@ def test_opd_sample_converts_to_on_policy_distillation_row() -> None:
         {"role": "user", "content": sample.query},
     ]
     system_prompt = row["prompt"][0]["content"]
-    assert "Discovery actions add deduplicated memories" in system_prompt
+    assert "RETRIEVE and FILTER search the original hidden store" in system_prompt
+    assert "DROP removes current evidence" in system_prompt
     assert "assess the accumulated" in system_prompt
     assert "call DROP next; otherwise continue without DROP" in system_prompt
     assert "do not repeat an unchanged action without a state-based reason" in system_prompt
@@ -1534,7 +1623,6 @@ class FakeStudent:
                         "field": "timestamp",
                         "op": "eq",
                         "value": "2026-01-01T11:00:00",
-                        "scope": "full_memory",
                     },
                 ),
                 ToolAction("STOP"),
@@ -1745,7 +1833,7 @@ def test_teacher_xml_correction_accepts_drop_id_array() -> None:
         "observation": {
             "evidence_revision": 2,
             "last_drop_revision": 1,
-            "evidence_catalog": [{"evidence_id": "E1"}, {"evidence_id": "E3"}],
+            "evidence": [{"evidence_id": "E1"}, {"evidence_id": "E3"}],
         },
         "verifier_feedback": {
             "evidence_sufficient": False,
@@ -1756,9 +1844,9 @@ def test_teacher_xml_correction_accepts_drop_id_array() -> None:
     assert correction is not None
     assert correction["teacher_actions"] == [{"tool": "DROP", "evidence_ids": ["E1", "E3"]}]
 
-    request["observation"]["evidence_catalog"] = [{"evidence_id": "E1"}]
+    request["observation"]["evidence"] = [{"evidence_id": "E1"}]
     assert finalize_online_step_correction(request, teacher_raw_response=teacher_xml) is None
-    request["observation"]["evidence_catalog"] = [{"evidence_id": "E1"}, {"evidence_id": "E3"}]
+    request["observation"]["evidence"] = [{"evidence_id": "E1"}, {"evidence_id": "E3"}]
     request["observation"]["last_drop_revision"] = 2
     assert finalize_online_step_correction(request, teacher_raw_response=teacher_xml) is None
 
@@ -1789,8 +1877,6 @@ def test_teacher_xml_correction_repairs_missing_parameter_closes_and_aliases() -
         "equals\n"
         "<parameter=value>\n"
         "2024-09-28\n"
-        "<parameter=scope>\n"
-        "current_pool\n"
         "</parameter>\n"
         "</function>\n"
         "</tool_call><|im_end|>"
@@ -1803,10 +1889,22 @@ def test_teacher_xml_correction_repairs_missing_parameter_closes_and_aliases() -
         "field": "timestamp",
         "op": "eq",
         "value": "2024-09-28",
-        "scope": "current_pool",
     }
     assert "<parameter=field>\ntimestamp\n</parameter>" in target_xml
     assert "<parameter=op>\neq\n</parameter>" in target_xml
+
+
+def test_teacher_xml_correction_rejects_legacy_filter_scope() -> None:
+    assert extract_canonical_tool_call_xml(
+        "<tool_call>\n"
+        "<function=filter>\n"
+        "<parameter=field>\nmodality\n</parameter>\n"
+        "<parameter=op>\neq\n</parameter>\n"
+        "<parameter=value>\nimage\n</parameter>\n"
+        "<parameter=scope>\nfull_memory\n</parameter>\n"
+        "</function>\n"
+        "</tool_call>"
+    ) is None
 
 
 def test_teacher_xml_correction_rejects_defaultable_empty_calls() -> None:
@@ -1832,7 +1930,6 @@ def test_online_xml_correction_drops_invalid_filter_value() -> None:
             "<parameter=field>\nsource_type\n</parameter>\n"
             "<parameter=op>\neq\n</parameter>\n"
             "<parameter=value>\nuser\n</parameter>\n"
-            "<parameter=scope>\ncurrent_pool\n</parameter>\n"
             "</function>\n"
             "</tool_call>"
         ),
@@ -1865,7 +1962,6 @@ def test_teacher_xml_correction_recovers_explicit_nonstandard_argument_lines() -
         "<field=session_date>\n"
         "op=eq\n"
         "value=2024-09-28\n"
-        "scope=current_pool\n"
         "</function>\n"
         "</tool_call>"
     )
@@ -1886,7 +1982,6 @@ def test_teacher_xml_correction_recovers_explicit_nonstandard_argument_lines() -
         "field": "timestamp",
         "op": "eq",
         "value": "2024-09-28",
-        "scope": "current_pool",
     }
 
 
@@ -2500,13 +2595,13 @@ def test_helpers_build_hidden_store_from_dicts_and_schemas() -> None:
         "drop",
         "stop",
     ]
-    filter_scope = schemas[0]["function"]["parameters"]["properties"]["scope"]
+    filter_properties = schemas[0]["function"]["parameters"]["properties"]
     filter_value_description = schemas[0]["function"]["parameters"]["properties"]["value"]["description"]
-    assert filter_scope["enum"] == ["current_pool", "full_memory"]
+    assert "scope" not in filter_properties
     assert "source_type uses dialogue_turn or dialogue_image" in filter_value_description
     assert "modality uses text or image" in filter_value_description
     assert "MEMORY/user/assistant" not in filter_value_description
-    assert "scope" in schemas[0]["function"]["parameters"]["required"]
+    assert schemas[0]["function"]["parameters"]["required"] == ["field", "op", "value"]
     assert schemas[3]["function"]["parameters"]["required"] == ["method", "top_k"]
     drop_schema = schemas[5]
     assert drop_schema["function"]["parameters"]["required"] == ["evidence_ids"]

@@ -73,9 +73,12 @@ class Tracking:
 
             import wandb
 
-            settings = None
+            settings_kwargs = {}
             if config and config["trainer"].get("wandb_proxy", None):
-                settings = wandb.Settings(https_proxy=config["trainer"]["wandb_proxy"])
+                settings_kwargs["https_proxy"] = config["trainer"]["wandb_proxy"]
+            if config and config["trainer"].get("wandb_disable_stats", False):
+                settings_kwargs["x_disable_stats"] = True
+            settings = wandb.Settings(**settings_kwargs) if settings_kwargs else None
             entity = os.environ.get("WANDB_ENTITY", None)
             wandb.init(project=project_name, name=experiment_name, entity=entity, config=config, settings=settings)
             self.logger["wandb"] = wandb

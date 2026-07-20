@@ -9,9 +9,28 @@ cd "$REPO_ROOT"
 
 RUN_TIMESTAMP=${RUN_TIMESTAMP:-$(date +%Y%m%d_%H%M%S)}
 
-# Use OPD_MODEL_PATH for an already merged HF checkpoint. Alternatively set
-# OPD_CHECKPOINT_DIR to a verl global_step_* directory and this script will
-# validate/merge it before starting a fresh optimizer state.
+WANDB_MODE=${WANDB_MODE:-online}
+WANDB_DISABLE_STATS=${WANDB_DISABLE_STATS:-True}
+WANDB_PROXY=${WANDB_PROXY:-}
+WANDB_PROXY_FALLBACK=${WANDB_PROXY_FALLBACK:-http://127.0.0.1:7896}
+WANDB_CONNECTIVITY_TIMEOUT=${WANDB_CONNECTIVITY_TIMEOUT:-5}
+if [[ "${WANDB_MODE,,}" == "online" && -z "$WANDB_PROXY" ]] \
+    && ! curl -sS --max-time "$WANDB_CONNECTIVITY_TIMEOUT" -o /dev/null https://api.wandb.ai; then
+    if curl -sS --max-time "$WANDB_CONNECTIVITY_TIMEOUT" --proxy "$WANDB_PROXY_FALLBACK" \
+        -o /dev/null https://api.wandb.ai; then
+        WANDB_PROXY=$WANDB_PROXY_FALLBACK
+    else
+        echo "W&B is unreachable directly and through $WANDB_PROXY_FALLBACK" >&2
+    fi
+fi
+export WANDB_MODE
+WANDB_TRAINER_ARGS=(+trainer.wandb_disable_stats=${WANDB_DISABLE_STATS})
+if [[ -n "$WANDB_PROXY" ]]; then
+    WANDB_TRAINER_ARGS+=(+trainer.wandb_proxy="$WANDB_PROXY")
+fi
+
+# Start the student from the base 4B model by default. OPD_MODEL_PATH may still
+# point to another merged HF checkpoint, or OPD_CHECKPOINT_DIR to a verl step.
 OPD_MODEL_PATH=${OPD_MODEL_PATH:-}
 OPD_CHECKPOINT_DIR=${OPD_CHECKPOINT_DIR:-}
 if [[ -z "$OPD_MODEL_PATH" && -n "$OPD_CHECKPOINT_DIR" ]]; then
@@ -22,8 +41,7 @@ if [[ -z "$OPD_MODEL_PATH" && -n "$OPD_CHECKPOINT_DIR" ]]; then
         --output-dir "$OPD_MODEL_PATH"
 fi
 if [[ -z "$OPD_MODEL_PATH" ]]; then
-    OPD_MODEL_PATH=$(find checkpoints/verl_distill_opd_mm -type d -name actor_merged_hf_vllm_fixed \
-        -printf '%T@ %p\n' 2>/dev/null | sort -nr | head -n 1 | cut -d' ' -f2- || true)
+    OPD_MODEL_PATH=/home/guojr/data/pretrained_models/Qwen/Qwen3.5-4B
 fi
 if [[ -z "$OPD_MODEL_PATH" || ! -f "$OPD_MODEL_PATH/config.json" ]]; then
     echo "No prepared OPD model found. Set OPD_MODEL_PATH or OPD_CHECKPOINT_DIR." >&2
@@ -51,9 +69,11 @@ NNODES=${NNODES:-1}
 NGPUS_PER_NODE=${NGPUS_PER_NODE:-4}
 TEACHER_NGPUS_PER_NODE=${TEACHER_NGPUS_PER_NODE:-2}
 TEACHER_NNODES=${TEACHER_NNODES:-1}
-TEACHER_MODEL_PATH=${TEACHER_MODEL_PATH:-/home/guojr/data/pretrained_models/Qwen/Qwen3.5-9B}
+TEACHER_MODEL_PATH=${TEACHER_MODEL_PATH:-/home/guojr/data/pretrained_models/Qwen/Qwen3.5-4B}
 TEACHER_TP=${TEACHER_TP:-2}
-TEACHER_MAX_MODEL_LEN=${TEACHER_MAX_MODEL_LEN:-16384}
+TEACHER_MAX_MODEL_LEN=${TEACHER_MAX_MODEL_LEN:-32768}
+TEACHER_MAX_NUM_BATCHED_TOKENS=${TEACHER_MAX_NUM_BATCHED_TOKENS:-4096}
+TEACHER_GPU_MEMORY_UTIL=${TEACHER_GPU_MEMORY_UTIL:-0.55}
 OPD_MM_KL_TOPK=${OPD_MM_KL_TOPK:-8}
 OPD_MM_KL_TOP_ACTIONS=${OPD_MM_KL_TOP_ACTIONS:-2}
 
@@ -73,9 +93,15 @@ OUTCOME_SERVER_START_TIMEOUT=${OUTCOME_SERVER_START_TIMEOUT:-900}
 rollout_n=${ROLLOUT_N:-4}
 train_batch_size=${TRAIN_BATCH_SIZE:-12}
 ppo_mini_batch_size=${PPO_MINI_BATCH_SIZE:-$train_batch_size}
-max_prompt_length=${MAX_PROMPT_LENGTH:-4096}
+max_prompt_length=${MAX_PROMPT_LENGTH:-16384}
 max_response_length=${MAX_RESPONSE_LENGTH:-2048}
-ppo_max_token_len_per_gpu=${PPO_MAX_TOKEN_LEN_PER_GPU:-8192}
+actor_sp_size=${ACTOR_SP_SIZE:-4}
+# Dynamic batching multiplies this per-device budget by the Ulysses SP size.
+# Keep one complete 16K+2K state lossless while sharding its token/vocab
+# activations across all four actor GPUs.
+ppo_max_token_len_per_gpu=${PPO_MAX_TOKEN_LEN_PER_GPU:-$(((max_prompt_length + max_response_length + actor_sp_size - 1) / actor_sp_size))}
+actor_use_torch_compile=${ACTOR_USE_TORCH_COMPILE:-False}
+distill_chunk_size=${DISTILL_CHUNK_SIZE:-256}
 actor_lr=${ACTOR_LR:-5e-7}
 entropy_coeff=${ENTROPY_COEFF:-0.0}
 rollout_tp=${ROLLOUT_TP:-2}
@@ -94,7 +120,7 @@ NON_STOP_PENALTY=${NON_STOP_PENALTY:-0.1}
 EMPTY_EVIDENCE_PENALTY=${EMPTY_EVIDENCE_PENALTY:-0.1}
 
 project_name=${PROJECT_NAME:-verl_grpo_opd_mm}
-experiment_name=${EXPERIMENT_NAME:-opd_mm_qwen35_4b_klcredit_top2_grpo_teacher9b_${RUN_TIMESTAMP}}
+experiment_name=${EXPERIMENT_NAME:-opd_mm_qwen35_4b_selfdistill_klcredit_top2_grpo_${RUN_TIMESTAMP}}
 CHECKPOINT_ROOT=${CHECKPOINT_ROOT:-checkpoints/${project_name}/${experiment_name}}
 LOG_DIR=${LOG_DIR:-logs}
 TRAIN_LOG_PATH=${TRAIN_LOG_PATH:-${LOG_DIR}/${experiment_name}.log}
@@ -125,6 +151,7 @@ export OPD_MM_RECORD_POLICY_STATES=1
 export OPD_MM_KL_TOPK
 export OPD_MM_KL_CREDIT_ASSIGNMENT=1
 export OPD_MM_SKIP_INITIAL_CORRECTION=0
+export OPD_MM_FAIL_ON_PROMPT_TRUNCATION=1
 export OPD_MM_TEACHER_CORRECTION_DUMP_DIR
 export OPD_MM_TEACHER_CORRECTION_DUMP_MAX_CHARS=${OPD_MM_TEACHER_CORRECTION_DUMP_MAX_CHARS:-12000}
 export OPD_MM_TEACHER_CORRECTION_DUMP_INCLUDE_PROMPT=${OPD_MM_TEACHER_CORRECTION_DUMP_INCLUDE_PROMPT:-0}
@@ -193,9 +220,15 @@ echo "OUTCOME_MODEL_PATH=${OUTCOME_MODEL_PATH}"
 echo "TEACHER_MODEL_PATH=${TEACHER_MODEL_PATH}"
 echo "OPD_MM_KL_TOPK=${OPD_MM_KL_TOPK}"
 echo "OPD_MM_KL_TOP_ACTIONS=${OPD_MM_KL_TOP_ACTIONS}"
+echo "ACTOR_SP_SIZE=${actor_sp_size}"
+echo "PPO_MAX_TOKEN_LEN_PER_GPU=${ppo_max_token_len_per_gpu}"
+echo "DISTILL_CHUNK_SIZE=${distill_chunk_size}"
 echo "ROLLOUT_N=${rollout_n}"
 echo "TRAIN_LOG_PATH=${TRAIN_LOG_PATH}"
 echo "OPD_MM_OUTCOME_REWARD_DUMP_DIR=${OPD_MM_OUTCOME_REWARD_DUMP_DIR}"
+echo "WANDB_MODE=${WANDB_MODE}"
+echo "WANDB_PROXY=${WANDB_PROXY:-direct}"
+echo "WANDB_DISABLE_STATS=${WANDB_DISABLE_STATS}"
 
 max_num_tokens=$(( max_prompt_length + max_response_length + 1 ))
 
@@ -229,7 +262,7 @@ MODEL=(
 )
 
 ACTOR=(
-    actor_rollout_ref.actor.use_torch_compile=True
+    actor_rollout_ref.actor.use_torch_compile=${actor_use_torch_compile}
     actor_rollout_ref.actor.optim.lr=${actor_lr}
     actor_rollout_ref.actor.ppo_mini_batch_size=${ppo_mini_batch_size}
     actor_rollout_ref.actor.use_dynamic_bsz=True
@@ -238,6 +271,7 @@ ACTOR=(
     actor_rollout_ref.actor.entropy_coeff=${entropy_coeff}
     actor_rollout_ref.actor.fsdp_config.param_offload=True
     actor_rollout_ref.actor.fsdp_config.optimizer_offload=True
+    actor_rollout_ref.actor.fsdp_config.ulysses_sequence_parallel_size=${actor_sp_size}
 )
 
 ROLLOUT=(
@@ -264,7 +298,7 @@ ROLLOUT=(
 TRAINER=(
     trainer.use_v1=False
     trainer.balance_batch=True
-    trainer.logger='["console"]'
+    trainer.logger='["console","wandb"]'
     trainer.project_name=${project_name}
     trainer.experiment_name=${experiment_name}
     trainer.n_gpus_per_node=${NGPUS_PER_NODE}
@@ -298,11 +332,13 @@ DISTILLATION=(
     distillation.distillation_loss.use_policy_gradient=False
     distillation.distillation_loss.distillation_loss_coef=1.0
     distillation.distillation_loss.log_prob_min_clamp=-10.0
+    +distillation.distillation_loss.use_chunked_topk=True
+    +distillation.distillation_loss.chunked_topk_chunk_size=${distill_chunk_size}
     distillation.teacher_models.teacher_model.model_path="$TEACHER_MODEL_PATH"
     distillation.teacher_models.teacher_model.inference.tensor_model_parallel_size=${TEACHER_TP}
-    distillation.teacher_models.teacher_model.inference.gpu_memory_utilization=0.85
+    distillation.teacher_models.teacher_model.inference.gpu_memory_utilization=${TEACHER_GPU_MEMORY_UTIL}
     distillation.teacher_models.teacher_model.inference.max_model_len=${TEACHER_MAX_MODEL_LEN}
-    distillation.teacher_models.teacher_model.inference.max_num_batched_tokens=${TEACHER_MAX_MODEL_LEN}
+    distillation.teacher_models.teacher_model.inference.max_num_batched_tokens=${TEACHER_MAX_NUM_BATCHED_TOKENS}
     distillation.teacher_models.teacher_model.inference.enable_prefix_caching=True
     distillation.teacher_models.teacher_model.inference.enforce_eager=False
 )
@@ -314,6 +350,7 @@ CUDA_VISIBLE_DEVICES="$TRAIN_GPUS" python3 -m verl.trainer.main_ppo \
     "${ACTOR[@]}" \
     "${ROLLOUT[@]}" \
     "${TRAINER[@]}" \
+    "${WANDB_TRAINER_ARGS[@]}" \
     "${REWARD[@]}" \
     "${DISTILLATION[@]}" \
     "$@"

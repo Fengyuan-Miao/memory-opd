@@ -363,6 +363,13 @@ class AgentLoopBase(ABC):
     def _cap_text_prompt_length(self, prompt_ids: list[int]) -> list[int]:
         prompt_length = self.rollout_config.prompt_length
         if len(prompt_ids) > prompt_length:
+            fail_on_truncation = str(os.getenv("OPD_MM_FAIL_ON_PROMPT_TRUNCATION") or "").strip().lower()
+            if fail_on_truncation in {"1", "true", "yes", "on"}:
+                raise ValueError(
+                    f"Prompt produced {len(prompt_ids)} tokens, exceeding "
+                    f"rollout.prompt_length={prompt_length}; OPD-MM prompt truncation is disabled. "
+                    "Increase data.max_prompt_length instead of dropping evidence."
+                )
             logger.warning(
                 "Prompt of %d tokens exceeds rollout.prompt_length=%d; left-truncating.",
                 len(prompt_ids),
@@ -956,9 +963,12 @@ class AgentLoopWorker:
             tool_format=str(request.get("tool_format") or self.rollout_config.multi_turn.format),
         )
         observation = request.get("observation") or {}
+        teacher_evidence = observation.get("evidence")
+        if not isinstance(teacher_evidence, list):
+            teacher_evidence = observation.get("evidence_catalog", [])
         teacher_evidence_ids = [
             str(item.get("evidence_id"))
-            for item in observation.get("evidence_catalog", [])
+            for item in teacher_evidence
             if isinstance(item, dict) and item.get("evidence_id")
         ]
         teacher_tool_schemas = openai_tool_schemas(
@@ -1020,17 +1030,29 @@ class AgentLoopWorker:
         routing_key: Optional[str],
     ) -> Optional[dict[str, Any]]:
         """Score one student-generated action under public and privileged prefixes."""
-        from verl.experimental.opd_mm.kl_credit import masked_mean, tokenwise_topk_union_kl
+        from verl.experimental.opd_mm.kl_credit import (
+            masked_mean,
+            response_prediction_rows,
+            tokenwise_topk_union_kl,
+        )
+
+        def failure(reason: str) -> dict[str, Any]:
+            return {"failure_reason": str(reason)[:320]}
 
         response_ids = [int(token) for token in request.get("student_response_ids") or []]
         tool_call_mask = [int(bool(value)) for value in request.get("student_tool_call_mask") or []]
-        if not response_ids or len(response_ids) != len(tool_call_mask) or not any(tool_call_mask):
-            return None
+        if not response_ids:
+            return failure("empty_student_response")
+        if len(response_ids) != len(tool_call_mask):
+            return failure("unaligned_student_tool_call_mask")
+        if not any(tool_call_mask):
+            return failure("empty_student_tool_call_mask")
 
-        topk = int(os.getenv("OPD_MM_KL_TOPK") or self.distillation_config.distillation_loss.topk or 8)
+        distillation_loss_config = self.teacher_server_manager.distillation_loss_config
+        topk = int(os.getenv("OPD_MM_KL_TOPK") or distillation_loss_config.topk or 8)
         student_prompt_ids = [int(token) for token in request.get("student_prompt_ids") or []]
         if not student_prompt_ids:
-            return None
+            return failure("empty_student_prompt")
         student_sequence = student_prompt_ids + response_ids
         teacher_sequence = list(teacher_prompt_ids) + response_ids
         sampling_params = {"max_tokens": 1, "temperature": 1.0, "prompt_logprobs": topk}
@@ -1053,6 +1075,7 @@ class AgentLoopWorker:
                     multi_modal_data=multi_modal_data,
                     mm_processor_kwargs=mm_processor_kwargs,
                     routing_key=routing_key,
+                    allow_processed_length_mismatch=True,
                 )
             )
             student_output, (teacher_ids, teacher_logprobs) = await asyncio.gather(student_task, teacher_task)
@@ -1062,20 +1085,11 @@ class AgentLoopWorker:
             if student_ids is None or student_logprobs is None:
                 raise RuntimeError("student rollout server did not return prompt top-k logprobs")
 
-            def response_prediction_slice(values: Any, prompt_length: int) -> list[Any]:
-                if hasattr(values, "tolist"):
-                    values = values.tolist()
-                start = max(0, int(prompt_length) - 1)
-                result = list(values[start : start + len(response_ids)])
-                if len(result) != len(response_ids):
-                    raise RuntimeError("prompt top-k output does not cover the complete student action")
-                return result
-
-            response_student_ids = response_prediction_slice(student_ids, len(student_prompt_ids))
-            response_student_logprobs = response_prediction_slice(student_logprobs, len(student_prompt_ids))
-            response_teacher_ids = response_prediction_slice(teacher_ids, len(teacher_prompt_ids))
-            response_teacher_logprobs = response_prediction_slice(teacher_logprobs, len(teacher_prompt_ids))
-            missing_logprob = self.distillation_config.distillation_loss.log_prob_min_clamp
+            response_student_ids = response_prediction_rows(student_ids, len(response_ids))
+            response_student_logprobs = response_prediction_rows(student_logprobs, len(response_ids))
+            response_teacher_ids = response_prediction_rows(teacher_ids, len(response_ids))
+            response_teacher_logprobs = response_prediction_rows(teacher_logprobs, len(response_ids))
+            missing_logprob = distillation_loss_config.log_prob_min_clamp
             if missing_logprob is None:
                 missing_logprob = -10.0
             token_kl = tokenwise_topk_union_kl(
@@ -1087,7 +1101,11 @@ class AgentLoopWorker:
             )
             action_kl = masked_mean(token_kl, tool_call_mask)
             if not math.isfinite(action_kl):
-                return None
+                valid_masked_rows = sum(
+                    bool(keep) and math.isfinite(float(value))
+                    for value, keep in zip(token_kl, tool_call_mask, strict=False)
+                )
+                return failure(f"nonfinite_action_kl:valid_masked_rows={valid_masked_rows}")
             return {
                 "topk": topk,
                 "action_kl": float(action_kl),
@@ -1097,7 +1115,7 @@ class AgentLoopWorker:
             }
         except Exception as exc:
             logger.warning("Failed to score OPD-MM state KL credit: %s", exc)
-            return None
+            return failure(f"{type(exc).__name__}: {exc}")
 
     def _pad_token_ids(
         self,

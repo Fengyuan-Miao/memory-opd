@@ -30,10 +30,39 @@ def _topk_distribution(ids: Iterable[Any], logprobs: Iterable[Any]) -> dict[int,
         if token_id is None or logprob is None:
             continue
         try:
-            distribution[int(token_id)] = float(logprob)
+            value = float(logprob)
+            if not math.isfinite(value):
+                continue
+            distribution[int(token_id)] = value
         except (TypeError, ValueError):
             continue
     return distribution
+
+
+def response_prediction_rows(values: Any, response_length: int) -> list[Any]:
+    """Return next-token rows for a response using tail alignment.
+
+    Multimodal serving may expand or deduplicate image placeholder tokens, so
+    the number of prompt-logprob rows can differ from the caller's serialized
+    prefix length. The response is always the sequence suffix. Its prediction
+    rows are therefore the final ``response_length`` rows before vLLM's dummy
+    last-token row, independent of the processed prefix length.
+    """
+    if hasattr(values, "tolist"):
+        values = values.tolist()
+    rows = list(values or [])
+    response_length = int(response_length)
+    if response_length <= 0:
+        return []
+    if len(rows) < response_length + 1:
+        raise RuntimeError(
+            f"prompt top-k output has {len(rows)} rows but needs at least "
+            f"{response_length + 1} to cover the complete student action"
+        )
+    result = rows[-(response_length + 1) : -1]
+    if len(result) != response_length:
+        raise RuntimeError("prompt top-k output does not cover the complete student action")
+    return result
 
 
 def normalized_topk_union_kl(
@@ -158,6 +187,7 @@ def structured_action_disagreement(
 __all__ = [
     "masked_mean",
     "normalized_topk_union_kl",
+    "response_prediction_rows",
     "structured_action_disagreement",
     "tokenwise_topk_union_kl",
 ]

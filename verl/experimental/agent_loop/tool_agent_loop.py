@@ -568,7 +568,6 @@ class ToolAgentLoop(AgentLoopBase):
             observation = {
                 "pool_count": 0,
                 "evidence_count": 0,
-                "pool_preview": [],
                 "evidence": [],
                 "trace": [],
                 "stopped": False,
