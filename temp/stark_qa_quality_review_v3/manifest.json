@@ -1,0 +1,17 @@
+{
+  "source_qa_count": 1063,
+  "seed": 20260722,
+  "sample_count": 90,
+  "per_point": {
+    "FR": 10,
+    "TR": 10,
+    "VS": 10,
+    "TTL": 10,
+    "VR": 10,
+    "MR": 10,
+    "KR": 10,
+    "CD": 10,
+    "AR": 10
+  },
+  "sample_file": "/home/miaofy/memory-opd/temp/stark_qa_quality_review_v3/sample_90_new_raw.jsonl"
+}

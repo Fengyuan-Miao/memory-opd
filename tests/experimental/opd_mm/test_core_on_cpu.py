@@ -194,6 +194,90 @@ def test_kl_credit_batch_populates_grpo_and_all_fail_distillation_states() -> No
     assert credit_batch.batch["distillation_mask"].sum().item() == 2
 
 
+def test_reward_gated_opd_uses_full_grpo_states_without_kl_selection() -> None:
+    config = SimpleNamespace(
+        algorithm=SimpleNamespace(
+            opd_mm_kl_credit={
+                "top_actions": 1,
+                "topk": 2,
+                "grpo_action_selection": "all_states",
+                "success_key": "opd_mm/answer_correct",
+            }
+        ),
+        actor_rollout_ref=SimpleNamespace(
+            rollout=SimpleNamespace(prompt_length=4, response_length=3, n=1),
+            actor=SimpleNamespace(ppo_mini_batch_size=1),
+        ),
+    )
+    trainer = SimpleNamespace(
+        config=config,
+        tokenizer=SimpleNamespace(pad_token_id=0),
+        actor_rollout_wg=object(),
+        _get_dp_size=lambda worker_group, role: 1,
+    )
+    states = np.empty(2, dtype=object)
+    states[0] = [
+        {
+            "step_index": 0,
+            "prompt_ids": [10],
+            "response_ids": [20, 21],
+            "response_logprobs": [-0.2, -0.3],
+        },
+        {
+            "step_index": 1,
+            "prompt_ids": [10, 20],
+            "response_ids": [22],
+            "response_logprobs": [-0.4],
+        },
+    ]
+    states[1] = [
+        {
+            "step_index": 0,
+            "prompt_ids": [11],
+            "response_ids": [30, 31],
+            "response_logprobs": [-0.5, -0.6],
+        }
+    ]
+    corrections = np.empty(2, dtype=object)
+    corrections[0] = []
+    corrections[1] = [
+        {
+            "step_index": 0,
+            "kl_credit": {
+                "structured_disagreement": True,
+                "action_kl": 1.5,
+                "tool_call_mask": [1, 1],
+                "teacher_ids": [[40, 41], [42, 43]],
+                "teacher_logprobs": [[-0.1, -2.0], [-0.2, -1.8]],
+            },
+        }
+    ]
+    batch = DataProto.from_dict(
+        tensors={
+            "advantages": torch.tensor([[1.0, 1.0, 0.0], [0.0, 0.0, 0.0]]),
+            "response_mask": torch.tensor([[1, 1, 0], [1, 1, 0]]),
+        },
+        non_tensors={
+            "uid": np.array(["successful-group", "all-fail-group"], dtype=object),
+            "opd_mm/answer_correct": np.array([1.0, 0.0], dtype=object),
+            "opd_mm_policy_states": states,
+            "opd_mm_step_corrections": corrections,
+        },
+    )
+
+    result = RayPPOTrainer._build_opd_mm_kl_credit_batch(trainer, batch)
+
+    assert result is not None
+    gated_batch, metrics = result
+    assert metrics["opd_mm_grpo_states"] == 2.0
+    assert metrics["opd_mm_grpo_full_states"] == 2.0
+    assert metrics["opd_mm_distill_states"] == 1.0
+    assert metrics["opd_mm_kl_selected_actions"] == 1.0
+    assert gated_batch.batch["response_mask"].sum().item() == 3
+    assert gated_batch.batch["distillation_mask"].sum().item() == 2
+    assert gated_batch.non_tensor_batch["opd_mm_kl_credit_mode"].tolist() == ["grpo", "grpo", "distill"]
+
+
 def _records() -> list[MemoryRecord]:
     return [
         MemoryRecord(

@@ -1422,12 +1422,15 @@ class RayPPOTrainer:
     def _build_opd_mm_kl_credit_batch(
         self, batch: DataProto
     ) -> Optional[tuple[DataProto, dict[str, float]]]:
-        """Build hard top-action masks for reward-gated GRPO/KL distillation.
+        """Build a reward-gated GRPO/KL-distillation batch.
 
         A uid group with at least one answer-correct rollout contributes only
         GRPO loss. A group with no answer-correct rollout contributes only
-        forward-KL distillation. Both paths operate on the two highest-KL
-        structured-disagreement action spans from each student trajectory.
+        forward-KL distillation. ``grpo_action_selection=top_kl`` restricts
+        both objectives to the highest-KL structured-disagreement actions;
+        ``all_states`` makes successful groups use ordinary GRPO on every
+        visited student state while retaining privileged distillation only for
+        all-fail groups.
         """
         states_column = batch.non_tensor_batch.get("opd_mm_policy_states")
         corrections_column = batch.non_tensor_batch.get("opd_mm_step_corrections")
@@ -1437,6 +1440,12 @@ class RayPPOTrainer:
 
         credit_config = self.config.algorithm.opd_mm_kl_credit
         top_actions = max(1, int(credit_config.get("top_actions", 2)))
+        grpo_action_selection = str(credit_config.get("grpo_action_selection", "top_kl")).strip().lower()
+        if grpo_action_selection not in {"top_kl", "all_states"}:
+            raise ValueError(
+                "algorithm.opd_mm_kl_credit.grpo_action_selection must be "
+                f"'top_kl' or 'all_states', got {grpo_action_selection!r}"
+            )
         success_key = str(credit_config.get("success_key", "opd_mm/answer_correct"))
         success_values = batch.non_tensor_batch.get(success_key)
         if success_values is None:
@@ -1468,6 +1477,7 @@ class RayPPOTrainer:
         grpo_groups: set[str] = set()
         distill_groups: set[str] = set()
         trajectories_with_candidates = 0
+        grpo_full_state_count = 0
 
         for sample_index, (raw_states, raw_corrections) in enumerate(
             zip(states_column, corrections_column, strict=True)
@@ -1484,6 +1494,62 @@ class RayPPOTrainer:
                 for index, state in enumerate(sample_states)
                 if isinstance(state, dict)
             }
+            uid = str(plain(original_uids[sample_index]))
+            mode = "grpo" if uid_success[uid] else "distill"
+            if mode == "grpo":
+                grpo_groups.add(uid)
+            else:
+                distill_groups.add(uid)
+
+            trajectory_advantage = 0.0
+            if mode == "grpo":
+                valid_advantages = batch.batch["advantages"][sample_index]
+                if response_mask is not None:
+                    valid_advantages = valid_advantages[response_mask[sample_index].bool()]
+                if valid_advantages.numel() == 0:
+                    continue
+                trajectory_advantage = float(valid_advantages.float().mean().item())
+
+            if mode == "grpo" and grpo_action_selection == "all_states":
+                initial_row_count = len(rows)
+                for state in sample_states:
+                    if not isinstance(state, dict):
+                        continue
+                    prompt_ids = plain(state.get("prompt_ids") or [])
+                    sampled_ids = plain(state.get("response_ids") or [])
+                    rollout_logprobs = plain(state.get("response_logprobs") or [])
+                    if not isinstance(prompt_ids, list) or not isinstance(sampled_ids, list):
+                        raise RuntimeError("OPD-MM GRPO state has non-list prompt or response token IDs")
+                    if not isinstance(rollout_logprobs, list) or len(rollout_logprobs) != len(sampled_ids):
+                        raise RuntimeError(
+                            "OPD-MM GRPO state response tokens and rollout log-probabilities are not aligned"
+                        )
+                    if not prompt_ids or not sampled_ids or len(sampled_ids) > response_width:
+                        raise RuntimeError("OPD-MM GRPO state has an empty or overlong prompt/response")
+                    rows.append(
+                        {
+                            "prompt_ids": [int(token) for token in prompt_ids],
+                            "sampled_ids": [int(token) for token in sampled_ids],
+                            "rollout_logprobs": [float(value) for value in rollout_logprobs],
+                            "tool_call_mask": [1] * len(sampled_ids),
+                            "teacher_ids": [],
+                            "teacher_logprobs": [],
+                            "advantage": trajectory_advantage,
+                            "uid": uid,
+                            "state": state,
+                            "correction": None,
+                            "mode": mode,
+                            "action_kl": None,
+                            "multi_modal_inputs": (
+                                original_multi_modal_inputs[sample_index]
+                                if original_multi_modal_inputs is not None
+                                else {}
+                            ),
+                        }
+                    )
+                grpo_full_state_count += len(rows) - initial_row_count
+                continue
+
             candidates: list[tuple[float, dict[str, Any], dict[str, Any], dict[str, Any]]] = []
             for correction in sample_corrections:
                 if not isinstance(correction, dict):
@@ -1525,21 +1591,6 @@ class RayPPOTrainer:
                 continue
             trajectories_with_candidates += 1
             candidates.sort(key=lambda item: item[0], reverse=True)
-            uid = str(plain(original_uids[sample_index]))
-            mode = "grpo" if uid_success[uid] else "distill"
-            if mode == "grpo":
-                grpo_groups.add(uid)
-            else:
-                distill_groups.add(uid)
-
-            trajectory_advantage = 0.0
-            if mode == "grpo":
-                valid_advantages = batch.batch["advantages"][sample_index]
-                if response_mask is not None:
-                    valid_advantages = valid_advantages[response_mask[sample_index].bool()]
-                if valid_advantages.numel() == 0:
-                    continue
-                trajectory_advantage = float(valid_advantages.float().mean().item())
 
             for score, state, correction, credit in candidates[:top_actions]:
                 prompt_ids = plain(state.get("prompt_ids") or [])
@@ -1597,7 +1648,14 @@ class RayPPOTrainer:
         if len(rows) < target_size:
             rows = (rows * math.ceil(target_size / len(rows)))[:target_size]
 
-        topk = len(rows[0]["teacher_ids"][0])
+        topk = next(
+            (
+                len(row["teacher_ids"][0])
+                for row in rows
+                if row["teacher_ids"] and row["teacher_ids"][0]
+            ),
+            max(1, int(credit_config.get("topk", 8))),
+        )
         tensor_values: dict[str, list[Any]] = defaultdict(list)
         for row in rows:
             prompt_ids = row["prompt_ids"][-prompt_width:]
@@ -1625,11 +1683,12 @@ class RayPPOTrainer:
             teacher_ids = [[pad_id] * topk for _ in range(prompt_width + response_width)]
             teacher_logprobs = [[0.0] * topk for _ in range(prompt_width + response_width)]
             prediction_start = prompt_width - 1
-            for offset, (ids_row, logprobs_row) in enumerate(
-                zip(row["teacher_ids"], row["teacher_logprobs"], strict=True)
-            ):
-                teacher_ids[prediction_start + offset] = ids_row
-                teacher_logprobs[prediction_start + offset] = logprobs_row
+            if row["mode"] == "distill":
+                for offset, (ids_row, logprobs_row) in enumerate(
+                    zip(row["teacher_ids"], row["teacher_logprobs"], strict=True)
+                ):
+                    teacher_ids[prediction_start + offset] = ids_row
+                    teacher_logprobs[prediction_start + offset] = logprobs_row
 
             tensor_values["prompts"].append(padded_prompt)
             tensor_values["responses"].append(padded_response)
@@ -1670,18 +1729,20 @@ class RayPPOTrainer:
             "opd_mm_policy_state": np.array([row["state"] for row in rows], dtype=object),
             "opd_mm_step_correction": np.array([row["correction"] for row in rows], dtype=object),
         }
-        scores = [row["action_kl"] for row in rows[:unpadded_row_count]]
+        selected_rows = [row for row in rows[:unpadded_row_count] if row["action_kl"] is not None]
+        scores = [float(row["action_kl"]) for row in selected_rows]
         metrics = {
-            "opd_mm_kl_selected_actions": float(unpadded_row_count),
+            "opd_mm_kl_selected_actions": float(len(selected_rows)),
             "opd_mm_grpo_states": float(grpo_state_count),
+            "opd_mm_grpo_full_states": float(grpo_full_state_count),
             "opd_mm_distill_states": float(distill_state_count),
             "opd_mm_grpo_groups": float(len(grpo_groups)),
             "opd_mm_all_fail_groups": float(len(distill_groups)),
             "opd_mm_trajectories_with_candidates": float(trajectories_with_candidates),
-            "opd_mm_selected_action_kl": float(sum(scores) / len(scores)),
+            "opd_mm_selected_action_kl": float(sum(scores) / len(scores)) if scores else 0.0,
             "opd_mm_selected_token_fraction": float(
-                sum(sum(row["tool_call_mask"]) for row in rows[:unpadded_row_count])
-                / max(1, sum(len(row["sampled_ids"]) for row in rows[:unpadded_row_count]))
+                sum(sum(row["tool_call_mask"]) for row in selected_rows)
+                / max(1, sum(len(row["sampled_ids"]) for row in selected_rows))
             ),
         }
         return (

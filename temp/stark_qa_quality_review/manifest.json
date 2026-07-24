@@ -1,0 +1,17 @@
+{
+  "source": "/home/miaofy/memory-opd/dataset/Stark/opd_mm_store_direct/expansion_v2/direct_api/qa",
+  "seed": 20260722,
+  "sample_count": 90,
+  "per_point": {
+    "FR": 10,
+    "VS": 10,
+    "TTL": 10,
+    "TR": 10,
+    "VR": 10,
+    "MR": 10,
+    "KR": 10,
+    "CD": 10,
+    "AR": 10
+  },
+  "sample_file": "/home/miaofy/memory-opd/temp/stark_qa_quality_review/sample_90_raw.jsonl"
+}

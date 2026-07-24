@@ -488,12 +488,12 @@ def run_answer_model(args: argparse.Namespace, rows: list[dict[str, Any]]) -> li
 
 
 def _judge_prompt(row: dict[str, Any]) -> list[dict[str, str]]:
-    evidence = row.get("evidence") or []
-    evidence_text = json.dumps(evidence[:8], ensure_ascii=False, indent=2)
     system = (
-        "You are a strict but fair evaluator for a memory QA benchmark. "
-        "Judge whether the student's final answer correctly answers the question. "
-        "Use the gold answer as the primary reference; evidence is provided only for context. "
+        "Judge answer correctness for a memory-QA benchmark. Use the gold answer as the sole correctness reference: "
+        "the student answer is correct only if it directly answers the question and is semantically equivalent to "
+        "the gold answer. Do not evaluate retrieval or evidence sufficiency. A refusal, unknown, or "
+        "INSUFFICIENT_EVIDENCE is incorrect when the gold answer provides a substantive answer; it is correct only "
+        "when the gold answer itself explicitly means unknown or not mentioned. "
         "Return only valid JSON with keys: correct (boolean), score (0 or 1), reason (short string)."
     )
     user = f"""Question:
@@ -504,9 +504,6 @@ Gold answer:
 
 Student answer:
 {row.get('student_answer')}
-
-Retrieved evidence:
-{evidence_text}
 
 Is the student answer semantically correct?"""
     return [{"role": "system", "content": system}, {"role": "user", "content": user}]

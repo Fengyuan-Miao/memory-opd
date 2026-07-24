@@ -1,0 +1,75 @@
+{
+  "sample_file": "/home/miaofy/memory-opd/temp/stark_qa_quality_review/sample_90_raw.jsonl",
+  "reviewed_file": "/home/miaofy/memory-opd/temp/stark_qa_quality_review/sample_90_reviewed.jsonl",
+  "review_method": "Manual review of declared support for all 90 QAs; actual images for VS/TTL/VR; full-episode absence checks for AR.",
+  "sample_count": 90,
+  "label_counts": {
+    "pass": 76,
+    "fail": 6,
+    "minor_issue": 8
+  },
+  "label_rates": {
+    "pass": 0.8444444444444444,
+    "fail": 0.06666666666666667,
+    "minor_issue": 0.08888888888888889
+  },
+  "per_point": {
+    "AR": {
+      "pass": 10,
+      "minor_issue": 0,
+      "fail": 0
+    },
+    "CD": {
+      "pass": 8,
+      "minor_issue": 2,
+      "fail": 0
+    },
+    "FR": {
+      "pass": 7,
+      "minor_issue": 0,
+      "fail": 3
+    },
+    "KR": {
+      "pass": 10,
+      "minor_issue": 0,
+      "fail": 0
+    },
+    "MR": {
+      "pass": 9,
+      "minor_issue": 0,
+      "fail": 1
+    },
+    "TR": {
+      "pass": 10,
+      "minor_issue": 0,
+      "fail": 0
+    },
+    "TTL": {
+      "pass": 7,
+      "minor_issue": 1,
+      "fail": 2
+    },
+    "VR": {
+      "pass": 9,
+      "minor_issue": 1,
+      "fail": 0
+    },
+    "VS": {
+      "pass": 6,
+      "minor_issue": 4,
+      "fail": 0
+    }
+  },
+  "issue_counts": {
+    "support_incomplete": 4,
+    "metadata_wording": 3,
+    "weak_visual_specificity": 2,
+    "image_not_diagnostic": 2,
+    "category_style_drift": 2,
+    "unresolved_reference": 1,
+    "question_conflates_facts": 1,
+    "weak_visual_grounding": 1,
+    "identity_not_visually_verifiable": 1
+  },
+  "conclusion": "Most sampled QAs are usable. The main blocking defects are incomplete declared support and visually non-diagnostic TTL questions; VS wording and CD style drift are lower-severity issues."
+}

@@ -76,6 +76,21 @@ def test_outcome_reward_generates_answer_before_gold_aware_judge(tmp_path, monke
     assert row["candidate_answer"] == "The bicycle was red."
 
 
+def test_answer_judge_does_not_use_missing_evidence_to_excuse_a_refusal() -> None:
+    messages = outcome_reward._judge_messages(
+        query="Which conference was recommended?",
+        gold_answer="AAAI.",
+        evidence=[{"content": "Unrelated public evidence."}],
+        candidate_answer="INSUFFICIENT_EVIDENCE",
+    )
+    prompt = json.dumps(messages, ensure_ascii=False)
+
+    assert "sole correctness reference" in prompt
+    assert "INSUFFICIENT_EVIDENCE is incorrect" in prompt
+    assert "AAAI." in prompt
+    assert "Unrelated public evidence." not in prompt
+
+
 def test_outcome_reward_does_not_call_models_for_nonterminal_or_empty_evidence(monkeypatch) -> None:
     async def unexpected_call(**kwargs: Any) -> str:
         del kwargs

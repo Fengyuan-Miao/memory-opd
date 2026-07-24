@@ -584,32 +584,31 @@ def _write_tables(
         )
 
 
-def build_mem_gallery_vector_store(
+def _build_vector_store(
     *,
-    dataset_root: str | Path,
+    records: list[MemoryRecord],
+    qas: list[dict[str, Any]],
     output_dir: str | Path,
+    dataset_manifest: dict[str, Any],
     dense_model_path: str | Path,
     vision_model_path: str | Path,
     hybrid_model_path: str | Path,
-    device: str = "cuda:0",
-    dense_batch_size: int = 128,
-    vision_batch_size: int = 32,
-    hybrid_text_batch_size: int = 16,
-    hybrid_image_batch_size: int = 4,
-    build_dense: bool = True,
-    build_vision: bool = True,
-    build_hybrid: bool = True,
+    device: str,
+    dense_batch_size: int,
+    vision_batch_size: int,
+    hybrid_text_batch_size: int,
+    hybrid_image_batch_size: int,
+    build_dense: bool,
+    build_vision: bool,
+    build_hybrid: bool,
 ) -> dict[str, Any]:
-    """Build and persist a Mem-Gallery OPD-MM memory store."""
+    """Persist records/QA tables and build the standard OPD-MM indexes."""
+
     output = Path(output_dir)
     output.mkdir(parents=True, exist_ok=True)
-    records = load_mem_gallery_records(dataset_root)
-    qas = load_mem_gallery_qas(dataset_root)
     _write_tables(records, qas, output)
-
     manifest: dict[str, Any] = {
-        "dataset": "mem_gallery",
-        "dataset_root": str(Path(dataset_root).resolve()),
+        **dataset_manifest,
         "output_dir": str(output.resolve()),
         "created_at": _now(),
         "record_count": len(records),
@@ -735,6 +734,97 @@ def build_mem_gallery_vector_store(
 
     _write_json(output / "manifest.json", manifest)
     return manifest
+
+
+def build_mem_gallery_vector_store(
+    *,
+    dataset_root: str | Path,
+    output_dir: str | Path,
+    dense_model_path: str | Path,
+    vision_model_path: str | Path,
+    hybrid_model_path: str | Path,
+    device: str = "cuda:0",
+    dense_batch_size: int = 128,
+    vision_batch_size: int = 32,
+    hybrid_text_batch_size: int = 16,
+    hybrid_image_batch_size: int = 4,
+    build_dense: bool = True,
+    build_vision: bool = True,
+    build_hybrid: bool = True,
+) -> dict[str, Any]:
+    """Build and persist a Mem-Gallery OPD-MM memory store."""
+    records = load_mem_gallery_records(dataset_root)
+    qas = load_mem_gallery_qas(dataset_root)
+    return _build_vector_store(
+        records=records,
+        qas=qas,
+        output_dir=output_dir,
+        dataset_manifest={
+            "dataset": "mem_gallery",
+            "dataset_root": str(Path(dataset_root).resolve()),
+        },
+        dense_model_path=dense_model_path,
+        vision_model_path=vision_model_path,
+        hybrid_model_path=hybrid_model_path,
+        device=device,
+        dense_batch_size=dense_batch_size,
+        vision_batch_size=vision_batch_size,
+        hybrid_text_batch_size=hybrid_text_batch_size,
+        hybrid_image_batch_size=hybrid_image_batch_size,
+        build_dense=build_dense,
+        build_vision=build_vision,
+        build_hybrid=build_hybrid,
+    )
+
+
+def build_jsonl_vector_store(
+    *,
+    records_path: str | Path,
+    qa_paths: Iterable[str | Path],
+    output_dir: str | Path,
+    dataset_name: str,
+    dense_model_path: str | Path,
+    vision_model_path: str | Path,
+    hybrid_model_path: str | Path,
+    device: str = "cuda:0",
+    dense_batch_size: int = 128,
+    vision_batch_size: int = 32,
+    hybrid_text_batch_size: int = 16,
+    hybrid_image_batch_size: int = 4,
+    build_dense: bool = True,
+    build_vision: bool = True,
+    build_hybrid: bool = True,
+) -> dict[str, Any]:
+    """Build the Mem-Gallery-compatible indexes for an existing JSONL store."""
+
+    resolved_qa_paths = [Path(path) for path in qa_paths]
+    records = _records_from_jsonl(records_path)
+    qas = [
+        row
+        for path in resolved_qa_paths
+        for row in _read_jsonl(path)
+    ]
+    return _build_vector_store(
+        records=records,
+        qas=qas,
+        output_dir=output_dir,
+        dataset_manifest={
+            "dataset": dataset_name,
+            "records_source": str(Path(records_path).resolve()),
+            "qa_sources": [str(path.resolve()) for path in resolved_qa_paths],
+        },
+        dense_model_path=dense_model_path,
+        vision_model_path=vision_model_path,
+        hybrid_model_path=hybrid_model_path,
+        device=device,
+        dense_batch_size=dense_batch_size,
+        vision_batch_size=vision_batch_size,
+        hybrid_text_batch_size=hybrid_text_batch_size,
+        hybrid_image_batch_size=hybrid_image_batch_size,
+        build_dense=build_dense,
+        build_vision=build_vision,
+        build_hybrid=build_hybrid,
+    )
 
 
 def load_indexed_memory_store(

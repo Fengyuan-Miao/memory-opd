@@ -167,21 +167,27 @@ def _judge_messages(
     evidence: list[Any],
     candidate_answer: str,
 ) -> list[dict[str, str]]:
-    evidence_json = json.dumps(evidence, ensure_ascii=False, separators=(",", ":"), default=str)
+    # Evidence quality is evaluated separately. Including evidence here can
+    # make the judge reward a reasonable refusal after a failed retrieval,
+    # even though that refusal does not answer the question or match gold.
+    del evidence
     return [
         {
             "role": "system",
             "content": (
-                "Judge a memory-QA answer. Mark correct only when the candidate semantically answers the question, "
-                "matches the gold answer, and is supported by the public evidence. A correct guess without evidence "
-                "is incorrect. Return only JSON: {\"correct\":true|false,\"reason\":\"short reason\"}."
+                "Judge answer correctness for a memory-QA benchmark. Use the gold answer as the sole correctness "
+                "reference: mark correct only if the candidate directly answers the question and is semantically "
+                "equivalent to the gold answer. Do not evaluate retrieval or evidence sufficiency. A refusal, unknown, "
+                "or INSUFFICIENT_EVIDENCE is incorrect when the gold answer provides a substantive answer; it is "
+                "correct only when the gold answer itself explicitly means unknown or not mentioned. "
+                "Return only JSON: {\"correct\":true|false,\"reason\":\"short reason\"}."
             ),
         },
         {
             "role": "user",
             "content": (
                 f"Question:\n{query}\n\nGold answer:\n{gold_answer}\n\n"
-                f"Public evidence:\n{evidence_json}\n\nCandidate answer:\n{candidate_answer}"
+                f"Candidate answer:\n{candidate_answer}"
             ),
         },
     ]

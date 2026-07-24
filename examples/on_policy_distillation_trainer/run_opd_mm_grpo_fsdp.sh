@@ -76,6 +76,9 @@ TEACHER_MAX_NUM_BATCHED_TOKENS=${TEACHER_MAX_NUM_BATCHED_TOKENS:-4096}
 TEACHER_GPU_MEMORY_UTIL=${TEACHER_GPU_MEMORY_UTIL:-0.55}
 OPD_MM_KL_TOPK=${OPD_MM_KL_TOPK:-8}
 OPD_MM_KL_TOP_ACTIONS=${OPD_MM_KL_TOP_ACTIONS:-2}
+OPD_MM_GRPO_ACTION_SELECTION=${OPD_MM_GRPO_ACTION_SELECTION:-top_kl}
+OPD_MM_KL_CREDIT_ENABLED=${OPD_MM_KL_CREDIT_ENABLED:-True}
+DISTILLATION_ENABLED=${DISTILLATION_ENABLED:-True}
 
 # One fixed VLM serves INSPECT_RAW, terminal answer generation, and the private
 # correctness judge. Gold is sent only in the second, post-rollout judge call.
@@ -149,7 +152,14 @@ export OPD_MM_STUDENT_ROLLOUT_DUMP_DIR
 export OPD_MM_STUDENT_ROLLOUT_DUMP_MAX_CHARS=${OPD_MM_STUDENT_ROLLOUT_DUMP_MAX_CHARS:-12000}
 export OPD_MM_RECORD_POLICY_STATES=1
 export OPD_MM_KL_TOPK
-export OPD_MM_KL_CREDIT_ASSIGNMENT=1
+case "${OPD_MM_KL_CREDIT_ENABLED,,}" in
+    1|true|yes|on) export OPD_MM_KL_CREDIT_ASSIGNMENT=1 ;;
+    0|false|no|off) export OPD_MM_KL_CREDIT_ASSIGNMENT=0 ;;
+    *)
+        echo "Invalid OPD_MM_KL_CREDIT_ENABLED=$OPD_MM_KL_CREDIT_ENABLED" >&2
+        exit 1
+        ;;
+esac
 export OPD_MM_SKIP_INITIAL_CORRECTION=0
 export OPD_MM_FAIL_ON_PROMPT_TRUNCATION=1
 export OPD_MM_TEACHER_CORRECTION_DUMP_DIR
@@ -220,6 +230,9 @@ echo "OUTCOME_MODEL_PATH=${OUTCOME_MODEL_PATH}"
 echo "TEACHER_MODEL_PATH=${TEACHER_MODEL_PATH}"
 echo "OPD_MM_KL_TOPK=${OPD_MM_KL_TOPK}"
 echo "OPD_MM_KL_TOP_ACTIONS=${OPD_MM_KL_TOP_ACTIONS}"
+echo "OPD_MM_GRPO_ACTION_SELECTION=${OPD_MM_GRPO_ACTION_SELECTION}"
+echo "OPD_MM_KL_CREDIT_ENABLED=${OPD_MM_KL_CREDIT_ENABLED}"
+echo "DISTILLATION_ENABLED=${DISTILLATION_ENABLED}"
 echo "ACTOR_SP_SIZE=${actor_sp_size}"
 echo "PPO_MAX_TOKEN_LEN_PER_GPU=${ppo_max_token_len_per_gpu}"
 echo "DISTILL_CHUNK_SIZE=${distill_chunk_size}"
@@ -235,8 +248,10 @@ max_num_tokens=$(( max_prompt_length + max_response_length + 1 ))
 DATA=(
     algorithm.adv_estimator=grpo
     algorithm.use_kl_in_reward=False
-    +algorithm.opd_mm_kl_credit.enabled=True
+    +algorithm.opd_mm_kl_credit.enabled=${OPD_MM_KL_CREDIT_ENABLED}
     +algorithm.opd_mm_kl_credit.top_actions=${OPD_MM_KL_TOP_ACTIONS}
+    +algorithm.opd_mm_kl_credit.topk=${OPD_MM_KL_TOPK}
+    +algorithm.opd_mm_kl_credit.grpo_action_selection=${OPD_MM_GRPO_ACTION_SELECTION}
     +algorithm.opd_mm_kl_credit.success_key=opd_mm/answer_correct
     algorithm.rollout_correction.bypass_mode=True
     algorithm.rollout_correction.loss_type=ppo_clip
@@ -322,7 +337,7 @@ REWARD=(
 )
 
 DISTILLATION=(
-    distillation.enabled=True
+    distillation.enabled=${DISTILLATION_ENABLED}
     distillation.n_gpus_per_node=${TEACHER_NGPUS_PER_NODE}
     distillation.nnodes=${TEACHER_NNODES}
     distillation.teacher_key=data_source
