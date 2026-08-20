@@ -132,6 +132,36 @@ def _correction(step: int, score: float) -> dict:
     }
 
 
+def test_group_route_excludes_reward_service_failures() -> None:
+    trainer = SimpleNamespace()
+    batch = DataProto.from_dict(
+        tensors={"token_level_scores": torch.zeros(2, 2)},
+        non_tensors={
+            "uid": np.array(["broken-group", "broken-group"], dtype=object),
+            "opd_mm/answer_correct": np.array([0.0, 0.0]),
+            "opd_mm/outcome_evaluated": np.array([0.0, 1.0]),
+            "opd_mm/outcome_infrastructure_failure": np.array([1.0, 0.0]),
+        },
+    )
+
+    assert RayPPOTrainer._opd_mm_group_routes(trainer, batch) == {"broken-group": "invalid"}
+
+
+def test_group_route_treats_nonterminal_rollouts_as_real_failures() -> None:
+    trainer = SimpleNamespace()
+    batch = DataProto.from_dict(
+        tensors={"token_level_scores": torch.zeros(2, 2)},
+        non_tensors={
+            "uid": np.array(["policy-fail-group", "policy-fail-group"], dtype=object),
+            "opd_mm/answer_correct": np.array([0.0, 0.0]),
+            "opd_mm/outcome_evaluated": np.array([0.0, 0.0]),
+            "opd_mm/outcome_infrastructure_failure": np.array([0.0, 0.0]),
+        },
+    )
+
+    assert RayPPOTrainer._opd_mm_group_routes(trainer, batch) == {"policy-fail-group": "all_fail"}
+
+
 def test_kl_credit_batch_routes_success_groups_to_grpo_and_all_fail_groups_to_distillation() -> None:
     config = SimpleNamespace(
         algorithm=SimpleNamespace(
@@ -187,7 +217,7 @@ def test_kl_credit_batch_routes_success_groups_to_grpo_and_all_fail_groups_to_di
     assert credit_batch.batch["response_mask"][:, 0].tolist() == [1, 1, 0, 0]
     assert credit_batch.batch["distillation_mask"][:, 0].tolist() == [0, 0, 1, 1]
     assert credit_batch.batch["advantages"][:, 0].tolist() == [1.0, -1.0, 0.0, 0.0]
-    assert credit_batch.batch["teacher_ids"][0, 5].tolist() == [10, 11]
+    assert credit_batch.batch["teacher_ids"][2, 5].tolist() == [10, 11]
     assert metrics["opd_mm_grpo_states"] == 2.0
     assert metrics["opd_mm_distill_states"] == 2.0
     assert metrics["opd_mm_all_fail_groups"] == 1.0
@@ -235,3 +265,61 @@ def test_kl_credit_batch_keeps_only_the_two_highest_kl_actions_per_trajectory() 
     assert selected_steps == [1, 2]
     assert metrics["opd_mm_kl_selected_actions"] == 2.0
     assert metrics["opd_mm_selected_action_kl"] == pytest.approx(1.4)
+
+
+def test_pure_state_opsd_uses_every_valid_tool_call_without_reward_gating() -> None:
+    config = SimpleNamespace(
+        algorithm=SimpleNamespace(
+            opd_mm_state_opsd={"enabled": True, "topk": 2},
+            opd_mm_kl_credit={"enabled": False},
+        ),
+        actor_rollout_ref=SimpleNamespace(
+            rollout=SimpleNamespace(prompt_length=6, response_length=4, n=1),
+            actor=SimpleNamespace(ppo_mini_batch_size=1),
+        ),
+    )
+    trainer = SimpleNamespace(
+        config=config,
+        tokenizer=SimpleNamespace(pad_token_id=0),
+        actor_rollout_wg=object(),
+        _get_dp_size=lambda worker_group, role: 1,
+    )
+    states = np.empty(1, dtype=object)
+    corrections = np.empty(1, dtype=object)
+    states[0] = [_state(0, 20), _state(1, 30)]
+    # OPSD is distribution matching, so an action remains a valid target even
+    # when the teacher's decoded argmax call agrees with the student's call.
+    first = _correction(0, 0.2)
+    first["kl_credit"]["structured_disagreement"] = False
+    second = _correction(1, 0.8)
+    states[0][1]["response_logprobs"] = []
+    corrections[0] = [first, second]
+    batch = DataProto.from_dict(
+        tensors={
+            "response_mask": torch.tensor([[1, 1, 0, 0]]),
+            "advantages": torch.zeros(1, 4),
+            "token_level_scores": torch.zeros(1, 4),
+        },
+        non_tensors={
+            "uid": np.array(["trajectory"], dtype=object),
+            "opd_mm/answer_correct": np.array([0.0]),
+            "opd_mm_policy_states": states,
+            "opd_mm_step_corrections": corrections,
+        },
+    )
+
+    result = RayPPOTrainer._build_opd_mm_kl_credit_batch(
+        trainer,
+        batch,
+        pure_state_opsd=True,
+    )
+
+    assert result is not None
+    opsd_batch, metrics = result
+    assert opsd_batch.non_tensor_batch["opd_mm_kl_credit_mode"].tolist() == ["distill", "distill"]
+    assert opsd_batch.batch["response_mask"].sum().item() == 0
+    assert opsd_batch.batch["distillation_mask"][:, :2].tolist() == [[1, 0], [1, 0]]
+    assert opsd_batch.batch["old_log_probs"][1, :2].tolist() == [0.0, 0.0]
+    assert metrics["opd_mm_kl_selected_actions"] == 2.0
+    assert metrics["opd_mm_distill_states"] == 2.0
+    assert metrics["opd_mm_state_opsd"] == 1.0

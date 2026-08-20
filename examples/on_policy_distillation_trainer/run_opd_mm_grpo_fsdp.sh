@@ -62,6 +62,7 @@ OPD_MM_TRAIN_FILES=${OPD_MM_TRAIN_FILES:-"['${GRPO_DATA_DIR}/train.parquet']"}
 OPD_MM_VAL_FILES=${OPD_MM_VAL_FILES:-$OPD_MM_TRAIN_FILES}
 OPD_MM_TOOL_CONFIG=${OPD_MM_TOOL_CONFIG:-examples/opd_mm_baseline/opd_mm_tool_config.yaml}
 OPD_MM_REWARD_PATH=${OPD_MM_REWARD_PATH:-/home/miaofy/memory-opd/verl/experimental/opd_mm/outcome_reward.py}
+OPD_MM_VECTOR_STORE_DIR=${OPD_MM_VECTOR_STORE_DIR:-dataset/mem_gallery/opd_mm_store}
 
 TRAIN_GPUS=${TRAIN_GPUS:-0,1,2,3,4,5}
 OUTCOME_SERVER_GPUS=${OUTCOME_SERVER_GPUS:-6,7}
@@ -78,6 +79,9 @@ OPD_MM_KL_TOPK=${OPD_MM_KL_TOPK:-8}
 OPD_MM_KL_TOP_ACTIONS=${OPD_MM_KL_TOP_ACTIONS:-2}
 OPD_MM_GRPO_ACTION_SELECTION=${OPD_MM_GRPO_ACTION_SELECTION:-top_kl}
 OPD_MM_KL_CREDIT_ENABLED=${OPD_MM_KL_CREDIT_ENABLED:-True}
+OPD_MM_REWARD_GATED_SFT_ENABLED=${OPD_MM_REWARD_GATED_SFT_ENABLED:-False}
+OPD_MM_STATE_OPSD_ENABLED=${OPD_MM_STATE_OPSD_ENABLED:-False}
+OPD_MM_STATE_OPSD_REWARD_GATED=${OPD_MM_STATE_OPSD_REWARD_GATED:-False}
 DISTILLATION_ENABLED=${DISTILLATION_ENABLED:-True}
 
 # One fixed VLM serves INSPECT_RAW, terminal answer generation, and the private
@@ -95,6 +99,7 @@ OUTCOME_SERVER_START_TIMEOUT=${OUTCOME_SERVER_START_TIMEOUT:-900}
 
 rollout_n=${ROLLOUT_N:-4}
 train_batch_size=${TRAIN_BATCH_SIZE:-12}
+val_batch_size=${VAL_BATCH_SIZE:-20}
 ppo_mini_batch_size=${PPO_MINI_BATCH_SIZE:-$train_batch_size}
 max_prompt_length=${MAX_PROMPT_LENGTH:-16384}
 max_response_length=${MAX_RESPONSE_LENGTH:-2048}
@@ -104,13 +109,22 @@ actor_sp_size=${ACTOR_SP_SIZE:-4}
 # activations across all four actor GPUs.
 ppo_max_token_len_per_gpu=${PPO_MAX_TOKEN_LEN_PER_GPU:-$(((max_prompt_length + max_response_length + actor_sp_size - 1) / actor_sp_size))}
 actor_use_torch_compile=${ACTOR_USE_TORCH_COMPILE:-False}
+actor_activation_offload=${ACTOR_ACTIVATION_OFFLOAD:-False}
 distill_chunk_size=${DISTILL_CHUNK_SIZE:-256}
 actor_lr=${ACTOR_LR:-5e-7}
+actor_adamw_foreach=${ACTOR_ADAMW_FOREACH:-false}
 entropy_coeff=${ENTROPY_COEFF:-0.0}
+use_reference_kl=${USE_REFERENCE_KL:-False}
+reference_kl_coef=${REFERENCE_KL_COEF:-0.005}
 rollout_tp=${ROLLOUT_TP:-2}
 rollout_gpu_mem_util=${ROLLOUT_GPU_MEM_UTIL:-0.4}
 rollout_temperature=${ROLLOUT_TEMPERATURE:-0.8}
 rollout_top_p=${ROLLOUT_TOP_P:-0.95}
+val_do_sample=${VAL_DO_SAMPLE:-True}
+val_temperature=${VAL_TEMPERATURE:-$rollout_temperature}
+val_top_p=${VAL_TOP_P:-$rollout_top_p}
+val_top_k=${VAL_TOP_K:--1}
+val_n=${VAL_N:-1}
 total_epochs=${TOTAL_EPOCHS:-3}
 save_freq=${SAVE_FREQ:-25}
 test_freq=${TEST_FREQ:--1}
@@ -121,6 +135,11 @@ MAX_ACTION_PENALTY=${MAX_ACTION_PENALTY:-0.1}
 ERROR_PENALTY=${ERROR_PENALTY:-0.1}
 NON_STOP_PENALTY=${NON_STOP_PENALTY:-0.1}
 EMPTY_EVIDENCE_PENALTY=${EMPTY_EVIDENCE_PENALTY:-0.1}
+EVIDENCE_ANSWERABLE_WEIGHT=${EVIDENCE_ANSWERABLE_WEIGHT:-0.2}
+EFFICIENCY_ACTION_FREE=${EFFICIENCY_ACTION_FREE:-3}
+EFFICIENCY_ACTION_PENALTY=${EFFICIENCY_ACTION_PENALTY:-0.01}
+EFFICIENCY_EVIDENCE_FREE=${EFFICIENCY_EVIDENCE_FREE:-16}
+EFFICIENCY_EVIDENCE_PENALTY=${EFFICIENCY_EVIDENCE_PENALTY:-0.005}
 
 project_name=${PROJECT_NAME:-verl_grpo_opd_mm}
 experiment_name=${EXPERIMENT_NAME:-opd_mm_qwen35_4b_selfdistill_klcredit_top2_grpo_${RUN_TIMESTAMP}}
@@ -131,6 +150,7 @@ OPD_MM_STUDENT_ROLLOUT_DUMP_DIR=${OPD_MM_STUDENT_ROLLOUT_DUMP_DIR:-${LOG_DIR}/op
 OPD_MM_OUTCOME_REWARD_DUMP_DIR=${OPD_MM_OUTCOME_REWARD_DUMP_DIR:-${LOG_DIR}/opd_mm_grpo_outcomes_${RUN_TIMESTAMP}}
 OPD_MM_TEACHER_CORRECTION_DUMP_DIR=${OPD_MM_TEACHER_CORRECTION_DUMP_DIR:-${LOG_DIR}/opd_mm_kl_credit_${RUN_TIMESTAMP}}
 OUTCOME_SERVER_LOG=${OUTCOME_SERVER_LOG:-${LOG_DIR}/${experiment_name}_outcome_server.log}
+VALIDATION_DATA_DIR=${VALIDATION_DATA_DIR:-${LOG_DIR}/${experiment_name}_validation}
 
 RUN_POST_TRAIN_EVAL=${RUN_POST_TRAIN_EVAL:-1}
 POST_TRAIN_EVAL_GPUS=${POST_TRAIN_EVAL_GPUS:-0,1}
@@ -144,7 +164,7 @@ RAY_TMPDIR=${RAY_TMPDIR:-${RAY_TMP_ROOT}/grpo${RUN_TIMESTAMP:9}}
 TMPDIR=${TMPDIR:-$RAY_TMPDIR}
 
 mkdir -p "$LOG_DIR" "$OPD_MM_STUDENT_ROLLOUT_DUMP_DIR" "$OPD_MM_OUTCOME_REWARD_DUMP_DIR" \
-    "$OPD_MM_TEACHER_CORRECTION_DUMP_DIR" "$RAY_TMPDIR"
+    "$OPD_MM_TEACHER_CORRECTION_DUMP_DIR" "$VALIDATION_DATA_DIR" "$RAY_TMPDIR"
 export PYTHONUNBUFFERED=${PYTHONUNBUFFERED:-1}
 export HYDRA_FULL_ERROR=${HYDRA_FULL_ERROR:-1}
 export RAY_TMPDIR TMPDIR
@@ -166,6 +186,7 @@ export OPD_MM_TEACHER_CORRECTION_DUMP_DIR
 export OPD_MM_TEACHER_CORRECTION_DUMP_MAX_CHARS=${OPD_MM_TEACHER_CORRECTION_DUMP_MAX_CHARS:-12000}
 export OPD_MM_TEACHER_CORRECTION_DUMP_INCLUDE_PROMPT=${OPD_MM_TEACHER_CORRECTION_DUMP_INCLUDE_PROMPT:-0}
 export OPD_MM_OUTCOME_REWARD_DUMP_DIR
+export OPD_MM_VECTOR_STORE_DIR
 export OPD_MM_OUTCOME_BASE_URL="$OUTCOME_SERVER_BASE_URL"
 export OPD_MM_OUTCOME_MODEL="$OUTCOME_SERVED_MODEL"
 export OPD_MM_JUDGE_BASE_URL="$OUTCOME_SERVER_BASE_URL"
@@ -232,11 +253,24 @@ echo "OPD_MM_KL_TOPK=${OPD_MM_KL_TOPK}"
 echo "OPD_MM_KL_TOP_ACTIONS=${OPD_MM_KL_TOP_ACTIONS}"
 echo "OPD_MM_GRPO_ACTION_SELECTION=${OPD_MM_GRPO_ACTION_SELECTION}"
 echo "OPD_MM_KL_CREDIT_ENABLED=${OPD_MM_KL_CREDIT_ENABLED}"
+echo "OPD_MM_REWARD_GATED_SFT_ENABLED=${OPD_MM_REWARD_GATED_SFT_ENABLED}"
+echo "OPD_MM_STATE_OPSD_ENABLED=${OPD_MM_STATE_OPSD_ENABLED}"
+echo "OPD_MM_STATE_OPSD_REWARD_GATED=${OPD_MM_STATE_OPSD_REWARD_GATED}"
 echo "DISTILLATION_ENABLED=${DISTILLATION_ENABLED}"
+echo "USE_REFERENCE_KL=${use_reference_kl}"
+echo "REFERENCE_KL_COEF=${reference_kl_coef}"
+echo "OPD_MM_VECTOR_STORE_DIR=${OPD_MM_VECTOR_STORE_DIR}"
 echo "ACTOR_SP_SIZE=${actor_sp_size}"
 echo "PPO_MAX_TOKEN_LEN_PER_GPU=${ppo_max_token_len_per_gpu}"
 echo "DISTILL_CHUNK_SIZE=${distill_chunk_size}"
+echo "ACTOR_ADAMW_FOREACH=${actor_adamw_foreach}"
 echo "ROLLOUT_N=${rollout_n}"
+echo "VAL_BATCH_SIZE=${val_batch_size}"
+echo "TEST_FREQ=${test_freq}"
+echo "SAVE_FREQ=${save_freq}"
+echo "EVIDENCE_ANSWERABLE_WEIGHT=${EVIDENCE_ANSWERABLE_WEIGHT}"
+echo "EFFICIENCY_ACTION=${EFFICIENCY_ACTION_FREE}+${EFFICIENCY_ACTION_PENALTY}/action"
+echo "EFFICIENCY_EVIDENCE=${EFFICIENCY_EVIDENCE_FREE}+${EFFICIENCY_EVIDENCE_PENALTY}/evidence"
 echo "TRAIN_LOG_PATH=${TRAIN_LOG_PATH}"
 echo "OPD_MM_OUTCOME_REWARD_DUMP_DIR=${OPD_MM_OUTCOME_REWARD_DUMP_DIR}"
 echo "WANDB_MODE=${WANDB_MODE}"
@@ -253,12 +287,19 @@ DATA=(
     +algorithm.opd_mm_kl_credit.topk=${OPD_MM_KL_TOPK}
     +algorithm.opd_mm_kl_credit.grpo_action_selection=${OPD_MM_GRPO_ACTION_SELECTION}
     +algorithm.opd_mm_kl_credit.success_key=opd_mm/answer_correct
+    +algorithm.opd_mm_reward_gated_sft.enabled=${OPD_MM_REWARD_GATED_SFT_ENABLED}
+    +algorithm.opd_mm_state_opsd.enabled=${OPD_MM_STATE_OPSD_ENABLED}
+    +algorithm.opd_mm_state_opsd.reward_gated=${OPD_MM_STATE_OPSD_REWARD_GATED}
+    +algorithm.opd_mm_state_opsd.topk=${OPD_MM_KL_TOPK}
+    +algorithm.opd_mm_state_opsd.grpo_action_selection=${OPD_MM_GRPO_ACTION_SELECTION}
+    +algorithm.opd_mm_state_opsd.success_key=opd_mm/answer_correct
     algorithm.rollout_correction.bypass_mode=True
     algorithm.rollout_correction.loss_type=ppo_clip
     data.train_files="$OPD_MM_TRAIN_FILES"
     data.val_files="$OPD_MM_VAL_FILES"
     data.prompt_key=prompt
     data.train_batch_size=${train_batch_size}
+    data.val_batch_size=${val_batch_size}
     data.max_prompt_length=${max_prompt_length}
     data.max_response_length=${max_response_length}
     data.filter_overlong_prompts=True
@@ -274,19 +315,25 @@ MODEL=(
     actor_rollout_ref.model.path="$OPD_MODEL_PATH"
     actor_rollout_ref.model.use_remove_padding=True
     actor_rollout_ref.model.enable_gradient_checkpointing=True
+    actor_rollout_ref.model.enable_activation_offload=${actor_activation_offload}
 )
 
 ACTOR=(
     actor_rollout_ref.actor.use_torch_compile=${actor_use_torch_compile}
     actor_rollout_ref.actor.optim.lr=${actor_lr}
+    "actor_rollout_ref.actor.optim.override_optimizer_config={foreach:${actor_adamw_foreach}}"
     actor_rollout_ref.actor.ppo_mini_batch_size=${ppo_mini_batch_size}
     actor_rollout_ref.actor.use_dynamic_bsz=True
     actor_rollout_ref.actor.ppo_max_token_len_per_gpu=${ppo_max_token_len_per_gpu}
-    actor_rollout_ref.actor.use_kl_loss=False
+    actor_rollout_ref.actor.use_kl_loss=${use_reference_kl}
+    actor_rollout_ref.actor.kl_loss_coef=${reference_kl_coef}
+    actor_rollout_ref.actor.kl_loss_type=low_var_kl
     actor_rollout_ref.actor.entropy_coeff=${entropy_coeff}
     actor_rollout_ref.actor.fsdp_config.param_offload=True
     actor_rollout_ref.actor.fsdp_config.optimizer_offload=True
     actor_rollout_ref.actor.fsdp_config.ulysses_sequence_parallel_size=${actor_sp_size}
+    actor_rollout_ref.ref.fsdp_config.param_offload=True
+    actor_rollout_ref.ref.ulysses_sequence_parallel_size=${actor_sp_size}
 )
 
 ROLLOUT=(
@@ -296,12 +343,18 @@ ROLLOUT=(
     actor_rollout_ref.rollout.n=${rollout_n}
     actor_rollout_ref.rollout.temperature=${rollout_temperature}
     actor_rollout_ref.rollout.top_p=${rollout_top_p}
+    actor_rollout_ref.rollout.val_kwargs.do_sample=${val_do_sample}
+    actor_rollout_ref.rollout.val_kwargs.temperature=${val_temperature}
+    actor_rollout_ref.rollout.val_kwargs.top_p=${val_top_p}
+    actor_rollout_ref.rollout.val_kwargs.top_k=${val_top_k}
+    actor_rollout_ref.rollout.val_kwargs.n=${val_n}
     actor_rollout_ref.rollout.max_model_len=${max_num_tokens}
     actor_rollout_ref.rollout.log_prob_use_dynamic_bsz=True
     actor_rollout_ref.rollout.log_prob_max_token_len_per_gpu=${ppo_max_token_len_per_gpu}
     actor_rollout_ref.rollout.multi_turn.enable=True
     actor_rollout_ref.rollout.multi_turn.tool_config_path="$OPD_MM_TOOL_CONFIG"
     actor_rollout_ref.rollout.multi_turn.max_parallel_calls=1
+    actor_rollout_ref.rollout.multi_turn.max_assistant_turns=10
     actor_rollout_ref.rollout.multi_turn.format=qwen3_coder
     actor_rollout_ref.rollout.multi_turn.tokenization_sanity_check_mode=disable
     actor_rollout_ref.rollout.agent.default_agent_loop=tool_agent
@@ -323,6 +376,7 @@ TRAINER=(
     trainer.test_freq=${test_freq}
     trainer.total_epochs=${total_epochs}
     trainer.resume_mode=disable
+    trainer.validation_data_dir="$VALIDATION_DATA_DIR"
 )
 
 REWARD=(
@@ -334,6 +388,11 @@ REWARD=(
     +reward.custom_reward_function.reward_kwargs.error_penalty=${ERROR_PENALTY}
     +reward.custom_reward_function.reward_kwargs.non_stop_penalty=${NON_STOP_PENALTY}
     +reward.custom_reward_function.reward_kwargs.empty_evidence_penalty=${EMPTY_EVIDENCE_PENALTY}
+    +reward.custom_reward_function.reward_kwargs.evidence_answerable_weight=${EVIDENCE_ANSWERABLE_WEIGHT}
+    +reward.custom_reward_function.reward_kwargs.efficiency_action_free=${EFFICIENCY_ACTION_FREE}
+    +reward.custom_reward_function.reward_kwargs.efficiency_action_penalty=${EFFICIENCY_ACTION_PENALTY}
+    +reward.custom_reward_function.reward_kwargs.efficiency_evidence_free=${EFFICIENCY_EVIDENCE_FREE}
+    +reward.custom_reward_function.reward_kwargs.efficiency_evidence_penalty=${EFFICIENCY_EVIDENCE_PENALTY}
 )
 
 DISTILLATION=(

@@ -423,10 +423,14 @@ def _answer_prompt(row: dict[str, Any], max_evidence: int) -> list[dict[str, str
     evidence = row.get("evidence") or []
     evidence_text = json.dumps(evidence[: max(0, int(max_evidence))], ensure_ascii=False, indent=2)
     system = (
-        "You are the answer model for a memory QA benchmark. "
-        "Answer the user's question using only the retrieved evidence. "
-        "Do not mention tool calls. Do not use any gold answer. "
-        "If the evidence is insufficient, answer with the best supported response and briefly state uncertainty."
+        "You are the answer model for a memory QA benchmark. Use only retrieved evidence; do not use a gold answer or "
+        "outside knowledge. If evidence cannot support an answer, return exactly INSUFFICIENT_EVIDENCE. Never guess an "
+        "unstated exact name, value, date, cause, or capability from a related fact; a nearby action is not a cause "
+        "unless evidence explicitly links them. Not mentioned and No are distinct: No requires an explicit negative "
+        "statement, and missing information never supports No. When asked whether a person, conversation, dialogue, or "
+        "record mentioned, stated, or provided information, return exactly Not mentioned if it is absent. For other "
+        "unsupported yes/no questions, use INSUFFICIENT_EVIDENCE. Do not mention tool calls; ignore unrelated evidence "
+        "and return only the final answer."
     )
     user = f"""Question:
 {row.get('question')}
@@ -492,8 +496,11 @@ def _judge_prompt(row: dict[str, Any]) -> list[dict[str, str]]:
         "Judge answer correctness for a memory-QA benchmark. Use the gold answer as the sole correctness reference: "
         "the student answer is correct only if it directly answers the question and is semantically equivalent to "
         "the gold answer. Do not evaluate retrieval or evidence sufficiency. A refusal, unknown, or "
-        "INSUFFICIENT_EVIDENCE is incorrect when the gold answer provides a substantive answer; it is correct only "
-        "when the gold answer itself explicitly means unknown or not mentioned. "
+        "INSUFFICIENT_EVIDENCE is incorrect when the gold answer provides a substantive answer. When the gold means "
+        "unknown or not mentioned, a candidate that explicitly says the detail is unstated or cannot be determined "
+        "from the record is equivalent. A bare No is equivalent only when the question itself asks whether the "
+        "conversation or record mentioned, stated, or provided information; it is not equivalent when the question "
+        "asks whether an event occurred. "
         "Return only valid JSON with keys: correct (boolean), score (0 or 1), reason (short string)."
     )
     user = f"""Question:
@@ -520,7 +527,9 @@ def _evidence_answerable_prompt(row: dict[str, Any], max_evidence: int) -> list[
         "gold answer. Do not require exact wording. Penalize missing comparison sides, "
         "missing list entities, unsupported temporal claims, off-topic evidence, and "
         "missing visual details. Empty evidence is not sufficient, including for "
-        "not-mentioned or absence answers. Return only valid JSON."
+        "not-mentioned or absence answers. For such an answer, mark evidence sufficient only when it covers the "
+        "referenced person or event well enough to show that the requested detail is unstated; unrelated or merely "
+        "partial evidence is insufficient. Return only valid JSON."
     )
     user = f"""Question:
 {row.get('question')}

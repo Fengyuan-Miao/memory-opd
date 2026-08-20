@@ -229,6 +229,7 @@ def _samples_for_qas(
     data_source: str,
     agent_name: str,
 ) -> list[OPDSample]:
+    dataset_root = Path(dataset_root).resolve()
     records = load_mem_gallery_records(dataset_root)
     records_by_scenario: dict[str, list[Any]] = defaultdict(list)
     for record in records:
@@ -247,6 +248,10 @@ def _samples_for_qas(
             "qa_index": qa.get("qa_index"),
             "question_image": qa.get("question_image"),
             "question_image_relative": qa.get("question_image_relative"),
+            # Keep the index location sample-local so validation files from
+            # multiple corpora can be evaluated in one dataloader without a
+            # process-wide OPD_MM_VECTOR_STORE_DIR selecting the wrong index.
+            "vector_store_dir": str(dataset_root / "opd_mm_store"),
             "extra_info": {
                 "mem_gallery_sample_id": qa.get("sample_id"),
                 "scenario": scenario,

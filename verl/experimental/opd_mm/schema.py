@@ -34,11 +34,10 @@ ALLOWED_TOOLS = {
     "STOP",
 }
 DEFAULT_MAX_ACTIONS = 10
-FILTER_FIELDS = {"modality", "source_type", "timestamp", "status"}
+FILTER_FIELDS = {"modality", "timestamp", "status"}
 FILTER_OPS = {"eq", "neq", "before", "after", "contains"}
 FILTER_VALUE_ENUMS = {
     "modality": {"image", "text"},
-    "source_type": {"dialogue_image", "dialogue_turn"},
     "status": {"active"},
 }
 SORT_FIELDS = {"timestamp", "turn_id", "score"}
@@ -58,7 +57,7 @@ MEMORY_ID_PATTERN = re.compile(r"\b(?:m|memory|mau)[-_]?\d+\b", re.IGNORECASE)
 EVIDENCE_ID_PATTERN = re.compile(r"^E[1-9]\d*$")
 
 TOOL_SCHEMA_TEXT = """Allowed executable tools:
-FILTER(field=modality|source_type|timestamp|status,
+FILTER(field=modality|timestamp|status,
        op=eq|neq|before|after|contains, value=...)
 SORT(field=timestamp|turn_id|score, order=asc|desc)
 TOPK(k=positive integer)
@@ -76,8 +75,7 @@ candidate pool. For timestamp filters, date-only values
 such as YYYY-MM-DD match all memory timestamps from that date. Every FILTER
 searches the original hidden memory store and merges deduplicated matches into
 the current pool. Use DROP to remove evidence from the current pool.
-For Mem-Gallery, source_type values are dialogue_turn and dialogue_image;
-modality values are text and image; status value is active.
+For Mem-Gallery, modality values are text and image; status value is active.
 EXPAND_NEIGHBORS adds
 nearby turns around the current candidate pool; use it only after a retrieve or
 filter step has selected relevant candidates. DROP removes clearly irrelevant,

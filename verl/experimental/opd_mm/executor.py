@@ -226,21 +226,63 @@ class ToolExecutor:
         *,
         prioritize_incoming: bool = True,
     ) -> tuple[List[PoolItem], int]:
-        """Merge discovery results into the bounded working pool, prioritizing the latest result set."""
-        merged = self._merge_pools(existing, incoming) if has_existing_candidates else list(incoming)
+        """Fuse discovery rankings into the bounded working pool.
+
+        Scores from BM25, dense, vision, and metadata filtering are not
+        calibrated with one another. Fuse their within-call ranks instead of
+        letting the most recent call evict all earlier evidence. Items found by
+        both rankings receive two reciprocal-rank contributions and therefore
+        stay ahead of one-off results. ``prioritize_incoming`` only resolves
+        equal-rank ties, so a new query can still surface new evidence without
+        discarding the strongest existing candidates.
+        """
+        merged = (
+            self._merge_pools(existing, incoming)
+            if has_existing_candidates
+            else list(incoming)
+        )
         overflow = max(0, len(merged) - self.max_pool_size)
-        if not has_existing_candidates or not prioritize_incoming:
+        if not has_existing_candidates:
             return merged[: self.max_pool_size], overflow
 
         merged_by_id = {item.memory.memory_id: item for item in merged}
-        prioritized_ids = list(
-            dict.fromkeys(
-                [item.memory.memory_id for item in incoming]
-                + [item.memory.memory_id for item in existing]
+        existing_ranks = {
+            item.memory.memory_id: rank for rank, item in enumerate(existing, start=1)
+        }
+        incoming_ranks = {
+            item.memory.memory_id: rank for rank, item in enumerate(incoming, start=1)
+        }
+        stable_order = {
+            memory_id: index
+            for index, memory_id in enumerate(
+                dict.fromkeys(
+                    [item.memory.memory_id for item in existing]
+                    + [item.memory.memory_id for item in incoming]
+                )
             )
+        }
+        rrf_constant = 60.0
+
+        def fusion_key(memory_id: str) -> tuple[float, int, int, int]:
+            ranks = [
+                rank
+                for rank in (existing_ranks.get(memory_id), incoming_ranks.get(memory_id))
+                if rank is not None
+            ]
+            fused_score = sum(1.0 / (rrf_constant + rank) for rank in ranks)
+            preferred = incoming_ranks if prioritize_incoming else existing_ranks
+            return (
+                -fused_score,
+                0 if memory_id in preferred else 1,
+                min(ranks),
+                stable_order[memory_id],
+            )
+
+        fused_ids = sorted(merged_by_id, key=fusion_key)
+        return (
+            [merged_by_id[memory_id] for memory_id in fused_ids[: self.max_pool_size]],
+            overflow,
         )
-        prioritized = [merged_by_id[memory_id] for memory_id in prioritized_ids]
-        return prioritized[: self.max_pool_size], overflow
 
     @staticmethod
     def _ensure_public_evidence_ids(pool: List[PoolItem], evidence_ids_by_memory: dict[str, str]) -> None:

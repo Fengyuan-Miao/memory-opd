@@ -67,6 +67,80 @@ def _last_user_text(messages: list[dict[str, Any]]) -> str:
     return ""
 
 
+def _opd_mm_distillation_mask(token_count: int, xml_mask: list[int]) -> list[int]:
+    """Select only tokens inside a serialized OPD-MM tool call."""
+    if len(xml_mask) != token_count:
+        raise ValueError("OPD-MM XML mask must align with the sampled response")
+    return [int(bool(value)) for value in xml_mask]
+
+
+def _is_legal_opd_mm_action(
+    action: Optional[dict[str, Any]],
+    *,
+    allow_inspect_raw: bool,
+) -> bool:
+    """Return whether a parsed student call is valid under the OPD-MM schema."""
+    if not isinstance(action, dict):
+        return False
+    try:
+        from verl.experimental.opd_mm.models import ToolAction
+        from verl.experimental.opd_mm.schema import TrajectoryValidator
+
+        TrajectoryValidator(allow_inspect_raw=allow_inspect_raw)._validate_action(
+            ToolAction.from_dict(action),
+            0,
+        )
+    except Exception:
+        return False
+    return True
+
+
+def _parse_opd_mm_student_action(
+    tool_calls: list[FunctionCall],
+    active_tools: dict[str, Any],
+) -> tuple[Optional[dict[str, Any]], str]:
+    """Parse exactly one schema-valid, case-sensitive OPD-MM tool call."""
+    if not tool_calls:
+        return None, "missing_tool_call"
+    if len(tool_calls) != 1:
+        return None, "multiple_tool_calls"
+    tool_call = tool_calls[0]
+    tool_name = str(tool_call.name or "")
+    try:
+        arguments = json.loads(tool_call.arguments)
+    except (TypeError, json.JSONDecodeError):
+        return {"tool": tool_name.upper(), "raw_arguments": tool_call.arguments}, "invalid_json_arguments"
+    if not isinstance(arguments, dict):
+        return {"tool": tool_name.upper(), "raw_arguments": arguments}, "arguments_must_be_object"
+    action = {"tool": tool_name.upper(), **arguments}
+    if tool_name not in active_tools:
+        return action, f"unknown_or_mis_cased_tool:{tool_name}"
+    if not _is_legal_opd_mm_action(action, allow_inspect_raw="inspect_raw" in active_tools):
+        return action, "invalid_tool_arguments"
+    return action, ""
+
+
+def _mark_opd_mm_invalid_termination(agent_data: "AgentData", reason: str) -> None:
+    """Expose an invalid generation as a terminal trajectory error."""
+    runtime = (agent_data.tools_kwargs or {}).get("opd_mm") or {}
+    observation = agent_data.extra_fields.get("opd_mm")
+    if not isinstance(observation, dict):
+        observation = {
+            "query": str(runtime.get("query") or ""),
+            "pool_count": 0,
+            "evidence_count": 0,
+            "evidence": [],
+            "trace": [],
+            "raw_inspection_calls": 0,
+            "max_actions_reached": False,
+        }
+    else:
+        observation = dict(observation)
+    observation["stopped"] = False
+    observation["error"] = f"invalid_student_action:{reason}"
+    agent_data.extra_fields["opd_mm"] = observation
+
+
 def _dump_student_raw_output(
     *,
     agent_data: "AgentData",
@@ -456,7 +530,10 @@ class ToolAgentLoop(AgentLoopBase):
             if agent_data.full_prompt_ids:
                 agent_data.full_prompt_ids += agent_data.response_ids
             agent_data.response_mask += [1] * len(agent_data.response_ids)
-            current_distillation_mask = build_tool_call_xml_span_mask(self.tokenizer, agent_data.response_ids)
+            current_distillation_mask = _opd_mm_distillation_mask(
+                len(agent_data.response_ids),
+                build_tool_call_xml_span_mask(self.tokenizer, agent_data.response_ids),
+            )
             agent_data.distillation_mask += current_distillation_mask
             if output.log_probs:
                 agent_data.response_logprobs += output.log_probs
@@ -479,29 +556,31 @@ class ToolAgentLoop(AgentLoopBase):
             agent_data.response_ids, tools
         )
         agent_data.last_assistant_content = assistant_content or ""
-        student_next_action = None
-        if agent_data.tool_calls:
-            tool_call = agent_data.tool_calls[0]
-            try:
-                arguments = json.loads(tool_call.arguments)
-            except (TypeError, json.JSONDecodeError):
-                arguments = {"raw_arguments": tool_call.arguments}
-            if isinstance(arguments, dict):
-                student_next_action = {"tool": str(tool_call.name).upper(), **arguments}
+        opd_runtime = (agent_data.tools_kwargs or {}).get("opd_mm")
+        is_opd_mm = isinstance(opd_runtime, dict)
+        student_next_action, invalid_action_reason = _parse_opd_mm_student_action(
+            agent_data.tool_calls,
+            active_tools,
+        )
+        legal_student_action = not invalid_action_reason
+        tool_call_mask = build_tool_call_xml_span_mask(self.tokenizer, agent_data.response_ids)
+        if is_opd_mm and not legal_student_action:
+            _mark_opd_mm_invalid_termination(agent_data, invalid_action_reason)
         self._record_opd_mm_policy_state(
             agent_data=agent_data,
             state_prompt_ids=state_prompt_ids,
             response_ids=agent_data.response_ids,
             response_logprobs=output.log_probs,
-            tool_call_mask=build_tool_call_payload_mask(self.tokenizer, agent_data.response_ids),
+            tool_call_mask=tool_call_mask if legal_student_action or is_opd_mm else [0] * len(agent_data.response_ids),
             student_next_action=student_next_action,
         )
-        await self._collect_online_state_correction(
-            agent_data=agent_data,
-            state_prompt_ids=state_prompt_ids,
-            response_ids=agent_data.response_ids,
-            assistant_content=assistant_content,
-        )
+        if legal_student_action or is_opd_mm:
+            await self._collect_online_state_correction(
+                agent_data=agent_data,
+                state_prompt_ids=state_prompt_ids,
+                response_ids=agent_data.response_ids,
+                assistant_content=assistant_content,
+            )
         _dump_student_raw_output(
             agent_data=agent_data,
             tokenizer=self.tokenizer,
@@ -512,6 +591,8 @@ class ToolAgentLoop(AgentLoopBase):
         if self.enable_continuous_token:
             agent_data.messages.append(self._build_assistant_message(assistant_content, agent_data))
 
+        if is_opd_mm and not legal_student_action:
+            return AgentState.TERMINATED
         if terminate_after_generation:
             return AgentState.TERMINATED
         if agent_data.tool_calls:
@@ -586,7 +667,6 @@ class ToolAgentLoop(AgentLoopBase):
                 arguments = {"raw_arguments": tool_call.arguments}
             if isinstance(arguments, dict):
                 student_next_action = {"tool": str(tool_call.name).upper(), **arguments}
-
         multi_modal_data = {}
         if agent_data.image_data is not None:
             multi_modal_data["images"] = agent_data.image_data
@@ -610,7 +690,7 @@ class ToolAgentLoop(AgentLoopBase):
                     "student_tool_call_mask": (
                         list(latest_policy_state.get("tool_call_mask") or [])
                         if isinstance(latest_policy_state, dict)
-                        else build_tool_call_payload_mask(self.tokenizer, response_ids)
+                        else build_tool_call_xml_span_mask(self.tokenizer, response_ids)
                     ),
                     "student_next_action": student_next_action,
                     "history": observation.get("trace") or [],

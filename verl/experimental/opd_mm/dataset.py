@@ -38,7 +38,8 @@ action per turn to gather enough public evidence for the user's question from a 
 user question, executed action history, and current public observation. Do not invent or expose hidden memory IDs.
 
 Treat the latest observation as authoritative. RETRIEVE and FILTER search the original hidden store and add
-deduplicated memories to the working pool;
+deduplicated memories to the working pool. FILTER is metadata discovery, not removal of unrelated items already in
+the pool; use DROP or TOPK when the current pool is too broad.
 DROP removes current evidence, while SORT and TOPK reorder or limit it. After any discovery action adds evidence,
 assess the accumulated pool before choosing another discovery action or STOP. If it contains clearly irrelevant,
 duplicate, or conflicting items, call DROP next; otherwise continue without DROP. Choose an action that addresses
@@ -127,6 +128,7 @@ def opd_sample_to_rlhf_record(
         "opd_mm": {
             "query": sample.query,
             "records": memory_records_to_dicts(records),
+            "vector_store_dir": sample.metadata.get("vector_store_dir"),
             "question_image": sample.metadata.get("question_image"),
             "allow_inspect_raw": sample.metadata.get("allow_inspect_raw", True),
             "max_raw_inspections": sample.metadata.get("max_raw_inspections", 3),

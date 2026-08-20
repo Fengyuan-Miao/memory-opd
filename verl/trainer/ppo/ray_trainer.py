@@ -1290,33 +1290,136 @@ class RayPPOTrainer:
         return old_log_prob, old_log_prob_mfu
 
     def _update_actor(self, batch: DataProto) -> DataProto:
+        if self._opd_mm_reward_gated_opsd_enabled() and not getattr(
+            self, "_opd_mm_state_opsd_update_active", False
+        ):
+            if not is_distillation_enabled(self.config.get("distillation")):
+                raise RuntimeError("Reward-gated OPD-MM state OPSD requires distillation.enabled=True")
+            # Keep policy-gradient and privileged state distillation in
+            # separate actor updates. A mixed dense batch would allocate
+            # teacher top-k tensors for GRPO rows and make the two objectives
+            # share an accidental token/padding normalization.
+            grpo_batch = self._build_opd_mm_grpo_state_batch(batch, only_successful=True)
+            opsd_result = self._build_opd_mm_kl_credit_batch(
+                batch,
+                reward_gated_opsd=True,
+                only_mode="distill",
+            )
+            opsd_batch = opsd_result[0] if opsd_result is not None else None
+            if grpo_batch is None and opsd_batch is None:
+                return DataProto.from_single_dict(
+                    data={},
+                    meta_info={
+                        "metrics": {
+                            "actor/opd_mm_reward_gated_grpo_update": 0.0,
+                            "actor/opd_mm_reward_gated_opsd_update": 0.0,
+                        }
+                    },
+                )
+
+            outputs: list[tuple[str, DataProto]] = []
+            self._opd_mm_state_opsd_update_active = True
+            try:
+                if grpo_batch is not None:
+                    outputs.append(("grpo", self._update_actor(grpo_batch)))
+                if opsd_batch is not None:
+                    outputs.append(("opsd", self._update_actor(opsd_batch)))
+            finally:
+                self._opd_mm_state_opsd_update_active = False
+
+            merged_metrics: dict[str, Any] = {}
+            for phase, output in outputs:
+                for key, value in output.meta_info.get("metrics", {}).items():
+                    phase_key = key.replace("actor/", f"actor/{phase}/", 1)
+                    merged_metrics[phase_key] = value
+            merged_metrics["actor/opd_mm_reward_gated_grpo_update"] = float(grpo_batch is not None)
+            merged_metrics["actor/opd_mm_reward_gated_opsd_update"] = float(opsd_batch is not None)
+            return DataProto.from_single_dict(data={}, meta_info={"metrics": merged_metrics})
+
+        if self._opd_mm_reward_gated_sft_enabled() and not getattr(
+            self, "_opd_mm_reward_gated_update_active", False
+        ):
+            # Keep the two objectives in separate actor updates.  The generic
+            # distillation loss treats an OPD SFT batch as SFT-only, so putting
+            # GRPO and correction rows in one batch would silently discard the
+            # policy-gradient term for the GRPO rows.
+            grpo_batch = self._build_opd_mm_grpo_state_batch(batch, only_successful=True)
+            sft_batch = self._build_opd_mm_correction_sft_batch(batch, only_all_fail=True)
+            if grpo_batch is None and sft_batch is None:
+                self._opd_mm_reward_gated_update_active = True
+                try:
+                    return self._update_actor(batch)
+                finally:
+                    self._opd_mm_reward_gated_update_active = False
+
+            outputs: list[tuple[str, DataProto]] = []
+            self._opd_mm_reward_gated_update_active = True
+            try:
+                if grpo_batch is not None:
+                    outputs.append(("grpo", self._update_actor(grpo_batch)))
+                if sft_batch is not None:
+                    outputs.append(("opd", self._update_actor(sft_batch)))
+            finally:
+                self._opd_mm_reward_gated_update_active = False
+
+            merged_metrics: dict[str, Any] = {}
+            for phase, output in outputs:
+                for key, value in output.meta_info.get("metrics", {}).items():
+                    phase_key = key.replace("actor/", f"actor/{phase}/", 1)
+                    merged_metrics[phase_key] = value
+            merged_metrics["actor/opd_mm_reward_gated_grpo_update"] = float(grpo_batch is not None)
+            merged_metrics["actor/opd_mm_reward_gated_sft_update"] = float(sft_batch is not None)
+            return DataProto.from_single_dict(data={}, meta_info={"metrics": merged_metrics})
+
         opd_mm_sft_examples = 0
         opd_mm_grpo_states = 0
         opd_mm_distill_states = 0
         opd_mm_kl_credit_enabled = self._opd_mm_kl_credit_enabled()
+        opd_mm_state_opsd_enabled = self._opd_mm_state_opsd_enabled()
+        rebuilt_opd_mm_state_batch = False
+        if opd_mm_kl_credit_enabled and opd_mm_state_opsd_enabled:
+            raise RuntimeError("OPD-MM KL credit assignment and pure state OPSD are mutually exclusive")
         opd_mm_credit_metrics: dict[str, float] = {}
-        if opd_mm_kl_credit_enabled:
+        prebuilt_state_batch = (
+            "opd_mm_kl_credit_batch" in batch.non_tensor_batch
+            or "opd_mm_grpo_state_batch" in batch.non_tensor_batch
+        )
+        if (opd_mm_kl_credit_enabled or opd_mm_state_opsd_enabled) and not prebuilt_state_batch:
             if not is_distillation_enabled(self.config.get("distillation")):
-                raise RuntimeError("OPD-MM KL credit assignment requires distillation.enabled=True")
-            credit_result = self._build_opd_mm_kl_credit_batch(batch)
+                raise RuntimeError("OPD-MM state-level KL supervision requires distillation.enabled=True")
+            credit_result = self._build_opd_mm_kl_credit_batch(
+                batch,
+                pure_state_opsd=opd_mm_state_opsd_enabled
+                and not self._opd_mm_state_opsd_reward_gated_enabled(),
+                reward_gated_opsd=self._opd_mm_state_opsd_reward_gated_enabled(),
+            )
             if credit_result is None:
                 actor_output = {
                     "actor/opd_mm_kl_selected_actions": 0.0,
                     "actor/opd_mm_grpo_states": 0.0,
                     "actor/opd_mm_distill_states": 0.0,
+                    "actor/opd_mm_invalid_or_missing_states": float(len(batch)),
                     "perf/mfu/actor": 0.0,
                 }
                 return DataProto.from_single_dict(data={}, meta_info={"metrics": actor_output})
             batch, opd_mm_credit_metrics = credit_result
+            rebuilt_opd_mm_state_batch = True
             opd_mm_grpo_states = int(opd_mm_credit_metrics.get("opd_mm_grpo_states", 0.0))
             opd_mm_distill_states = int(opd_mm_credit_metrics.get("opd_mm_distill_states", 0.0))
+        elif prebuilt_state_batch:
+            rebuilt_opd_mm_state_batch = True
+            opd_mm_credit_metrics = dict(batch.meta_info.get("opd_mm_credit_metrics") or {})
+            if "opd_mm_grpo_state_batch" in batch.non_tensor_batch:
+                opd_mm_grpo_states = len(batch)
+            if "opd_mm_kl_credit_batch" in batch.non_tensor_batch:
+                opd_mm_distill_states = len(batch)
         else:
             opd_mm_sft_batch = self._build_opd_mm_correction_sft_batch(batch)
             if opd_mm_sft_batch is not None:
                 batch = opd_mm_sft_batch
                 opd_mm_sft_examples = len(batch)
         if (
-            not opd_mm_kl_credit_enabled
+            not (opd_mm_kl_credit_enabled or opd_mm_state_opsd_enabled)
             and not opd_mm_sft_examples
             and not is_distillation_enabled(self.config.get("distillation"))
         ):
@@ -1338,6 +1441,12 @@ class RayPPOTrainer:
                     raise RuntimeError(
                         "OPD-MM GRPO rollout states were present but none had aligned rollout log-probabilities"
                     )
+        if rebuilt_opd_mm_state_batch and self.use_reference_policy:
+            # The KL-credit batch contains independently refreshed state/action
+            # prompts rather than the original concatenated rollout. Score the
+            # frozen reference on those exact states so reference KL remains
+            # token-aligned with the selected top-KL actions.
+            batch = batch.union(self._compute_ref_log_prob(batch))
         rollout_config = self.config.actor_rollout_ref.rollout
         batch.meta_info["multi_turn"] = rollout_config.multi_turn.enable
         # TODO: Make "temperature" single source of truth from generation.
@@ -1346,7 +1455,7 @@ class RayPPOTrainer:
         batch_td = batch.to_tensordict()
         # step 2: convert from padding to no-padding
         batch_td = left_right_2_no_padding(batch_td)
-        if opd_mm_kl_credit_enabled:
+        if opd_mm_kl_credit_enabled or opd_mm_state_opsd_enabled:
             # Engine-level token accounting must include both mutually
             # exclusive objectives. PPO still reads response_mask while the
             # KL loss reads distillation_mask.
@@ -1364,6 +1473,11 @@ class RayPPOTrainer:
             if is_distillation_enabled(self.config.get("distillation"))
             else False
         )
+        # A successful-group GRPO state batch has no teacher distribution. Do
+        # not invoke the top-k logits processor for it; the final loss path
+        # already returns a zero distillation term for this batch.
+        if opd_mm_grpo_states and not opd_mm_distill_states:
+            distillation_use_topk = False
         if opd_mm_sft_examples:
             distillation_use_topk = False
         distillation_only = False  # distillation_only flag means we can skip policy loss and reduce mem footprint
@@ -1376,6 +1490,14 @@ class RayPPOTrainer:
             )
         ppo_mini_batch_size = self.config.actor_rollout_ref.actor.ppo_mini_batch_size
         ppo_mini_batch_size = ppo_mini_batch_size * self.config.actor_rollout_ref.rollout.n
+        if prebuilt_state_batch:
+            # State batches are already expanded and minimally padded by their
+            # builder. Do not reuse the original rollout*n minimum for a small
+            # phase, otherwise two useful states become a 48-row duplicate
+            # batch and receive a distorted loss normalization.
+            dp_size = self._get_dp_size(self.actor_rollout_wg, "actor")
+            if len(batch) < ppo_mini_batch_size:
+                ppo_mini_batch_size = max(dp_size, len(batch))
         if opd_mm_sft_examples:
             ppo_mini_batch_size = self._opd_mm_sft_mini_batch_size(
                 batch_size=opd_mm_sft_examples,
@@ -1406,7 +1528,7 @@ class RayPPOTrainer:
             actor_output["actor/opd_mm_grpo_states"] = opd_mm_grpo_states
         if opd_mm_distill_states:
             actor_output["actor/opd_mm_distill_states"] = opd_mm_distill_states
-        if opd_mm_kl_credit_enabled:
+        if opd_mm_kl_credit_enabled or opd_mm_state_opsd_enabled:
             for key, value in opd_mm_credit_metrics.items():
                 actor_output[f"actor/{key}"] = value
         # modify key name
@@ -1419,40 +1541,49 @@ class RayPPOTrainer:
         config = self.config.algorithm.get("opd_mm_kl_credit", None)
         return bool(config and config.get("enabled", False))
 
-    def _build_opd_mm_kl_credit_batch(
-        self, batch: DataProto
-    ) -> Optional[tuple[DataProto, dict[str, float]]]:
-        """Build a reward-gated GRPO/KL-distillation batch.
+    def _opd_mm_reward_gated_sft_enabled(self) -> bool:
+        config = self.config.algorithm.get("opd_mm_reward_gated_sft", None)
+        return bool(config and config.get("enabled", False))
 
-        A uid group with at least one answer-correct rollout contributes only
-        GRPO loss. A group with no answer-correct rollout contributes only
-        forward-KL distillation. ``grpo_action_selection=top_kl`` restricts
-        both objectives to the highest-KL structured-disagreement actions;
-        ``all_states`` makes successful groups use ordinary GRPO on every
-        visited student state while retaining privileged distillation only for
-        all-fail groups.
+    def _opd_mm_reward_gated_opsd_enabled(self) -> bool:
+        config = self.config.algorithm.get("opd_mm_state_opsd", None)
+        return bool(config and config.get("enabled", False) and config.get("reward_gated", False))
+
+    def _opd_mm_state_opsd_reward_gated_enabled(self) -> bool:
+        return self._opd_mm_reward_gated_opsd_enabled()
+
+    def _opd_mm_group_success(self, batch: DataProto) -> dict[str, bool]:
+        """Return answer-correct status for valid rollout uid groups only.
+
+        Infrastructure failures are deliberately absent from this map so they
+        cannot enter either the GRPO or all-fail OPSD branch.
         """
-        states_column = batch.non_tensor_batch.get("opd_mm_policy_states")
-        corrections_column = batch.non_tensor_batch.get("opd_mm_step_corrections")
-        original_uids = batch.non_tensor_batch.get("uid")
-        if states_column is None or corrections_column is None or original_uids is None:
-            return None
+        route_fn = getattr(self, "_opd_mm_group_routes", None)
+        routes = route_fn(batch) if route_fn is not None else RayPPOTrainer._opd_mm_group_routes(self, batch)
+        return {
+            uid: route == "success"
+            for uid, route in routes.items()
+            if route != "invalid"
+        }
 
-        credit_config = self.config.algorithm.opd_mm_kl_credit
-        top_actions = max(1, int(credit_config.get("top_actions", 2)))
-        grpo_action_selection = str(credit_config.get("grpo_action_selection", "top_kl")).strip().lower()
-        if grpo_action_selection not in {"top_kl", "all_states"}:
-            raise ValueError(
-                "algorithm.opd_mm_kl_credit.grpo_action_selection must be "
-                f"'top_kl' or 'all_states', got {grpo_action_selection!r}"
-            )
-        success_key = str(credit_config.get("success_key", "opd_mm/answer_correct"))
-        success_values = batch.non_tensor_batch.get(success_key)
+    def _opd_mm_group_routes(self, batch: DataProto) -> dict[str, str]:
+        """Classify each uid as ``success``, ``all_fail``, or ``invalid``.
+
+        Only answer/judge infrastructure failures make a group invalid. A
+        rollout that never reached a judge because it failed to STOP, produced
+        an invalid action, or stopped with empty evidence is a genuine policy
+        failure and belongs in an all-fail group.
+        """
+        original_uids = batch.non_tensor_batch.get("uid")
+        if original_uids is None:
+            return {}
+        success_values = batch.non_tensor_batch.get("opd_mm/answer_correct")
         if success_values is None:
             token_scores = batch.batch.get("token_level_scores")
             if token_scores is None:
-                raise RuntimeError(f"OPD-MM KL credit batch is missing {success_key!r} and token-level scores")
+                return {}
             success_values = (token_scores.sum(dim=-1) > 0.5).cpu().numpy()
+        infrastructure_values = batch.non_tensor_batch.get("opd_mm/outcome_infrastructure_failure")
 
         def plain(value: Any) -> Any:
             if isinstance(value, np.ndarray):
@@ -1464,9 +1595,90 @@ class RayPPOTrainer:
                     pass
             return value
 
-        uid_success: dict[str, bool] = defaultdict(bool)
-        for uid, success in zip(original_uids, success_values, strict=True):
-            uid_success[str(plain(uid))] = uid_success[str(plain(uid))] or bool(float(plain(success)))
+        grouped: dict[str, dict[str, bool]] = {}
+        for index, (uid, success) in enumerate(zip(original_uids, success_values, strict=True)):
+            key = str(plain(uid))
+            group = grouped.setdefault(key, {"success": False, "valid": True})
+            if infrastructure_values is not None:
+                try:
+                    if bool(float(plain(infrastructure_values[index]))):
+                        group["valid"] = False
+                except (TypeError, ValueError):
+                    group["valid"] = False
+            try:
+                is_success = bool(float(plain(success)))
+            except (TypeError, ValueError):
+                is_success = False
+            group["success"] = group["success"] or is_success
+        return {
+            uid: "invalid" if not state["valid"] else ("success" if state["success"] else "all_fail")
+            for uid, state in grouped.items()
+        }
+
+    def _opd_mm_state_opsd_enabled(self) -> bool:
+        config = self.config.algorithm.get("opd_mm_state_opsd", None)
+        return bool(config and config.get("enabled", False))
+
+    def _build_opd_mm_kl_credit_batch(
+        self,
+        batch: DataProto,
+        *,
+        pure_state_opsd: bool = False,
+        reward_gated_opsd: bool = False,
+        only_mode: Optional[str] = None,
+    ) -> Optional[tuple[DataProto, dict[str, float]]]:
+        """Build a state-aligned GRPO/KL-distillation batch.
+
+        A uid group with at least one answer-correct rollout contributes only
+        GRPO loss. A group with no answer-correct rollout contributes only
+        forward-KL distillation. ``grpo_action_selection=top_kl`` restricts
+        both objectives to the highest-KL structured-disagreement actions;
+        ``all_states`` makes successful groups use ordinary GRPO on every
+        visited student state while retaining privileged distillation only for
+        all-fail groups. With ``pure_state_opsd=True``, every valid student
+        tool-call state contributes KL distillation regardless of reward or
+        structured disagreement.
+        """
+        states_column = batch.non_tensor_batch.get("opd_mm_policy_states")
+        corrections_column = batch.non_tensor_batch.get("opd_mm_step_corrections")
+        original_uids = batch.non_tensor_batch.get("uid")
+        if states_column is None or corrections_column is None or original_uids is None:
+            return None
+
+        credit_config = (
+            self.config.algorithm.opd_mm_state_opsd
+            if pure_state_opsd or reward_gated_opsd
+            else self.config.algorithm.opd_mm_kl_credit
+        )
+        top_actions = max(1, int(credit_config.get("top_actions", 2)))
+        grpo_action_selection = str(credit_config.get("grpo_action_selection", "top_kl")).strip().lower()
+        if grpo_action_selection not in {"top_kl", "all_states"}:
+            raise ValueError(
+                "algorithm.opd_mm_kl_credit.grpo_action_selection must be "
+                f"'top_kl' or 'all_states', got {grpo_action_selection!r}"
+            )
+        success_values = None
+        group_routes: dict[str, str] = {}
+        if not pure_state_opsd:
+            success_key = str(credit_config.get("success_key", "opd_mm/answer_correct"))
+            success_values = batch.non_tensor_batch.get(success_key)
+            if success_values is None:
+                token_scores = batch.batch.get("token_level_scores")
+                if token_scores is None:
+                    raise RuntimeError(f"OPD-MM KL credit batch is missing {success_key!r} and token-level scores")
+                success_values = (token_scores.sum(dim=-1) > 0.5).cpu().numpy()
+            route_fn = getattr(self, "_opd_mm_group_routes", None)
+            group_routes = route_fn(batch) if route_fn is not None else RayPPOTrainer._opd_mm_group_routes(self, batch)
+
+        def plain(value: Any) -> Any:
+            if isinstance(value, np.ndarray):
+                return value.item() if value.ndim == 0 else value.tolist()
+            if hasattr(value, "item"):
+                try:
+                    return value.item()
+                except Exception:
+                    pass
+            return value
 
         prompt_width = int(self.config.actor_rollout_ref.rollout.prompt_length)
         response_width = int(self.config.actor_rollout_ref.rollout.response_length)
@@ -1478,6 +1690,7 @@ class RayPPOTrainer:
         distill_groups: set[str] = set()
         trajectories_with_candidates = 0
         grpo_full_state_count = 0
+        invalid_groups: set[str] = set()
 
         for sample_index, (raw_states, raw_corrections) in enumerate(
             zip(states_column, corrections_column, strict=True)
@@ -1495,7 +1708,13 @@ class RayPPOTrainer:
                 if isinstance(state, dict)
             }
             uid = str(plain(original_uids[sample_index]))
-            mode = "grpo" if uid_success[uid] else "distill"
+            route = "distill" if pure_state_opsd else group_routes.get(uid, "invalid")
+            if route == "invalid":
+                invalid_groups.add(uid)
+                continue
+            mode = "distill" if pure_state_opsd or route == "all_fail" else "grpo"
+            if only_mode is not None and mode != only_mode:
+                continue
             if mode == "grpo":
                 grpo_groups.add(uid)
             else:
@@ -1524,6 +1743,18 @@ class RayPPOTrainer:
                         raise RuntimeError(
                             "OPD-MM GRPO state response tokens and rollout log-probabilities are not aligned"
                         )
+                    raw_tool_call_mask = state.get("tool_call_mask")
+                    tool_call_mask = plain(raw_tool_call_mask)
+                    if raw_tool_call_mask is None:
+                        # Preserve compatibility with legacy captured states;
+                        # current ToolAgentLoop always records the real mask.
+                        tool_call_mask = [1] * len(sampled_ids)
+                    if (
+                        not isinstance(tool_call_mask, list)
+                        or len(tool_call_mask) != len(sampled_ids)
+                        or not any(tool_call_mask)
+                    ):
+                        continue
                     if not prompt_ids or not sampled_ids or len(sampled_ids) > response_width:
                         raise RuntimeError("OPD-MM GRPO state has an empty or overlong prompt/response")
                     rows.append(
@@ -1531,7 +1762,7 @@ class RayPPOTrainer:
                             "prompt_ids": [int(token) for token in prompt_ids],
                             "sampled_ids": [int(token) for token in sampled_ids],
                             "rollout_logprobs": [float(value) for value in rollout_logprobs],
-                            "tool_call_mask": [1] * len(sampled_ids),
+                            "tool_call_mask": [int(bool(value)) for value in tool_call_mask],
                             "teacher_ids": [],
                             "teacher_logprobs": [],
                             "advantage": trajectory_advantage,
@@ -1555,7 +1786,9 @@ class RayPPOTrainer:
                 if not isinstance(correction, dict):
                     continue
                 credit = correction.get("kl_credit")
-                if not isinstance(credit, dict) or not bool(credit.get("structured_disagreement")):
+                if not isinstance(credit, dict) or credit.get("failure_reason"):
+                    continue
+                if not pure_state_opsd and not reward_gated_opsd and not bool(credit.get("structured_disagreement")):
                     continue
                 try:
                     score = float(credit.get("action_kl"))
@@ -1590,9 +1823,11 @@ class RayPPOTrainer:
             if not candidates:
                 continue
             trajectories_with_candidates += 1
-            candidates.sort(key=lambda item: item[0], reverse=True)
+            if not pure_state_opsd:
+                candidates.sort(key=lambda item: item[0], reverse=True)
 
-            for score, state, correction, credit in candidates[:top_actions]:
+            selected_candidates = candidates if pure_state_opsd or reward_gated_opsd else candidates[:top_actions]
+            for score, state, correction, credit in selected_candidates:
                 prompt_ids = plain(state.get("prompt_ids") or [])
                 sampled_ids = plain(state.get("response_ids") or [])
                 rollout_logprobs = plain(state.get("response_logprobs") or [])
@@ -1602,7 +1837,10 @@ class RayPPOTrainer:
                 if not isinstance(prompt_ids, list) or not prompt_ids or len(sampled_ids) > response_width:
                     raise RuntimeError("OPD-MM KL credit state has an empty or overlong prompt/response")
                 if not isinstance(rollout_logprobs, list) or len(rollout_logprobs) != len(sampled_ids):
-                    raise RuntimeError("OPD-MM KL credit state has unaligned rollout log-probabilities")
+                    if pure_state_opsd:
+                        rollout_logprobs = [0.0] * len(sampled_ids)
+                    else:
+                        raise RuntimeError("OPD-MM KL credit state has unaligned rollout log-probabilities")
                 if not all(isinstance(row, list) for row in teacher_ids + teacher_logprobs):
                     raise RuntimeError("OPD-MM KL credit state has non-list teacher top-k rows")
                 topk_widths = {len(row) for row in teacher_ids + teacher_logprobs}
@@ -1641,7 +1879,10 @@ class RayPPOTrainer:
             * int(self.config.actor_rollout_ref.rollout.n)
         )
         dp_size = self._get_dp_size(self.actor_rollout_wg, "actor")
-        multiple = max(dp_size, default_mini_batch_size)
+        # Do not inflate a tiny state batch to the full rollout mini-batch.
+        # For larger batches retain the configured mini-batch multiple so the
+        # engine can still shard them evenly.
+        multiple = dp_size if len(rows) < default_mini_batch_size else max(dp_size, default_mini_batch_size)
         if multiple % dp_size != 0:
             multiple = max(dp_size, (multiple // dp_size) * dp_size)
         target_size = max(multiple, math.ceil(len(rows) / multiple) * multiple)
@@ -1738,19 +1979,30 @@ class RayPPOTrainer:
             "opd_mm_distill_states": float(distill_state_count),
             "opd_mm_grpo_groups": float(len(grpo_groups)),
             "opd_mm_all_fail_groups": float(len(distill_groups)),
+            "opd_mm_invalid_groups": float(len(invalid_groups)),
             "opd_mm_trajectories_with_candidates": float(trajectories_with_candidates),
             "opd_mm_selected_action_kl": float(sum(scores) / len(scores)) if scores else 0.0,
             "opd_mm_selected_token_fraction": float(
                 sum(sum(row["tool_call_mask"]) for row in selected_rows)
                 / max(1, sum(len(row["sampled_ids"]) for row in selected_rows))
             ),
+            "opd_mm_state_opsd": float(pure_state_opsd),
         }
         return (
-            DataProto(batch=tensor_batch, non_tensor_batch=non_tensor_batch, meta_info=dict(batch.meta_info)),
+            DataProto(
+                batch=tensor_batch,
+                non_tensor_batch=non_tensor_batch,
+                meta_info={**dict(batch.meta_info), "opd_mm_credit_metrics": metrics},
+            ),
             metrics,
         )
 
-    def _build_opd_mm_grpo_state_batch(self, batch: DataProto) -> Optional[DataProto]:
+    def _build_opd_mm_grpo_state_batch(
+        self,
+        batch: DataProto,
+        *,
+        only_successful: bool = False,
+    ) -> Optional[DataProto]:
         """Expand refreshed OPD-MM state/action pairs with their trajectory advantage.
 
         OPD-MM replaces the observation prompt after every tool action to keep the
@@ -1768,13 +2020,18 @@ class RayPPOTrainer:
         pad_id = self.tokenizer.pad_token_id if self.tokenizer.pad_token_id is not None else 0
         response_mask = batch.batch.get("response_mask")
         original_uids = batch.non_tensor_batch.get("uid")
+        group_success = self._opd_mm_group_success(batch) if only_successful else {}
 
-        rows: list[tuple[list[int], list[int], list[float], float, str, dict[str, Any]]] = []
+        rows: list[tuple[list[int], list[int], list[float], list[int], float, str, dict[str, Any]]] = []
         for sample_index, sample_states in enumerate(states_column):
             sample_states = sample_states.item() if hasattr(sample_states, "item") else sample_states
             if isinstance(sample_states, np.ndarray):
                 sample_states = sample_states.tolist()
             if not isinstance(sample_states, list) or not sample_states:
+                continue
+
+            uid = str(original_uids[sample_index]) if original_uids is not None else str(uuid.uuid4())
+            if only_successful and not group_success.get(uid, False):
                 continue
 
             valid_advantages = batch.batch["advantages"][sample_index]
@@ -1783,8 +2040,6 @@ class RayPPOTrainer:
             if valid_advantages.numel() == 0:
                 continue
             trajectory_advantage = float(valid_advantages.float().mean().item())
-            uid = str(original_uids[sample_index]) if original_uids is not None else str(uuid.uuid4())
-
             for state in sample_states:
                 if not isinstance(state, dict):
                     continue
@@ -1803,6 +2058,18 @@ class RayPPOTrainer:
                     raise RuntimeError(
                         "OPD-MM GRPO state response tokens and rollout log-probabilities are not aligned"
                     )
+                raw_tool_call_mask = state.get("tool_call_mask")
+                tool_call_mask = raw_tool_call_mask
+                if raw_tool_call_mask is None:
+                    # Preserve compatibility with legacy captured states;
+                    # current ToolAgentLoop always records the real mask.
+                    tool_call_mask = [1] * len(sampled_ids)
+                if hasattr(tool_call_mask, "tolist"):
+                    tool_call_mask = tool_call_mask.tolist()
+                if not isinstance(tool_call_mask, list) or len(tool_call_mask) != len(sampled_ids):
+                    raise RuntimeError("OPD-MM GRPO state tool-call mask is not aligned with the sampled action")
+                if not any(tool_call_mask):
+                    continue
                 if not prompt_ids or not sampled_ids or len(sampled_ids) > response_width:
                     raise RuntimeError("OPD-MM GRPO state has an empty or overlong prompt/response")
                 rows.append(
@@ -1810,6 +2077,7 @@ class RayPPOTrainer:
                         [int(token) for token in prompt_ids],
                         [int(token) for token in sampled_ids],
                         [float(value) for value in rollout_logprobs],
+                        [int(bool(value)) for value in tool_call_mask],
                         trajectory_advantage,
                         uid,
                         state,
@@ -1824,7 +2092,7 @@ class RayPPOTrainer:
             * int(self.config.actor_rollout_ref.rollout.n)
         )
         dp_size = self._get_dp_size(self.actor_rollout_wg, "actor")
-        multiple = max(dp_size, default_mini_batch_size)
+        multiple = dp_size if len(rows) < default_mini_batch_size else max(dp_size, default_mini_batch_size)
         if multiple % dp_size != 0:
             multiple = max(dp_size, (multiple // dp_size) * dp_size)
         target_size = max(multiple, math.ceil(len(rows) / multiple) * multiple)
@@ -1839,7 +2107,7 @@ class RayPPOTrainer:
         position_ids = []
         old_log_probs = []
         advantages = []
-        for prompt_ids, sampled_ids, rollout_logprobs, advantage, _, _ in rows:
+        for prompt_ids, sampled_ids, rollout_logprobs, tool_call_mask, advantage, _, _ in rows:
             prompt_ids = prompt_ids[-prompt_width:]
             left_pad = prompt_width - len(prompt_ids)
             padded_prompt = [pad_id] * left_pad + prompt_ids
@@ -1858,7 +2126,9 @@ class RayPPOTrainer:
 
             prompts.append(padded_prompt)
             responses.append(padded_response)
-            response_masks.append(sampled_mask)
+            response_masks.append(
+                [mask * sampled for mask, sampled in zip(tool_call_mask + [0] * right_pad, sampled_mask, strict=True)]
+            )
             input_ids.append(padded_prompt + padded_response)
             attention_masks.append(sample_attention)
             position_ids.append(sample_position_ids)
@@ -1870,6 +2140,7 @@ class RayPPOTrainer:
                 "prompts": torch.tensor(prompts, dtype=torch.long),
                 "responses": torch.tensor(responses, dtype=torch.long),
                 "response_mask": torch.tensor(response_masks, dtype=torch.long),
+                "distillation_mask": torch.zeros_like(torch.tensor(response_masks, dtype=torch.long)),
                 "input_ids": torch.tensor(input_ids, dtype=torch.long),
                 "attention_mask": torch.tensor(attention_masks, dtype=torch.long),
                 "position_ids": torch.tensor(position_ids, dtype=torch.long),
@@ -1880,11 +2151,11 @@ class RayPPOTrainer:
             batch_size=len(rows),
         )
         non_tensor_batch = {
-            "uid": np.array([row[4] for row in rows], dtype=object),
+            "uid": np.array([row[5] for row in rows], dtype=object),
             "data_source": np.array(["opd_mm"] * len(rows), dtype=object),
             "multi_modal_inputs": np.array([{} for _ in rows], dtype=object),
             "opd_mm_grpo_state_batch": np.array([True for _ in rows], dtype=object),
-            "opd_mm_policy_state": np.array([row[5] for row in rows], dtype=object),
+            "opd_mm_policy_state": np.array([row[6] for row in rows], dtype=object),
         }
         return DataProto(
             batch=tensor_batch,
@@ -1903,17 +2174,35 @@ class RayPPOTrainer:
             return mini_batch_size
         return batch_size
 
-    def _build_opd_mm_correction_sft_batch(self, batch: DataProto) -> Optional[DataProto]:
+    def _build_opd_mm_correction_sft_batch(
+        self,
+        batch: DataProto,
+        *,
+        only_all_fail: bool = False,
+    ) -> Optional[DataProto]:
         corrections_column = batch.non_tensor_batch.get("opd_mm_step_corrections")
         if corrections_column is None:
             return None
+        original_uids = batch.non_tensor_batch.get("uid")
+        route_fn = getattr(self, "_opd_mm_group_routes", None)
+        group_routes = (
+            route_fn(batch)
+            if only_all_fail and route_fn is not None
+            else RayPPOTrainer._opd_mm_group_routes(self, batch)
+            if only_all_fail
+            else {}
+        )
 
         prompt_width = int(self.config.actor_rollout_ref.rollout.prompt_length)
         response_width = int(self.config.actor_rollout_ref.rollout.response_length)
         pad_id = self.tokenizer.pad_token_id if self.tokenizer.pad_token_id is not None else 0
 
         rows: list[tuple[list[int], list[int], dict[str, Any]]] = []
-        for sample_corrections in corrections_column:
+        for sample_index, sample_corrections in enumerate(corrections_column):
+            if only_all_fail and original_uids is not None:
+                uid = str(original_uids[sample_index])
+                if group_routes.get(uid) != "all_fail":
+                    continue
             sample_corrections = sample_corrections.item() if hasattr(sample_corrections, "item") else sample_corrections
             if isinstance(sample_corrections, np.ndarray):
                 sample_corrections = sample_corrections.tolist()
@@ -2258,7 +2547,9 @@ class RayPPOTrainer:
                                 metrics.update(calculate_debug_metrics(batch))
 
                     assert "old_log_probs" in batch.batch, f'"old_log_prob" not in {batch.batch.keys()=}'
-                    if self.use_reference_policy:
+                    if self.use_reference_policy and not (
+                        self._opd_mm_kl_credit_enabled() or self._opd_mm_state_opsd_enabled()
+                    ):
                         # compute reference log_prob
                         with marked_timer(str(Role.RefPolicy), timing_raw, color="olive"):
                             ref_log_prob = self._compute_ref_log_prob(batch)

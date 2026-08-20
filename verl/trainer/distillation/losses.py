@@ -277,8 +277,26 @@ def distillation_ppo_loss(
         sft_metrics["distillation/loss"] = Metric(value=sft_loss, aggregation=AggregationType.SUM)
         return sft_loss, sft_metrics
 
-    if data is not None and _is_opd_mm_batch(data) and "teacher_logprobs" not in data.keys():
-        return _zero_opd_mm_distillation_loss(model_output=model_output, data=data)
+    if data is not None and _is_opd_mm_batch(data):
+        # State-level OPD batches can contain only successful GRPO states. In
+        # that case the distillation mask is empty and no teacher logits are
+        # needed. Preserve the policy-gradient objective instead of treating
+        # the whole actor update as an unsupervised distillation batch.
+        distillation_mask = data.get("distillation_mask")
+        if "teacher_logprobs" not in data.keys() or (
+            distillation_mask is not None and _mask_token_count(distillation_mask).item() == 0
+        ):
+            zero_loss, zero_metrics = _zero_opd_mm_distillation_loss(model_output=model_output, data=data)
+            is_grpo_state_batch = _truthy_value(data.get("opd_mm_grpo_state_batch", False))
+            if (
+                is_grpo_state_batch
+                and distillation_config is not None
+                and distillation_config.distillation_loss.use_task_rewards
+            ):
+                policy_loss, policy_metrics = ppo_loss(config, model_output, data, dp_group)
+                policy_metrics.update(zero_metrics)
+                return policy_loss, policy_metrics
+            return zero_loss, zero_metrics
 
     # Called as final policy loss
     distillation_loss_config = distillation_config.distillation_loss

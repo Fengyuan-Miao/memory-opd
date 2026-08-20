@@ -14,6 +14,7 @@
 
 from __future__ import annotations
 
+import base64
 import json
 from dataclasses import dataclass, field
 from types import SimpleNamespace
@@ -24,11 +25,20 @@ import pytest
 import torch
 from tensordict import TensorDict
 
+import verl.trainer.distillation.losses as distillation_losses
 from verl import DataProto
 from verl.experimental.agent_loop.agent_loop import AgentLoopWorker
-from verl.experimental.agent_loop.tool_agent_loop import AgentState, ToolAgentLoop
+from verl.experimental.agent_loop.tool_agent_loop import AgentState, ToolAgentLoop, _parse_opd_mm_student_action
 from verl.experimental.agent_loop.tool_parser import FunctionCall
-from verl.experimental.opd_mm import MemoryRecord, OPDSample, OnPolicyDistiller, PolicyOutput, ToolAction, ToolExecutor
+from verl.experimental.opd_mm import (
+    MemoryRecord,
+    OPDSample,
+    OnPolicyDistiller,
+    PolicyOutput,
+    PoolItem,
+    ToolAction,
+    ToolExecutor,
+)
 from verl.experimental.opd_mm.dataset import (
     OPD_MM_SYSTEM_PROMPT,
     opd_messages_for_query,
@@ -278,6 +288,130 @@ def test_reward_gated_opd_uses_full_grpo_states_without_kl_selection() -> None:
     assert gated_batch.non_tensor_batch["opd_mm_kl_credit_mode"].tolist() == ["grpo", "grpo", "distill"]
 
 
+def test_reward_gated_opsd_distills_all_fail_states_without_disagreement_filter() -> None:
+    config = SimpleNamespace(
+        algorithm=SimpleNamespace(
+            opd_mm_state_opsd={
+                "top_actions": 2,
+                "topk": 2,
+                "grpo_action_selection": "all_states",
+                "success_key": "opd_mm/answer_correct",
+            }
+        ),
+        actor_rollout_ref=SimpleNamespace(
+            rollout=SimpleNamespace(prompt_length=4, response_length=3, n=1),
+            actor=SimpleNamespace(ppo_mini_batch_size=1),
+        ),
+    )
+    trainer = SimpleNamespace(
+        config=config,
+        tokenizer=SimpleNamespace(pad_token_id=0),
+        actor_rollout_wg=object(),
+        _get_dp_size=lambda worker_group, role: 1,
+    )
+    states = np.empty(2, dtype=object)
+    corrections = np.empty(2, dtype=object)
+    for index in range(2):
+        states[index] = [
+            {
+                "step_index": 0,
+                "prompt_ids": [10 + index],
+                "response_ids": [20 + index, 30 + index],
+                "response_logprobs": [-0.2, -0.3],
+            }
+        ]
+        corrections[index] = [
+            {
+                "step_index": 0,
+                "kl_credit": {
+                    "structured_disagreement": False,
+                    "action_kl": 0.5 + index,
+                    "tool_call_mask": [1, 1],
+                    "teacher_ids": [[40, 41], [42, 43]],
+                    "teacher_logprobs": [[-0.1, -2.0], [-0.2, -1.8]],
+                },
+            }
+        ]
+    batch = DataProto.from_dict(
+        tensors={
+            "advantages": torch.tensor([[1.0, 1.0, 0.0], [-1.0, -1.0, 0.0]]),
+            "response_mask": torch.tensor([[1, 1, 0], [1, 1, 0]]),
+        },
+        non_tensors={
+            "uid": np.array(["successful-group", "all-fail-group"], dtype=object),
+            "opd_mm/answer_correct": np.array([1.0, 0.0], dtype=object),
+            "opd_mm_policy_states": states,
+            "opd_mm_step_corrections": corrections,
+        },
+    )
+
+    result = RayPPOTrainer._build_opd_mm_kl_credit_batch(
+        trainer,
+        batch,
+        reward_gated_opsd=True,
+    )
+
+    assert result is not None
+    gated_batch, metrics = result
+    assert metrics["opd_mm_grpo_states"] == 1.0
+    assert metrics["opd_mm_distill_states"] == 1.0
+    assert metrics["opd_mm_kl_selected_actions"] == 1.0
+    assert gated_batch.batch["distillation_mask"].sum().item() == 2
+
+
+def test_reward_gated_sft_filters_successful_groups_from_both_updates() -> None:
+    config = SimpleNamespace(
+        algorithm=SimpleNamespace(),
+        actor_rollout_ref=SimpleNamespace(
+            rollout=SimpleNamespace(prompt_length=4, response_length=8, n=1),
+            actor=SimpleNamespace(ppo_mini_batch_size=1),
+        ),
+    )
+
+    class FakeTokenizer:
+        pad_token_id = 0
+
+        def __call__(self, text, add_special_tokens=False):
+            del text, add_special_tokens
+            return {"input_ids": [91, 92, 93]}
+
+    trainer = SimpleNamespace(
+        config=config,
+        tokenizer=FakeTokenizer(),
+        actor_rollout_wg=object(),
+        _get_dp_size=lambda worker_group, role: 1,
+    )
+    trainer._opd_mm_group_success = RayPPOTrainer._opd_mm_group_success.__get__(trainer)
+    states = np.empty(2, dtype=object)
+    states[0] = [{"prompt_ids": [10], "response_ids": [20], "response_logprobs": [-0.2]}]
+    states[1] = [{"prompt_ids": [11], "response_ids": [21], "response_logprobs": [-0.3]}]
+    corrections = np.empty(2, dtype=object)
+    corrections[0] = [{"sft_target_xml": "<tool_call><function=stop></function></tool_call>", "sft_prompt_ids": [10]}]
+    corrections[1] = [{"sft_target_xml": "<tool_call><function=retrieve></function></tool_call>", "sft_prompt_ids": [11]}]
+    batch = DataProto.from_dict(
+        tensors={
+            "advantages": torch.tensor([[1.0, 0.0], [0.0, 0.0]]),
+            "response_mask": torch.tensor([[1, 0], [1, 0]]),
+        },
+        non_tensors={
+            "uid": np.array(["successful-group", "all-fail-group"], dtype=object),
+            "opd_mm/answer_correct": np.array([1.0, 0.0], dtype=object),
+            "opd_mm_policy_states": states,
+            "opd_mm_step_corrections": corrections,
+        },
+    )
+
+    success_groups = RayPPOTrainer._opd_mm_group_success(trainer, batch)
+    assert success_groups == {"successful-group": True, "all-fail-group": False}
+    grpo_batch = RayPPOTrainer._build_opd_mm_grpo_state_batch(trainer, batch, only_successful=True)
+    sft_batch = RayPPOTrainer._build_opd_mm_correction_sft_batch(trainer, batch, only_all_fail=True)
+
+    assert grpo_batch is not None
+    assert set(grpo_batch.non_tensor_batch["uid"].tolist()) == {"successful-group"}
+    assert sft_batch is not None
+    assert len(sft_batch) == 1
+
+
 def _records() -> list[MemoryRecord]:
     return [
         MemoryRecord(
@@ -479,7 +613,52 @@ def test_remote_vllm_raw_inspector_sends_image_and_returns_text(tmp_path, monkey
     assert content[0]["type"] == "text"
     assert "What animal is shown?" in content[0]["text"]
     assert content[1]["type"] == "image_url"
-    assert content[1]["image_url"]["url"].startswith("data:image/jpeg;base64,")
+    assert content[1]["image_url"]["url"] == (
+        "data:image/jpeg;base64," + base64.b64encode(b"fake-jpeg").decode("ascii")
+    )
+
+
+def test_remote_vllm_raw_inspector_can_bypass_environment_proxy(tmp_path, monkeypatch) -> None:
+    image = tmp_path / "cat.jpg"
+    image.write_bytes(b"fake-jpeg")
+    opened: list[str] = []
+
+    class FakeResponse:
+        def __enter__(self) -> "FakeResponse":
+            return self
+
+        def __exit__(self, exc_type: Any, exc: Any, tb: Any) -> None:
+            return None
+
+        def read(self) -> bytes:
+            return b'{"choices":[{"message":{"content":"cat"}}]}'
+
+    class FakeOpener:
+        def open(self, req: Any, timeout: float) -> FakeResponse:
+            del timeout
+            opened.append(req.full_url)
+            return FakeResponse()
+
+    proxy_handlers: list[dict[str, str]] = []
+
+    def fake_proxy_handler(proxies: dict[str, str]) -> object:
+        proxy_handlers.append(proxies)
+        return object()
+
+    monkeypatch.setattr("verl.experimental.opd_mm.raw_inspector.urllib_request.ProxyHandler", fake_proxy_handler)
+    monkeypatch.setattr(
+        "verl.experimental.opd_mm.raw_inspector.urllib_request.build_opener",
+        lambda handler: FakeOpener(),
+    )
+
+    inspector = RemoteVLLMRawInspector(
+        base_url="http://192.168.1.113:31208",
+        model="Qwen3.5-9B",
+        bypass_proxy=True,
+    )
+    assert inspector.inspect(str(image), "What is shown?") == "cat"
+    assert proxy_handlers == [{}]
+    assert opened == ["http://192.168.1.113:31208/v1/chat/completions"]
 
 
 class QuerySwitchRetriever:
@@ -529,10 +708,11 @@ def test_validator_rejects_memory_ids_and_accepts_rewritten_retrieve_query() -> 
     )
     assert validated_filter[0].arguments == {"field": "modality", "op": "eq", "value": "image"}
 
-    with pytest.raises(TrajectoryValidationError, match="invalid FILTER field"):
-        validator.validate(
-            [{"tool": "FILTER", "field": "author", "op": "eq", "value": "user"}]
-        )
+    for removed_field in ("author", "source_type"):
+        with pytest.raises(TrajectoryValidationError, match="invalid FILTER field"):
+            validator.validate(
+                [{"tool": "FILTER", "field": removed_field, "op": "eq", "value": "user"}]
+            )
 
     with pytest.raises(TrajectoryValidationError, match="unknown arguments"):
         validator.validate(
@@ -541,10 +721,6 @@ def test_validator_rejects_memory_ids_and_accepts_rewritten_retrieve_query() -> 
 
     invalid_filter_values = (
         ("modality", "dialogue"),
-        ("source_type", "dialogue"),
-        ("source_type", "user"),
-        ("source_type", "MEMORY"),
-        ("source_type", "assistant"),
         ("status", "completed"),
     )
     for field, value in invalid_filter_values:
@@ -633,8 +809,8 @@ def test_repeated_filters_always_search_full_memory_and_merge_results() -> None:
     result = ToolExecutor().run(
         [
             {"tool": "FILTER", "field": "modality", "op": "eq", "value": "image"},
-            {"tool": "FILTER", "field": "source_type", "op": "eq", "value": "dialogue_turn"},
-            {"tool": "FILTER", "field": "source_type", "op": "eq", "value": "dialogue_image"},
+            {"tool": "FILTER", "field": "modality", "op": "eq", "value": "text"},
+            {"tool": "FILTER", "field": "status", "op": "eq", "value": "active"},
         ],
         query="Collect several independently filtered memory sets.",
         memory_store=store,
@@ -702,11 +878,11 @@ def test_repeated_retrieve_always_searches_original_memory_store() -> None:
     assert result.final_memory_ids == ["m_text_old", "m_cat_text"]
 
 
-def test_executor_composes_generic_tools_to_latest_user_image() -> None:
+def test_executor_composes_generic_tools_to_timestamped_image() -> None:
     store = HiddenMemoryStore(_records())
     result = ToolExecutor().run(
         [
-            {"tool": "FILTER", "field": "source_type", "op": "eq", "value": "dialogue_image"},
+            {"tool": "FILTER", "field": "timestamp", "op": "eq", "value": "2026-01-01T10:00:01"},
             {"tool": "SORT", "field": "timestamp", "order": "desc"},
             {"tool": "TOPK", "k": 1},
         ],
@@ -944,7 +1120,7 @@ async def test_verl_native_opd_tools_share_hidden_state_and_hide_ids() -> None:
 
     response, _, metrics = await filter_tool.execute(
         "instance",
-        {"field": "source_type", "op": "eq", "value": "dialogue_image"},
+        {"field": "timestamp", "op": "eq", "value": "2026-01-01T10:00:01"},
         agent_data=agent_data,
     )
 
@@ -987,12 +1163,12 @@ async def test_verl_native_filter_always_merges_from_full_memory() -> None:
     )
     await filter_tool.execute(
         "instance",
-        {"field": "source_type", "op": "eq", "value": "dialogue_turn"},
+        {"field": "modality", "op": "eq", "value": "text"},
         agent_data=agent_data,
     )
     response, _, _ = await filter_tool.execute(
         "instance",
-        {"field": "source_type", "op": "eq", "value": "dialogue_image"},
+        {"field": "status", "op": "eq", "value": "active"},
         agent_data=agent_data,
     )
 
@@ -1154,6 +1330,30 @@ async def test_bounded_merge_prioritizes_latest_discovery_results() -> None:
             "timestamp": "2026-01-01T11:00:00",
             "modality": "image",
         }
+    ]
+
+
+def test_bounded_merge_uses_reciprocal_rank_fusion_across_discoveries() -> None:
+    records = _records()
+    by_id = {record.memory_id: record for record in records}
+    executor = ToolExecutor(max_pool_size=3)
+    existing = [
+        PoolItem(by_id["m_cat_text"], score=0.9, retrieved=True),
+        PoolItem(by_id["m_text_old"], score=0.8, retrieved=True),
+        PoolItem(by_id["m_cat_image"], score=0.7, retrieved=True),
+    ]
+    incoming = [
+        PoolItem(by_id["m_assistant_image"], score=0.99, retrieved=True),
+        PoolItem(by_id["m_cat_text"], score=0.6, retrieved=True),
+    ]
+
+    fused, overflow = executor._merge_discovery_pool(existing, incoming, True)
+
+    assert overflow == 1
+    assert [item.memory.memory_id for item in fused] == [
+        "m_cat_text",
+        "m_assistant_image",
+        "m_text_old",
     ]
 
 
@@ -1416,6 +1616,126 @@ async def test_tool_agent_loop_collects_correction_from_each_live_state() -> Non
 
 
 @pytest.mark.asyncio
+async def test_tool_agent_loop_keeps_invalid_student_calls_for_opsd_correction() -> None:
+    calls = 0
+    payloads: list[dict[str, Any]] = []
+
+    async def corrector(payload: dict[str, Any]) -> dict[str, Any]:
+        nonlocal calls
+        calls += 1
+        payloads.append(payload)
+        return {"step_index": payload["step_index"]}
+
+    loop = SimpleNamespace(
+        tokenizer=SimpleNamespace(decode=lambda ids, skip_special_tokens=False: "analysis without a legal call"),
+        tool_parser_name="qwen3_coder",
+        tools={},
+    )
+    agent_data = SimpleNamespace(
+        online_state_corrector=corrector,
+        extra_fields={},
+        tool_calls=[FunctionCall(name="retrieve", arguments='{"method": "not-a-method", "top_k": 5}')],
+        request_id="invalid-request",
+        assistant_turns=1,
+        image_data=None,
+        video_data=None,
+        audio_data=None,
+        mm_processor_kwargs={},
+    )
+
+    await ToolAgentLoop._collect_online_state_correction(
+        loop,
+        agent_data=agent_data,
+        state_prompt_ids=[1, 2],
+        response_ids=[3, 4],
+        assistant_content="analysis without a legal call",
+    )
+
+    assert calls == 1
+    assert payloads[0]["student_next_action"] == {
+        "tool": "RETRIEVE",
+        "method": "not-a-method",
+        "top_k": 5,
+    }
+    assert len(agent_data.extra_fields["opd_mm_step_corrections"]) == 1
+
+
+@pytest.mark.asyncio
+async def test_tool_agent_loop_terminates_opd_trajectory_on_missing_tool_call() -> None:
+    class FakeServer:
+        async def generate(self, **kwargs: Any) -> Any:
+            del kwargs
+            return SimpleNamespace(
+                token_ids=[4, 5],
+                log_probs=[-0.1, -0.2],
+                routed_experts=None,
+                num_preempted=0,
+                extra_fields={},
+            )
+
+    class FakeParser:
+        stop_token_ids: list[int] = []
+
+        async def extract_tool_calls(self, response_ids: list[int], tools: list[Any]) -> tuple[str, list[Any]]:
+            del response_ids, tools
+            return "plain answer without a tool call", []
+
+    loop = object.__new__(ToolAgentLoop)
+    loop.server_manager = FakeServer()
+    loop.tool_parser = FakeParser()
+    loop.tokenizer = SimpleNamespace(decode=lambda ids, skip_special_tokens=False: "plain answer")
+    loop.enable_continuous_token = False
+    loop.response_length = 32
+    loop.max_assistant_turns = 10
+    loop.max_user_turns = None
+    loop.tools = {
+        "retrieve": SimpleNamespace(tool_schema={}),
+        "stop": SimpleNamespace(tool_schema={}),
+    }
+    loop.tool_parser_name = "qwen3_coder"
+    agent_data = SimpleNamespace(
+        request_id="invalid-generation",
+        prompt_ids=[1, 2, 3],
+        full_prompt_ids=[1, 2, 3],
+        response_ids=[],
+        response_mask=[],
+        distillation_mask=[],
+        response_logprobs=[],
+        routed_experts=None,
+        metrics={},
+        extra_fields={},
+        assistant_turns=0,
+        user_turns=0,
+        tools_kwargs={"opd_mm": {"query": "Find the red bicycle."}},
+        online_state_corrector=None,
+        image_data=None,
+        video_data=None,
+        audio_data=None,
+        mm_processor_kwargs={},
+        messages=[{"role": "user", "content": "Find the red bicycle."}],
+        tool_calls=[],
+        last_assistant_content="",
+    )
+
+    state = await ToolAgentLoop._handle_generating_state(loop, agent_data, {})
+
+    assert state == AgentState.TERMINATED
+    assert agent_data.assistant_turns == 1
+    assert agent_data.extra_fields["opd_mm"]["stopped"] is False
+    assert agent_data.extra_fields["opd_mm"]["error"] == "invalid_student_action:missing_tool_call"
+
+
+def test_opd_student_action_rejects_mis_cased_tool_name_without_losing_arguments() -> None:
+    action, reason = _parse_opd_mm_student_action(
+        [FunctionCall(name="RETRIEVE", arguments='{"method":"bm25","top_k":5}')],
+        {"retrieve": object()},
+    )
+
+    assert action == {"tool": "RETRIEVE", "method": "bm25", "top_k": 5}
+    assert reason == "unknown_or_mis_cased_tool:RETRIEVE"
+
+
+@pytest.mark.asyncio
 async def test_opd_stop_tool_requests_agent_loop_termination() -> None:
     records = [record.to_dict() for record in _records()]
     agent_data = FakeAgentData(
@@ -1456,22 +1776,68 @@ async def test_opd_tool_session_marks_forced_max_action_stop() -> None:
     assert metrics["agent_loop_terminate"] is True
 
 
-def test_raw_inspector_backend_environment_overrides_tool_config(monkeypatch) -> None:
+@pytest.mark.asyncio
+async def test_raw_inspector_backend_environment_overrides_tool_config(monkeypatch) -> None:
     monkeypatch.setenv("OPD_MM_RAW_INSPECTOR_BACKEND", "vllm")
     monkeypatch.setenv("OPD_MM_RAW_INSPECTOR_URL", "http://outcome-model:8011")
     monkeypatch.setenv("OPD_MM_RAW_INSPECTOR_MODEL", "opd-mm-outcome")
+    remote_calls: list[str] = []
+    teacher_calls: list[dict[str, Any]] = []
+
+    def remote_inspect(
+        self: RemoteVLLMRawInspector,
+        image_path: str,
+        query: str,
+        question_image: str | None = None,
+        text_context: str | None = None,
+    ) -> str:
+        remote_calls.append(image_path)
+        return "Remote vLLM sees a tabby cat sitting on a sofa."
+
+    async def teacher_inspect(payload: dict[str, Any]) -> str:
+        teacher_calls.append(payload)
+        return "This callback must not be used when the environment selects vllm."
+
+    monkeypatch.setattr(RemoteVLLMRawInspector, "inspect", remote_inspect)
     records = [record.to_dict() for record in _records()]
     agent_data = FakeAgentData(
-        messages=[{"role": "user", "content": "Inspect the image."}],
-        tools_kwargs={"opd_mm": {"query": "Inspect the image.", "records": records}},
+        messages=[{"role": "user", "content": "What is in the cat image?"}],
+        tools_kwargs={"opd_mm": {"query": "What is in the cat image?", "records": records}},
     )
-    tool = OPDInspectRawTool(config={"type": "native", "raw_inspector_backend": "teacher"}, tool_schema=None)
+    agent_data.teacher_raw_inspector = teacher_inspect
+    retrieve_tool = OPDRetrieveTool(
+        config={"type": "native", "raw_inspector_backend": "teacher"},
+        tool_schema=None,
+    )
+    inspect_tool = OPDInspectRawTool(
+        config={"type": "native", "raw_inspector_backend": "teacher"},
+        tool_schema=None,
+    )
 
-    session = tool._session(agent_data)
+    await retrieve_tool.execute(
+        "instance",
+        {"method": "bm25", "top_k": 1, "query": "tabby cat sofa"},
+        agent_data=agent_data,
+    )
+    response, _, metrics = await inspect_tool.execute(
+        "instance",
+        {
+            "target": "current_pool",
+            "instruction": "answer_query_related_visual_details",
+        },
+        agent_data=agent_data,
+    )
 
+    session = inspect_tool._session(agent_data)
+    observation = json.loads(response.text)
     assert isinstance(session.executor.raw_inspector, RemoteVLLMRawInspector)
     assert session.executor.raw_inspector.base_url == "http://outcome-model:8011"
     assert session.executor.raw_inspector.model == "opd-mm-outcome"
+    assert remote_calls == ["images/cat.png"]
+    assert teacher_calls == []
+    assert observation["error"] == ""
+    assert observation["evidence"][-1]["visual_observation"] == "Remote vLLM sees a tabby cat sitting on a sofa."
+    assert metrics["agent_loop_terminate"] is False
 
 
 def test_tool_agent_records_exact_opd_policy_state(monkeypatch) -> None:
@@ -1692,6 +2058,37 @@ def test_opd_mm_batch_without_teacher_logprobs_returns_zero_loss() -> None:
     )
 
     assert loss.item() == pytest.approx(0.0)
+    assert metrics["distillation/opd_mm_no_supervision_batches"].values == [1.0]
+
+
+def test_opd_mm_grpo_state_batch_without_teacher_logprobs_uses_policy_loss(monkeypatch) -> None:
+    data = _minimal_distillation_batch()
+    data["distillation_mask"] = torch.zeros_like(data["response_mask"])
+    tu.assign_non_tensor(data, data_source="opd_mm", opd_mm_grpo_state_batch=True)
+    config = ActorConfig(strategy="fsdp", rollout_n=1, ppo_micro_batch_size_per_gpu=1)
+    model_output = {"log_probs": torch.tensor([0.0, -0.5, -0.25])}
+    called = False
+
+    def fake_ppo_loss(actor_config, actor_output, actor_data, dp_group):
+        nonlocal called
+        called = True
+        assert actor_config is config
+        assert actor_output is model_output
+        assert actor_data is data
+        assert dp_group is None
+        return torch.tensor(0.75), {"actor/pg_loss": "policy-loss"}
+
+    monkeypatch.setattr(distillation_losses, "ppo_loss", fake_ppo_loss)
+    loss, metrics = distillation_ppo_loss(
+        config,
+        DistillationConfig(),
+        model_output=model_output,
+        data=data,
+    )
+
+    assert called is True
+    assert loss.item() == pytest.approx(0.75)
+    assert metrics["actor/pg_loss"] == "policy-loss"
     assert metrics["distillation/opd_mm_no_supervision_batches"].values == [1.0]
 
 
@@ -2108,8 +2505,7 @@ def test_live_online_state_request_uses_current_state_without_snapshot_replay() 
     assert request["student_next_action"] == {"tool": "STOP"}
     assert "SECRET_GOLD_ANSWER" in request["verifier_prompt"]
     assert "speaker attribution is guaranteed by dataset construction" in request["verifier_prompt"]
-    assert "Do not evaluate or mention whether sanitized" in request["verifier_prompt"]
-    assert "a missing repeated speaker name cannot" in request["verifier_prompt"]
+    assert 'not whether sanitized "User" repeats a query-provided name' in request["verifier_prompt"]
 
 
 def test_live_online_state_request_includes_initial_state_by_default() -> None:
@@ -2255,6 +2651,167 @@ async def test_agent_loop_worker_generates_verifier_and_teacher_for_one_live_sta
 
 
 @pytest.mark.asyncio
+async def test_state_opsd_uses_privileged_logits_without_generating_teacher_xml(monkeypatch) -> None:
+    monkeypatch.setenv("OPD_MM_ONLINE_SUPERVISION_MODE", "opsd")
+
+    class FakeTeacherServer:
+        def __init__(self) -> None:
+            self.generate_calls: list[dict[str, Any]] = []
+
+        async def generate_teacher_response_single(self, **kwargs: Any) -> list[int]:
+            self.generate_calls.append(kwargs)
+            return [101]
+
+    async def fake_kl_credit(self, **kwargs: Any) -> dict[str, Any]:
+        del self, kwargs
+        return {
+            "action_kl": 0.4,
+            "tool_call_mask": [1],
+            "teacher_ids": [[10, 11]],
+            "teacher_logprobs": [[-0.1, -2.0]],
+        }
+
+    teacher_server = FakeTeacherServer()
+    monkeypatch.setattr(AgentLoopWorker, "_compute_opd_mm_state_kl_credit", fake_kl_credit)
+    worker = SimpleNamespace(
+        teacher_key="data_source",
+        teacher_server_manager=teacher_server,
+        tokenizer=SimpleNamespace(
+            decode=lambda token_ids, skip_special_tokens=False: json.dumps(
+                {
+                    "evidence_sufficient": False,
+                    "reason": "No public evidence is available.",
+                    "missing_evidence_type": "no_public_evidence",
+                }
+            )
+        ),
+        rollout_config=SimpleNamespace(multi_turn=SimpleNamespace(format="qwen3_coder")),
+        _encode_opd_mm_teacher_prompt=lambda prompt, **kwargs: [len(prompt)],
+    )
+    correction = await AgentLoopWorker._generate_opd_mm_online_state_correction(
+        worker,
+        sample_kwargs={
+            "data_source": "opd_mm",
+            "raw_prompt": [{"role": "user", "content": "Find the relevant memory."}],
+            "tools_kwargs": {"opd_mm": {"query": "Find the relevant memory."}},
+            "extra_info": {
+                "gold_answer": "private answer",
+                "opd_mm_online_self_distill": True,
+                "sample_id": "opsd-state-sample",
+            },
+        },
+        state_payload={
+            "request_id": "opsd-state-request",
+            "step_index": 0,
+            "student_prompt_ids": [7, 8, 9],
+            "student_response_ids": [20],
+            "student_tool_call_mask": [1],
+            "student_raw_response": "<tool_call><function=stop></function></tool_call>",
+            "student_next_action": {"tool": "STOP"},
+            "history": [],
+            "observation": {"pool_count": 0, "evidence_count": 0, "trace": [], "evidence": []},
+            "tool_format": "qwen3_coder",
+            "multi_modal_data": {},
+            "mm_processor_kwargs": {},
+        },
+    )
+
+    assert correction is not None
+    assert correction["opsd_only"] is True
+    assert correction["teacher_actions"] == []
+    assert correction["kl_credit"]["action_kl"] == pytest.approx(0.4)
+    assert len(teacher_server.generate_calls) == 1  # verifier only
+
+
+@pytest.mark.asyncio
+async def test_agent_loop_worker_can_route_verifier_to_remote_model(monkeypatch) -> None:
+    remote_calls: list[dict[str, Any]] = []
+
+    async def fake_remote_verifier(**kwargs: Any) -> str:
+        remote_calls.append(kwargs)
+        return json.dumps(
+            {
+                "evidence_sufficient": False,
+                "missing_evidence_type": "no_public_evidence",
+                "reason": "No public evidence is available.",
+            }
+        )
+
+    monkeypatch.setenv("OPD_MM_VERIFIER_BASE_URL", "http://verifier.example:8000")
+    monkeypatch.setenv("OPD_MM_VERIFIER_MODEL", "Qwen3.5-9B")
+    monkeypatch.setattr(
+        "verl.experimental.agent_loop.agent_loop._opd_mm_remote_chat_completion",
+        fake_remote_verifier,
+    )
+
+    class FakeTeacherServer:
+        def __init__(self) -> None:
+            self.calls: list[dict[str, Any]] = []
+
+        async def generate_teacher_response_single(self, **kwargs: Any) -> list[int]:
+            self.calls.append(kwargs)
+            return [202]
+
+    teacher_server = FakeTeacherServer()
+    encoded_tools: list[Any] = []
+
+    def encode_teacher_prompt(prompt: str, **kwargs: Any) -> list[int]:
+        del prompt
+        encoded_tools.append(kwargs.get("tools"))
+        return [123]
+
+    worker = SimpleNamespace(
+        teacher_key="data_source",
+        teacher_server_manager=teacher_server,
+        tokenizer=SimpleNamespace(
+            decode=lambda token_ids, skip_special_tokens=False: (
+                "<tool_call>\n"
+                "<function=retrieve>\n"
+                "<parameter=method>\nbm25</parameter>\n"
+                "<parameter=top_k>\n10</parameter>\n"
+                "</function>\n"
+                "</tool_call>"
+            )
+        ),
+        rollout_config=SimpleNamespace(multi_turn=SimpleNamespace(format="qwen3_coder")),
+        _encode_opd_mm_teacher_prompt=encode_teacher_prompt,
+    )
+    correction = await AgentLoopWorker._generate_opd_mm_online_state_correction(
+        worker,
+        sample_kwargs={
+            "data_source": "opd_mm",
+            "raw_prompt": [{"role": "user", "content": "Find the relevant memory."}],
+            "tools_kwargs": {"opd_mm": {"query": "Find the relevant memory."}},
+            "extra_info": {
+                "gold_answer": "private answer",
+                "opd_mm_online_self_distill": True,
+                "sample_id": "remote-verifier-sample",
+            },
+        },
+        state_payload={
+            "request_id": "remote-verifier-request",
+            "step_index": 0,
+            "student_prompt_ids": [7, 8, 9],
+            "student_raw_response": "<tool_call><function=stop></function></tool_call>",
+            "student_next_action": {"tool": "STOP"},
+            "history": [],
+            "observation": {"pool_count": 0, "evidence_count": 0, "trace": [], "evidence": []},
+            "tool_format": "qwen3_coder",
+            "multi_modal_data": {},
+            "mm_processor_kwargs": {},
+        },
+    )
+
+    assert correction is not None
+    assert correction["teacher_actions"] == [{"tool": "RETRIEVE", "method": "bm25", "top_k": 10}]
+    assert len(remote_calls) == 1
+    assert remote_calls[0]["base_url"] == "http://verifier.example:8000"
+    assert remote_calls[0]["model"] == "Qwen3.5-9B"
+    assert len(teacher_server.calls) == 1
+    assert encoded_tools and encoded_tools[0] is not None
+
+
+@pytest.mark.asyncio
 async def test_agent_loop_worker_raw_inspection_uses_teacher_vllm(tmp_path, monkeypatch) -> None:
     image_path = tmp_path / "memory.png"
     from PIL import Image
@@ -2344,10 +2901,14 @@ def test_online_xml_correction_requests_include_invalid_student_state() -> None:
     assert "Current public evidence state and observations" in requests[0]["verifier_prompt"]
     assert "Tool semantics to consider" not in requests[0]["verifier_prompt"]
     assert "retrieve(method=bm25|dense|vision|hybrid" not in requests[0]["verifier_prompt"]
-    assert "filter(field=modality|author|source_type|timestamp|status" not in requests[0]["verifier_prompt"]
+    assert "source_type" not in requests[0]["verifier_prompt"]
     assert "expand_neighbors(window=1|2|3" not in requests[0]["verifier_prompt"]
     assert "inspect_raw(target=current_pool" not in requests[0]["verifier_prompt"]
     assert "SECRET_GOLD_ANSWER" in requests[0]["verifier_prompt"]
+    assert "missing_factual_support" in requests[0]["verifier_prompt"]
+    assert "Use incomplete_coverage only" in requests[0]["verifier_prompt"]
+    assert "Do not require an" in requests[0]["verifier_prompt"]
+    assert "exact answer string" in requests[0]["verifier_prompt"]
 
     verifier_feedback = {
         "evidence_sufficient": False,
@@ -2366,16 +2927,16 @@ def test_online_xml_correction_requests_include_invalid_student_state() -> None:
         allow_inspect_raw=requests[0]["allow_inspect_raw"],
         tool_format=requests[0]["tool_format"],
     )
-    assert "Produce exactly one next tool action" in requests[0]["teacher_prompt"]
-    assert "Verifier feedback is a private diagnostic, not evidence" in requests[0]["teacher_prompt"]
-    assert "The verifier saw the answer rubric; you did not." in requests[0]["teacher_prompt"]
+    assert "Produce exactly one tool action" in requests[0]["teacher_prompt"]
+    assert "Verifier feedback is a private diagnostic" in requests[0]["teacher_prompt"]
+    assert "evidence or an action command" in requests[0]["teacher_prompt"]
+    assert "do not see the gold answer" in requests[0]["teacher_prompt"]
     assert "Gold answer:" not in requests[0]["teacher_prompt"]
     assert "SECRET_GOLD_ANSWER" not in requests[0]["teacher_prompt"]
     assert "Do not copy" in requests[0]["teacher_prompt"]
     assert "verifier.reason" in requests[0]["teacher_prompt"]
-    assert "Use evidence_sufficient as" in requests[0]["teacher_prompt"]
-    assert "when false, choose a non-STOP tool" in requests[0]["teacher_prompt"]
-    assert "when true and the observation has no" in requests[0]["teacher_prompt"]
+    assert "output STOP immediately" in requests[0]["teacher_prompt"]
+    assert "evidence_sufficient=false: choose one non-STOP tool" in requests[0]["teacher_prompt"]
     assert "For STOP, emit exactly" not in requests[0]["teacher_prompt"]
     assert "schema-described tool" in requests[0]["teacher_prompt"]
     assert "Do not repeat an" in requests[0]["teacher_prompt"]
@@ -2416,7 +2977,7 @@ def test_state_verifier_feedback_parser_accepts_wrapped_json_and_blocks_stop() -
     )
 
     assert feedback["evidence_sufficient"] is False
-    assert feedback["missing_evidence_type"] == "incomplete_coverage"
+    assert feedback["missing_evidence_type"] == "missing_factual_support"
     assert feedback["parse_error"] == ""
 
 
@@ -2434,7 +2995,22 @@ def test_state_verifier_feedback_sanitizes_gold_answer_leakage() -> None:
     assert feedback["missing_evidence_type"] == "no_public_evidence"
     assert "Miso" not in feedback["reason"]
     assert "gold answer" not in feedback["reason"].lower()
-    assert feedback["reason"] == "Current public evidence is insufficient; collect relevant evidence first."
+    assert "Lena's brother" in feedback["reason"]
+    assert "cat named the missing value" in feedback["reason"]
+    assert feedback["reason"] != "Current public evidence is insufficient; collect relevant evidence first."
+
+
+def test_state_verifier_feedback_accepts_missing_factual_support() -> None:
+    feedback = parse_state_verifier_feedback(
+        '{"evidence_sufficient": false, '
+        '"reason": "The evidence is on topic but does not establish the requested relationship.", '
+        '"missing_evidence_type": "missing_factual_support"}',
+        {"evidence_count": 3, "pool_count": 3},
+    )
+
+    assert feedback["evidence_sufficient"] is False
+    assert feedback["missing_evidence_type"] == "missing_factual_support"
+    assert feedback["parse_error"] == ""
 
 
 def test_state_verifier_feedback_distinguishes_nonempty_irrelevant_evidence() -> None:
@@ -2541,6 +3117,40 @@ def test_online_xml_correction_drops_insufficient_teacher_stop_with_candidates()
     assert correction is None
 
 
+def test_online_xml_correction_drops_sufficient_teacher_non_stop() -> None:
+    request = {
+        "sample_id": "stop-gate-sufficient",
+        "step_index": 1,
+        "query": "Which image matches the description?",
+        "history": [{"tool": "RETRIEVE", "method": "vision", "top_k": 10}],
+        "observation": {"evidence_count": 2, "pool_count": 2, "trace": [{"tool": "RETRIEVE"}]},
+        "student_raw_response": "<tool_call><function=inspect_raw></function></tool_call>",
+        "student_prompt_ids": [7, 8, 9],
+        "allow_inspect_raw": True,
+        "tool_format": "qwen3_coder",
+        "verifier_feedback": {
+            "evidence_sufficient": True,
+            "missing_evidence_type": "none",
+            "reason": "The matching public image description and image ID are present.",
+            "parse_error": "",
+        },
+    }
+
+    correction = finalize_online_step_correction(
+        request,
+        teacher_raw_response=(
+            "<tool_call>\n"
+            "<function=inspect_raw>\n"
+            "<parameter=target>\ncurrent_pool</parameter>\n"
+            "<parameter=instruction>\nanswer_query_related_visual_details</parameter>\n"
+            "</function>\n"
+            "</tool_call>"
+        ),
+    )
+
+    assert correction is None
+
+
 def test_online_teacher_correction_dump_writes_jsonl(tmp_path, monkeypatch) -> None:
     request = {
         "sample_id": "sample-dump",
@@ -2633,11 +3243,26 @@ def test_opd_grpo_batch_uses_each_refreshed_state_and_terminal_advantage() -> No
     )
     states = np.empty(2, dtype=object)
     states[0] = [
-        {"prompt_ids": [10, 11], "response_ids": [20, 21], "response_logprobs": [-0.1, -0.2]},
-        {"prompt_ids": [10, 11, 12], "response_ids": [22], "response_logprobs": [-0.3]},
+        {
+            "prompt_ids": [10, 11],
+            "response_ids": [20, 21],
+            "response_logprobs": [-0.1, -0.2],
+            "tool_call_mask": [1, 0],
+        },
+        {
+            "prompt_ids": [10, 11, 12],
+            "response_ids": [22],
+            "response_logprobs": [-0.3],
+            "tool_call_mask": [1],
+        },
     ]
     states[1] = [
-        {"prompt_ids": [30], "response_ids": [31, 32], "response_logprobs": [-0.4, -0.5]},
+        {
+            "prompt_ids": [30],
+            "response_ids": [31, 32],
+            "response_logprobs": [-0.4, -0.5],
+            "tool_call_mask": [0, 1],
+        },
     ]
     batch = DataProto.from_dict(
         tensors={
@@ -2659,6 +3284,8 @@ def test_opd_grpo_batch_uses_each_refreshed_state_and_terminal_advantage() -> No
     assert expanded.batch["old_log_probs"][0, :2].tolist() == pytest.approx([-0.1, -0.2])
     assert expanded.batch["advantages"][0, :2].tolist() == [0.5, 0.5]
     assert expanded.batch["advantages"][2, :2].tolist() == [-0.25, -0.25]
+    assert expanded.batch["response_mask"][0, :4].tolist() == [1, 0, 0, 0]
+    assert expanded.batch["response_mask"][2, :4].tolist() == [0, 1, 0, 0]
     assert expanded.non_tensor_batch["uid"].tolist()[:3] == [
         "trajectory-a",
         "trajectory-a",
@@ -2682,7 +3309,8 @@ def test_helpers_build_hidden_store_from_dicts_and_schemas() -> None:
     filter_properties = schemas[0]["function"]["parameters"]["properties"]
     filter_value_description = schemas[0]["function"]["parameters"]["properties"]["value"]["description"]
     assert "scope" not in filter_properties
-    assert "source_type uses dialogue_turn or dialogue_image" in filter_value_description
+    assert filter_properties["field"]["enum"] == ["modality", "status", "timestamp"]
+    assert "source_type" not in json.dumps(schemas[0], ensure_ascii=False)
     assert "modality uses text or image" in filter_value_description
     assert "MEMORY/user/assistant" not in filter_value_description
     assert schemas[0]["function"]["parameters"]["required"] == ["field", "op", "value"]

@@ -67,6 +67,7 @@ _VERIFIER_MISSING_EVIDENCE_TYPES = {
     "missing_neighbor_context",
     "missing_temporal_order",
     "missing_raw_visual_detail",
+    "missing_factual_support",
     "incomplete_coverage",
     "insufficient_absence_support",
 }
@@ -126,6 +127,7 @@ def dump_online_step_correction(
             "verifier_feedback": request.get("verifier_feedback", {}),
             "teacher_raw_response": _truncate_for_dump(teacher_raw_response, max_chars),
             "parsed": correction is not None,
+            "opsd_only": bool(isinstance(correction, dict) and correction.get("opsd_only")),
             "teacher_actions": correction.get("teacher_actions", []) if isinstance(correction, dict) else [],
             "teacher_xml_span": correction.get("teacher_xml_span", "") if isinstance(correction, dict) else "",
             "sft_target_xml": correction.get("sft_target_xml", "") if isinstance(correction, dict) else "",
@@ -235,6 +237,10 @@ def _normalize_missing_evidence_type(value: Any) -> str | None:
         "raw_visual": "missing_raw_visual_detail",
         "needs_raw_visual_detail": "missing_raw_visual_detail",
         "inspect_raw": "missing_raw_visual_detail",
+        "factual_support": "missing_factual_support",
+        "missing_fact": "missing_factual_support",
+        "missing_specific_fact": "missing_factual_support",
+        "missing_query_fact": "missing_factual_support",
         "coverage": "incomplete_coverage",
         "more_coverage": "incomplete_coverage",
         "needs_more_coverage": "incomplete_coverage",
@@ -363,6 +369,22 @@ def _reason_leaks_private_answer(*, reason: str, gold_answer: str, query: str) -
     return False
 
 
+def _redact_private_answer_fragments(*, reason: str, gold_answer: str, query: str) -> str:
+    """Redact exact gold-only phrases while preserving the structural diagnosis."""
+    result = str(reason or "")
+    query_norm = _normalize_leak_text(query)
+    for fragment in _gold_answer_fragments(gold_answer):
+        fragment_norm = _normalize_leak_text(fragment)
+        if not fragment_norm or fragment_norm in query_norm:
+            continue
+        tokens = re.findall(r"\w+", fragment, flags=re.UNICODE)
+        if not tokens:
+            continue
+        pattern = r"(?<!\w)" + r"[\W_]+".join(re.escape(token) for token in tokens) + r"(?!\w)"
+        result = re.sub(pattern, "the missing value", result, flags=re.IGNORECASE)
+    return re.sub(r"\s+", " ", result).strip()
+
+
 def _generic_verifier_reason(*, evidence_sufficient: bool, missing_type: str, evidence_count: int) -> str:
     if evidence_sufficient:
         return "Current public evidence appears sufficient for the answer model to answer."
@@ -380,6 +402,8 @@ def _generic_verifier_reason(*, evidence_sufficient: bool, missing_type: str, ev
         return "Current public evidence needs raw visual details from retrieved candidates."
     if missing_type == "irrelevant_evidence":
         return "Current public evidence appears off-target; collect a more relevant candidate set."
+    if missing_type == "missing_factual_support":
+        return "Current public evidence is on topic but does not establish the query's requested fact."
     if missing_type == "insufficient_absence_support":
         return "Current public evidence needs broader support for absence, conflict, or contradiction."
     return "Current public evidence is insufficient; retrieve more relevant evidence."
@@ -396,6 +420,13 @@ def _sanitize_verifier_reason(
 ) -> str:
     reason = str(reason or "").strip()
     if _reason_leaks_private_answer(reason=reason, gold_answer=gold_answer, query=query):
+        redacted = _redact_private_answer_fragments(reason=reason, gold_answer=gold_answer, query=query)
+        if redacted and not _reason_leaks_private_answer(
+            reason=redacted,
+            gold_answer=gold_answer,
+            query=query,
+        ):
+            return redacted[:1000]
         return _generic_verifier_reason(
             evidence_sufficient=evidence_sufficient,
             missing_type=missing_type,
@@ -746,23 +777,30 @@ def build_state_verifier_prompt(
     missing_types = (
         "none|no_public_evidence|irrelevant_evidence|missing_metadata_constraint|"
         "candidate_set_too_broad|missing_neighbor_context|missing_temporal_order|"
-        "missing_raw_visual_detail|incomplete_coverage|insufficient_absence_support"
+        "missing_raw_visual_detail|incomplete_coverage|missing_factual_support|insufficient_absence_support"
         if allow_inspect_raw
         else "none|no_public_evidence|irrelevant_evidence|missing_metadata_constraint|"
         "candidate_set_too_broad|missing_neighbor_context|missing_temporal_order|"
-        "incomplete_coverage|insufficient_absence_support"
+        "incomplete_coverage|missing_factual_support|insufficient_absence_support"
     )
     visual_decision_line = (
         "- missing_raw_visual_detail: relevant image evidence exists but lacks required visual detail."
         if allow_inspect_raw
         else ""
     )
-    return f"""You are the OPD-MM state verifier. Determine whether the current public evidence lets a separate
-answer model answer the user question correctly. Use the private answer only as a sufficiency rubric.
+    return f"""You are the OPD-MM state verifier. Decide whether the public evidence logically supports a correct
+answer to the question. Compare against the private answer silently; never reveal or paraphrase gold-only content.
+A paraphrase or a fact embedded in a longer sentence is sufficient when it entails the answer. Do not require an
+exact answer string, quotation, isolated sentence, repeated speaker name, or special answer formatting.
+For a yes/no question, evidence that proves or contradicts the claim is sufficient. Treat paired dialogue/image
+records and their public timestamp/image_id as one event. A matching public image description plus image_id is
+sufficient for identification; require raw visual detail only when the queried attribute remains undescribed or
+ambiguous.
 
-Your output is shown to the teacher. Do not reveal or paraphrase private answer content. The reason must describe
-only the structural evidence gap, using generic references such as "requested entity", "relevant event", or
-"required list coverage"; do not quote concrete private names, values, dates, IDs, labels, or list items.
+Your output is shown to the teacher. Write the reason using only query-visible concepts, public-evidence content,
+and generic terms such as "requested fact", "relevant event", or "required list coverage". State what structural
+support is present and what query requirement is unresolved. Never state the expected answer or a gold-only name,
+value, date, ID, label, list item, synonym, or identifying description.
 
 Return JSON only:
 {{
@@ -776,17 +814,28 @@ Choose exactly one evidence type:
 - no_public_evidence: evidence_count is zero.
 - irrelevant_evidence: evidence concerns the wrong answer topic, event, or modality. Never use this type merely
   because sanitized dialogue says "User" instead of repeating a person name already supplied by the question.
-- missing_metadata_constraint: a query-visible modality, source_type, timestamp, or status constraint is not isolated.
+- missing_metadata_constraint: a query-visible modality, timestamp, or status constraint is not isolated.
 - candidate_set_too_broad: evidence is relevant but too broad/noisy to answer confidently.
 - missing_neighbor_context: a relevant turn appears present but adjacent dialogue/event context is missing.
 - missing_temporal_order: latest/earliest/before/after/order/ranking relation is not supported.
 {visual_decision_line}
-- incomplete_coverage: list/all/count/multi-fact evidence does not cover the full requested set.
+- missing_factual_support: an identifiable query-required entity, relation, attribute, event, or list item is absent.
+- incomplete_coverage: relevant items are present, but evidence cannot establish that a requested list/count is exhaustive.
 - insufficient_absence_support: absence/conflict/not-mentioned claims lack enough supporting scope.
 
-Consistency rules: evidence_count=0 means false/no_public_evidence. A true verdict requires type=none. A false verdict
-requires a non-none type. Sufficiency requires complete requested coverage, supported temporal relations, actual
-visual evidence for visual details, and adequate scope for absence or conflict claims.
+Selection rules: choose the most specific applicable type before missing_factual_support. In particular, use
+missing_raw_visual_detail for an unresolved visual attribute of a retrieved image, missing_neighbor_context for a
+missing adjacent turn, and missing_temporal_order for an unresolved sequence or extremum. Use
+missing_metadata_constraint when the question or public state supplies a usable modality, timestamp, or status
+constraint and the complete memory store must be searched for matching records; this remains valid even when the
+matching records are not currently visible. Use candidate_set_too_broad when relevant records are already present
+but the current set is too noisy or broad to answer. Do not use missing_factual_support for either case merely
+because matching records are absent from the current evidence.
+missing_factual_support when a specific required fact or item is absent, including one item in a multi-part answer.
+Use incomplete_coverage only when the unresolved gap is exhaustive list/count coverage rather than an identifiable
+missing item. evidence_count=0 means no_public_evidence. Use irrelevant_evidence when no evidence is on topic. Use
+candidate_set_too_broad only when relevant evidence is present but noise or ambiguity actually prevents a unique
+answer. A true verdict requires type=none; false requires non-none.
 
 User question:
 {query}
@@ -797,10 +846,8 @@ Private answer rubric:
 Current public evidence state and observations:
 {json.dumps(observation, ensure_ascii=False, indent=2, default=str)}
 
-Final mandatory check: Mem-Gallery query-to-memory speaker attribution is guaranteed by dataset construction and is
-outside this verifier's task. Do not evaluate or mention whether sanitized "User" matches a query-provided name.
-Evaluate only whether the evidence contains the requested factual content; a missing repeated speaker name cannot
-make evidence insufficient.
+Final check: query-to-memory speaker attribution is guaranteed by dataset construction. Evaluate factual support,
+not whether sanitized "User" repeats a query-provided name.
 """
 
 
@@ -834,7 +881,9 @@ def parse_state_verifier_feedback(
                     f"invalid missing_evidence_type: "
                     f"{payload.get('missing_evidence_type', payload.get('missing_type'))!r}"
                 )
-            missing_type = "none" if evidence_sufficient else ("no_public_evidence" if evidence_count <= 0 else "incomplete_coverage")
+            missing_type = "none" if evidence_sufficient else (
+                "no_public_evidence" if evidence_count <= 0 else "missing_factual_support"
+            )
 
         if evidence_count <= 0:
             evidence_sufficient = False
@@ -849,13 +898,13 @@ def parse_state_verifier_feedback(
             reason = reason or "The current public evidence is not relevant to the request."
         elif missing_type == "missing_neighbor_context" and not has_candidate_context:
             evidence_sufficient = False
-            missing_type = "incomplete_coverage"
+            missing_type = "missing_factual_support"
             reason = reason or "Need a relevant public candidate before neighboring context can help."
         elif evidence_sufficient and missing_type != "none":
             evidence_sufficient = False
             reason = reason or "The diagnostic says additional public evidence is still missing."
         elif not evidence_sufficient and missing_type == "none":
-            missing_type = "incomplete_coverage"
+            missing_type = "missing_factual_support"
             reason = reason or "Evidence is insufficient, so another tool action is required."
         elif evidence_sufficient:
             missing_type = "none"
@@ -908,20 +957,28 @@ def build_teacher_correction_prompt(
 Student output to correct:
 {student_raw_response}
 """
-    return f"""You are the OPD-MM teacher for one online correction. Produce exactly one next tool action for the
-student-visible state. You are not answering the question or using hidden memory. The output is an SFT target, so
-all arguments must be derivable from the question, public history, and public observation.
+    return f"""You are the OPD-MM action teacher for one student-visible state. Produce exactly one tool action.
+Apply this gate before considering the question modality or any tool description:
+- evidence_sufficient=true and no observation error: output STOP immediately. Every other tool, including
+  INSPECT_RAW for a visual question, is invalid.
+- evidence_sufficient=false: choose one non-STOP tool that addresses the diagnosed gap.
 
-Verifier feedback is a private diagnostic, not evidence. The verifier saw the answer rubric; you did not. Treat its
-missing_evidence_type as a description of the unresolved gap, not as an action command. Use evidence_sufficient as
-the termination gate: when false, choose a non-STOP tool that addresses the gap; when true and the observation has no
-error, choose STOP without an additional confirmation action. Do not copy verifier.reason or private content into any
-argument. A RETRIEVE.query may use only public question/history/observation text.
+You are not answering the question and do not see the gold answer. Verifier feedback is a private diagnostic, not
+evidence or an action command. All arguments must be derivable from the question, public history, and public
+observation. Do not copy verifier.reason or private content into an argument. A RETRIEVE.query may use only public
+question/history/observation text.
 
 Choose the schema-described tool whose effect addresses the gap and whose preconditions hold. Do not repeat an
-identical action when the latest observation is unchanged. Emit exactly one function call with no reasoning,
-markdown, JSON, hidden memory IDs, or unknown arguments. Public evidence_id values may be copied only into
-DROP.evidence_ids. The chat template supplies the tool descriptions and serialization.
+identical action when the latest observation is unchanged. DROP, SORT, and TOPK cannot recover a fact absent from
+the current candidates; use them only when removing noise or changing current-pool order/size resolves the gap.
+FILTER searches the complete hidden memory store and merges matching records into the working pool; it is not
+limited to currently visible evidence and does not remove unrelated items already in the pool. Use FILTER only when
+the question or public state provides a defensible modality, timestamp, or status condition. Never invent such a
+value. If the current pool is too broad, use DROP or TOPK as appropriate. If no metadata condition is supported and
+a semantic fact is missing, use RETRIEVE.
+Emit exactly one function call with no reasoning, markdown, JSON, hidden memory IDs, or unknown arguments. Public
+evidence_id values may be copied only into DROP.evidence_ids. The chat template supplies the tool descriptions and
+serialization.
 
 Question:
 {query}
@@ -1144,10 +1201,13 @@ def finalize_online_step_correction(
         last_drop_revision = int(observation.get("last_drop_revision") or 0)
         if evidence_revision <= last_drop_revision:
             return None
-    if teacher_action.tool == "STOP" and verifier_feedback and not bool(verifier_feedback.get("evidence_sufficient")):
-        # Do not turn a privileged STOP rejection into a synthetic action. The
-        # state is not a valid teacher target and must be excluded from SFT.
-        return None
+    if verifier_feedback:
+        evidence_sufficient = bool(verifier_feedback.get("evidence_sufficient"))
+        if (teacher_action.tool == "STOP") != evidence_sufficient:
+            # The verifier sufficiency bit is the termination gate. Do not
+            # synthesize a fallback when the teacher violates it; exclude the
+            # semantically invalid target from SFT instead.
+            return None
     example = {
         "sample_id": f"{sample_id}:step:{step_index}",
         "input": "",

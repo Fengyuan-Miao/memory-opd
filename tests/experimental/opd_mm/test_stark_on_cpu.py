@@ -136,3 +136,27 @@ def test_stark_assistant_image_stays_in_the_preceding_user_round(tmp_path):
     assert first_round[1].content == "Assistant shared an image."
     assert first_round[1].content != first_round[0].content
     assert first_round[1].raw_pointer == str(image.resolve())
+
+
+def test_stark_pure_image_round_does_not_duplicate_a_text_stub(tmp_path):
+    image = tmp_path / "pure-image.jpg"
+    image.write_bytes(b"image")
+    row = _row()
+    row["session1:speakers"] = json.dumps(["友理"])
+    row["session1:utterances"] = json.dumps([""])
+    row["session1:images_key"] = json.dumps(["pure-image"])
+    row["session1:image_descriptions"] = json.dumps(["A red bicycle"])
+
+    records = list(
+        iter_stark_row_records(
+            row,
+            source_row_index=7,
+            source_path="dataset/Stark/dialogue/stark.parquet",
+            local_images=discover_local_images(tmp_path),
+        )
+    )
+
+    assert len(records) == 1
+    assert records[0].modality == "image"
+    assert records[0].content == "User shared an image."
+    assert records[0].raw_pointer == str(image.resolve())

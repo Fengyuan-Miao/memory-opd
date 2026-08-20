@@ -93,6 +93,7 @@ class RemoteVLLMRawInspector:
     timeout: float = 60.0
     max_tokens: int = 256
     temperature: float = 0.0
+    bypass_proxy: bool | None = None
 
     def inspect(
         self,
@@ -201,7 +202,12 @@ class RemoteVLLMRawInspector:
 
     def _read_json(self, req: urllib_request.Request) -> dict[str, Any]:
         try:
-            with urllib_request.urlopen(req, timeout=float(self.timeout)) as response:
+            if self._should_bypass_proxy():
+                opener = urllib_request.build_opener(urllib_request.ProxyHandler({}))
+                response_context = opener.open(req, timeout=float(self.timeout))
+            else:
+                response_context = urllib_request.urlopen(req, timeout=float(self.timeout))
+            with response_context as response:
                 raw = response.read().decode("utf-8")
         except URLError as exc:
             raise RuntimeError(f"request to {req.full_url} failed: {exc}") from exc
@@ -211,3 +217,9 @@ class RemoteVLLMRawInspector:
         if not isinstance(parsed, dict):
             raise RuntimeError(f"unexpected JSON response from {req.full_url}: {type(parsed).__name__}")
         return parsed
+
+    def _should_bypass_proxy(self) -> bool:
+        if self.bypass_proxy is not None:
+            return bool(self.bypass_proxy)
+        configured = str(os.getenv("OPD_MM_RAW_INSPECTOR_BYPASS_PROXY") or "").strip().lower()
+        return configured in {"1", "true", "yes", "on"}

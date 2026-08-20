@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 import json
+import re
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -24,6 +25,7 @@ from verl.experimental.opd_mm.models import MemoryRecord
 
 MEM_GALLERY_DATASET = "mem_gallery"
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp"}
+MEMORY_IMAGE_ID_PATTERN = re.compile(r"^(D\d+)_IMG_(\d{3})$", re.IGNORECASE)
 
 
 def _load_json(path: Path) -> dict[str, Any]:
@@ -38,14 +40,41 @@ def _scenario_turn_id(scenario: str, round_id: str) -> str:
     return f"{scenario}:{round_id}"
 
 
+def _data_dir(dataset_root: Path) -> Path:
+    """Resolve both dataset/data/{dialog,image} and batch/{dialog,image} layouts."""
+    nested = dataset_root / "data"
+    if (nested / "dialog").is_dir():
+        return nested
+    return dataset_root
+
+
 def _resolve_image_path(dataset_root: Path, relative_path: str | None) -> str | None:
     if not relative_path:
         return None
     value = str(relative_path)
     if value.startswith("../image/"):
         value = value[len("../image/") :]
-    path = dataset_root / "data" / "image" / value
+    path = _data_dir(dataset_root) / "image" / value
     return str(path.resolve())
+
+
+def _string_list(value: Any) -> list[str]:
+    """Normalize fields that are serialized as either one value or a list."""
+
+    if value in (None, ""):
+        return []
+    if isinstance(value, (list, tuple)):
+        return [str(item) for item in value if item not in (None, "")]
+    return [str(value)]
+
+
+def _image_id_from_path(relative_path: str, fallback: str) -> str:
+    """Use the public MMem image ID encoded in a memory image filename."""
+
+    match = MEMORY_IMAGE_ID_PATTERN.fullmatch(Path(relative_path).stem)
+    if match:
+        return f"{match.group(1).upper()}:IMG_{match.group(2)}"
+    return fallback
 
 
 def _dialogue_text(round_data: dict[str, Any]) -> str:
@@ -96,7 +125,7 @@ def load_mem_gallery_records(dataset_root: str | Path) -> list[MemoryRecord]:
     """Convert Mem-Gallery dialogue rounds/images into OPD-MM memory records."""
     root = Path(dataset_root)
     records: list[MemoryRecord] = []
-    for scenario_file in sorted((root / "data" / "dialog").glob("*.json")):
+    for scenario_file in sorted((_data_dir(root) / "dialog").glob("*.json")):
         scenario = scenario_file.stem
         value = _load_json(scenario_file)
         profile = dict(value.get("character_profile") or {})
@@ -116,9 +145,9 @@ def load_mem_gallery_records(dataset_root: str | Path) -> list[MemoryRecord]:
                     round_data=round_data,
                     turn_index=turn_index,
                 )
-                image_ids = list(round_data.get("image_id") or [])
-                image_paths = list(round_data.get("input_image") or [])
-                image_captions = list(round_data.get("image_caption") or [])
+                image_ids = _string_list(round_data.get("image_id"))
+                image_paths = _string_list(round_data.get("input_image"))
+                image_captions = _string_list(round_data.get("image_caption"))
                 metadata.update(
                     {
                         "image_ids": image_ids,
@@ -150,7 +179,10 @@ def load_mem_gallery_records(dataset_root: str | Path) -> list[MemoryRecord]:
                     image_id = (
                         str(image_ids[image_index])
                         if image_index < len(image_ids)
-                        else f"{round_id}:IMG_{image_index + 1:03d}"
+                        else _image_id_from_path(
+                            relative_image,
+                            f"{round_id}:IMG_{image_index + 1:03d}",
+                        )
                     )
                     caption = (
                         str(image_captions[image_index])
@@ -189,7 +221,7 @@ def load_mem_gallery_qas(dataset_root: str | Path) -> list[dict[str, Any]]:
     """Load Mem-Gallery human annotated QAs with resolved support metadata."""
     root = Path(dataset_root)
     qas: list[dict[str, Any]] = []
-    for scenario_file in sorted((root / "data" / "dialog").glob("*.json")):
+    for scenario_file in sorted((_data_dir(root) / "dialog").glob("*.json")):
         scenario = scenario_file.stem
         value = _load_json(scenario_file)
         for index, qa in enumerate(value.get("human-annotated QAs", [])):

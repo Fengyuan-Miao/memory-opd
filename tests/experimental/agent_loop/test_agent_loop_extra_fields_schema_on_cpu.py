@@ -22,6 +22,7 @@ import pytest
 import torch
 from omegaconf import OmegaConf
 
+from verl import DataProto
 from verl.experimental.agent_loop.agent_loop import (
     AgentLoopMetrics,
     AgentLoopOutput,
@@ -30,7 +31,10 @@ from verl.experimental.agent_loop.agent_loop import (
     _InternalAgentLoopOutput,
 )
 from verl.experimental.agent_loop.single_turn_agent_loop import SingleTurnAgentLoop
-from verl.experimental.agent_loop.tool_agent_loop import build_tool_call_xml_span_mask
+from verl.experimental.agent_loop.tool_agent_loop import (
+    _opd_mm_distillation_mask,
+    build_tool_call_xml_span_mask,
+)
 from verl.utils.dataset.rl_dataset import RLHFDataset
 from verl.workers.rollout.replica import TokenOutput
 
@@ -68,6 +72,68 @@ class _FakeServerManager:
         response_ids = prompt_ids[-1:] + [21, 22]
         response_logprobs = [0.0] * len(response_ids)
         return response_ids, response_logprobs, False
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("do_sample", "expected"),
+    [
+        (True, {"temperature": 0.8, "top_p": 0.95, "top_k": -1}),
+        (False, {"temperature": 0, "top_p": 1.0, "top_k": -1}),
+    ],
+)
+async def test_agent_loop_validation_honors_do_sample(do_sample, expected) -> None:
+    captured: list[dict[str, Any]] = []
+
+    async def fake_run(sampling_params, trajectory, *, agent_name, trace=True, **kwargs):
+        del trajectory, agent_name, trace, kwargs
+        captured.append(dict(sampling_params))
+        return object()
+
+    worker = type("_Worker", (), {})()
+    worker.rollout_config = OmegaConf.create(
+        {
+            "temperature": 0.6,
+            "top_p": 0.9,
+            "top_k": 20,
+            "calculate_log_probs": False,
+            "val_kwargs": {
+                "do_sample": do_sample,
+                "temperature": 0.8,
+                "top_p": 0.95,
+                "top_k": -1,
+            },
+            "agent": {"default_agent_loop": "tool_agent"},
+        }
+    )
+    worker._run_agent_loop = fake_run
+    worker._postprocess = lambda outputs, **kwargs: (outputs, kwargs)
+    batch = DataProto.from_dict(
+        tensors={"input_ids": torch.tensor([[1]], dtype=torch.long)},
+        non_tensors={"index": np.array([0])},
+        meta_info={"validate": True, "global_steps": 3},
+    )
+
+    await AgentLoopWorker.generate_sequences(worker, batch)
+
+    assert len(captured) == 1
+    for key, value in expected.items():
+        assert captured[0][key] == value
+
+
+def test_opsd_supervises_only_serialized_tool_call_tokens(monkeypatch) -> None:
+    monkeypatch.setenv("OPD_MM_ONLINE_SUPERVISION_MODE", "opsd")
+    assert _opd_mm_distillation_mask(4, [0, 1, 1, 0]) == [0, 1, 1, 0]
+
+
+def test_opsd_bypasses_online_correction_sft_without_disabling_opd_routing(monkeypatch) -> None:
+    sample_kwargs = {"extra_info": {"opd_mm_online_self_distill": True}}
+    monkeypatch.setenv("OPD_MM_ONLINE_SUPERVISION_MODE", "opsd")
+
+    assert AgentLoopWorker._is_opd_mm_online_self_distill(sample_kwargs) is True
+    assert AgentLoopWorker._uses_opd_mm_correction_sft(sample_kwargs) is False
+    assert AgentLoopWorker._uses_opd_mm_state_opsd(sample_kwargs) is True
+    assert AgentLoopWorker._uses_opd_mm_online_state_supervision(sample_kwargs) is True
 
 
 class _FakeTokenizer:
@@ -334,6 +400,7 @@ async def test_agent_loop_extra_fields_schema_stable_for_training_concat_on_cpu(
         "max_global_steps",
         "extras",
         "opd_mm",
+        "opd_mm_prompt_state",
         "opd_mm_step_corrections",
     )
     for key in stable_keys:
@@ -346,6 +413,7 @@ async def test_agent_loop_extra_fields_schema_stable_for_training_concat_on_cpu(
     assert merged.non_tensor_batch["turn_scores"][0] == []
     assert merged.non_tensor_batch["tool_rewards"][0] == []
     assert merged.non_tensor_batch["opd_mm"][0] is None
+    assert merged.non_tensor_batch["opd_mm_prompt_state"][0] is None
     assert merged.non_tensor_batch["opd_mm_step_corrections"][0] is None
 
 
@@ -365,7 +433,10 @@ def test_agent_loop_postprocess_keeps_opd_mm_schema_stable_for_concat_on_cpu():
         output_response_ids=[3],
         output_response_mask=[1],
         metrics=AgentLoopMetrics(),
-        extra_fields={"opd_mm": {"pool_count": 1, "evidence_count": 0}},
+        extra_fields={
+            "opd_mm": {"pool_count": 1, "evidence_count": 0},
+            "opd_mm_prompt_state": {"action_history": [], "observation": {}},
+        },
         num_turns=2,
         prompt_len=2,
         response_len=2,
@@ -398,6 +469,12 @@ def test_agent_loop_postprocess_keeps_opd_mm_schema_stable_for_concat_on_cpu():
     assert merged.non_tensor_batch["opd_mm"].shape == (2,)
     assert merged.non_tensor_batch["opd_mm"][0] == {"pool_count": 1, "evidence_count": 0}
     assert merged.non_tensor_batch["opd_mm"][1] is None
+    assert merged.non_tensor_batch["opd_mm_prompt_state"].shape == (2,)
+    assert merged.non_tensor_batch["opd_mm_prompt_state"][0] == {
+        "action_history": [],
+        "observation": {},
+    }
+    assert merged.non_tensor_batch["opd_mm_prompt_state"][1] is None
     assert merged.non_tensor_batch["opd_mm_step_corrections"].shape == (2,)
     assert merged.non_tensor_batch["opd_mm_step_corrections"][0] is None
     assert merged.non_tensor_batch["opd_mm_step_corrections"][1] is None

@@ -28,6 +28,7 @@ and is designed to be fully replaceable by other agent frameworks such as:
 """
 
 import asyncio
+import json
 import logging
 import math
 import os
@@ -78,6 +79,103 @@ logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
 DEFAULT_ROUTING_CACHE_SIZE = 10000
+
+
+def _opd_mm_openai_chat_endpoint(base_url: str) -> str:
+    base = str(base_url or "").rstrip("/")
+    if base.endswith("/chat/completions"):
+        return base
+    if base.endswith("/v1"):
+        return f"{base}/chat/completions"
+    return f"{base}/v1/chat/completions"
+
+
+async def _opd_mm_remote_chat_completion(
+    *,
+    base_url: str,
+    model: str,
+    prompt: str,
+    sampling_params: dict[str, Any],
+    api_key: str = "",
+    timeout: float = 120.0,
+    retries: int = 3,
+) -> str:
+    """Call an OpenAI-compatible verifier without occupying the teacher pool."""
+    import aiohttp
+
+    payload = {
+        "model": model,
+        "messages": [
+            {"role": "system", "content": "You are a precise OPD-MM state verifier."},
+            {"role": "user", "content": prompt},
+        ],
+        "max_tokens": int(sampling_params.get("max_tokens", 256)),
+        "temperature": float(sampling_params.get("temperature", 0.0)),
+        "top_p": float(sampling_params.get("top_p", 1.0)),
+        "chat_template_kwargs": {"enable_thinking": False},
+    }
+    headers = {"Content-Type": "application/json"}
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+    client_timeout = aiohttp.ClientTimeout(total=float(timeout))
+    last_error: Exception | None = None
+    for attempt in range(max(1, int(retries))):
+        try:
+            async with aiohttp.ClientSession(timeout=client_timeout) as session:
+                async with session.post(
+                    _opd_mm_openai_chat_endpoint(base_url),
+                    json=payload,
+                    headers=headers,
+                ) as response:
+                    body = await response.text()
+                    if response.status >= 400:
+                        raise RuntimeError(f"verifier service HTTP {response.status}: {body[:400]}")
+                    parsed = json.loads(body)
+                    choices = parsed.get("choices") if isinstance(parsed, dict) else None
+                    if not choices or not isinstance(choices[0], dict):
+                        raise RuntimeError(f"verifier service returned no choices: {body[:400]}")
+                    message = choices[0].get("message") or {}
+                    content = message.get("content")
+                    if isinstance(content, list):
+                        content = "\n".join(
+                            str(item.get("text") or "")
+                            for item in content
+                            if isinstance(item, dict) and item.get("type") == "text"
+                        )
+                    content = str(content or "").strip()
+                    if not content:
+                        raise RuntimeError("verifier service returned empty content")
+                    return content
+        except (aiohttp.ClientError, asyncio.TimeoutError, json.JSONDecodeError, RuntimeError) as exc:
+            last_error = exc
+            if isinstance(exc, RuntimeError) and "HTTP 4" in str(exc):
+                break
+        if attempt + 1 < max(1, int(retries)):
+            await asyncio.sleep(min(2**attempt, 4))
+    raise RuntimeError(f"verifier request failed after {max(1, int(retries))} attempts: {last_error}")
+
+
+def _agent_loop_worker_runtime_env(worker_index: int) -> Optional[dict[str, dict[str, str]]]:
+    """Return an opt-in CUDA assignment for a GPU-backed tool worker.
+
+    Agent-loop workers do not request Ray GPU resources because inference GPUs
+    are already reserved by colocated rollout workers. Ray consequently hides
+    CUDA from them by default. Experiments that intentionally colocate a tool
+    model can provide a comma-separated list of physical device identifiers in
+    ``VERL_AGENT_LOOP_WORKER_CUDA_DEVICES``; workers are assigned round-robin.
+    """
+
+    raw_devices = os.getenv("VERL_AGENT_LOOP_WORKER_CUDA_DEVICES", "")
+    devices = [device.strip() for device in raw_devices.split(",") if device.strip()]
+    if not devices:
+        return None
+    return {
+        "env_vars": {
+            "CUDA_VISIBLE_DEVICES": devices[worker_index % len(devices)],
+            # Preserve the explicit CUDA assignment for this zero-GPU Ray actor.
+            "RAY_ACCEL_ENV_VAR_OVERRIDE_ON_ZERO": "0",
+        }
+    }
 
 
 class AgentLoopMetrics(BaseModel):
@@ -612,9 +710,12 @@ class AgentLoopWorker:
 
         # override sampling params for validation
         if validate:
-            sampling_params["top_p"] = config.val_kwargs.top_p
-            sampling_params["top_k"] = config.val_kwargs.top_k
-            sampling_params["temperature"] = config.val_kwargs.temperature
+            if bool(config.val_kwargs.do_sample):
+                sampling_params["top_p"] = config.val_kwargs.top_p
+                sampling_params["top_k"] = config.val_kwargs.top_k
+                sampling_params["temperature"] = config.val_kwargs.temperature
+            else:
+                apply_greedy_sampling_params(sampling_params)
 
         # by default, we assume it's a single turn agent
         if "agent_name" not in batch.non_tensor_batch:
@@ -719,8 +820,8 @@ class AgentLoopWorker:
         validate: bool,
         sample_kwargs: dict[str, Any],
     ) -> Optional[Any]:
-        """Create an async callback that corrects each live OPD-MM state."""
-        if validate or not self.distillation_enabled or not self._is_opd_mm_online_self_distill(sample_kwargs):
+        """Create an async callback that supervises each live OPD-MM action state."""
+        if validate or not self.distillation_enabled or not self._uses_opd_mm_online_state_supervision(sample_kwargs):
             return None
 
         async def correct(state_payload: dict[str, Any]) -> Optional[dict[str, Any]]:
@@ -930,29 +1031,63 @@ class AgentLoopWorker:
         multi_modal_data = state_payload.get("multi_modal_data") or {}
         mm_processor_kwargs = state_payload.get("mm_processor_kwargs") or {}
 
-        verifier_prompt_ids = self._encode_opd_mm_teacher_prompt(request["verifier_prompt"])
-        verifier_response_ids = await self.teacher_server_manager.generate_teacher_response_single(
-            prompt_ids=verifier_prompt_ids,
-            sampling_params=verifier_sampling_params,
-            multi_modal_data=multi_modal_data,
-            mm_processor_kwargs=mm_processor_kwargs,
-            routing_key=routing_key,
-        )
-        verifier_raw_response = self.tokenizer.decode(verifier_response_ids, skip_special_tokens=False)
+        verifier_base_url = str(
+            verifier_kwargs.get("base_url") or os.getenv("OPD_MM_VERIFIER_BASE_URL") or ""
+        ).strip()
+        if verifier_base_url:
+            verifier_model = str(
+                verifier_kwargs.get("model") or os.getenv("OPD_MM_VERIFIER_MODEL") or ""
+            ).strip()
+            if not verifier_model:
+                logger.warning("OPD-MM remote verifier is enabled without OPD_MM_VERIFIER_MODEL; dropping correction")
+                return None
+            try:
+                verifier_raw_response = await _opd_mm_remote_chat_completion(
+                    base_url=verifier_base_url,
+                    model=verifier_model,
+                    prompt=request["verifier_prompt"],
+                    sampling_params=verifier_sampling_params,
+                    api_key=str(
+                        verifier_kwargs.get("api_key") or os.getenv("OPD_MM_VERIFIER_API_KEY") or ""
+                    ),
+                    timeout=float(
+                        verifier_kwargs.get("timeout") or os.getenv("OPD_MM_VERIFIER_TIMEOUT") or 120.0
+                    ),
+                    retries=int(
+                        verifier_kwargs.get("retries") or os.getenv("OPD_MM_VERIFIER_RETRIES") or 3
+                    ),
+                )
+            except Exception as exc:
+                logger.warning("OPD-MM remote verifier failed; dropping correction: %s", exc)
+                return None
+        else:
+            verifier_prompt_ids = self._encode_opd_mm_teacher_prompt(request["verifier_prompt"])
+            verifier_response_ids = await self.teacher_server_manager.generate_teacher_response_single(
+                prompt_ids=verifier_prompt_ids,
+                sampling_params=verifier_sampling_params,
+                multi_modal_data=multi_modal_data,
+                mm_processor_kwargs=mm_processor_kwargs,
+                routing_key=routing_key,
+            )
+            verifier_raw_response = self.tokenizer.decode(verifier_response_ids, skip_special_tokens=False)
         verifier_feedback = parse_state_verifier_feedback(
             verifier_raw_response,
             request.get("observation", {}),
             gold_answer=str(request.get("gold_answer", "")),
             query=str(request.get("query", "")),
         )
+        if verifier_feedback.get("parse_error"):
+            logger.warning(
+                "OPD-MM verifier output was invalid; dropping correction: %s",
+                verifier_feedback.get("parse_error"),
+            )
+            return None
         request["verifier_raw_response"] = verifier_raw_response
         request["verifier_feedback"] = verifier_feedback
-        independent_teacher_action = str(os.getenv("OPD_MM_KL_CREDIT_ASSIGNMENT") or "").lower() in {
-            "1",
-            "true",
-            "yes",
-            "on",
-        }
+        state_opsd = AgentLoopWorker._uses_opd_mm_state_opsd(sample_kwargs)
+        independent_teacher_action = state_opsd or str(
+            os.getenv("OPD_MM_KL_CREDIT_ASSIGNMENT") or ""
+        ).lower() in {"1", "true", "yes", "on"}
         request["teacher_prompt"] = build_teacher_correction_prompt(
             query=request.get("query", ""),
             history=request.get("history", []),
@@ -978,15 +1113,6 @@ class AgentLoopWorker:
         teacher_prompt_ids = self._encode_opd_mm_teacher_prompt(
             request["teacher_prompt"], tools=teacher_tool_schemas
         )
-        teacher_response_task = asyncio.create_task(
-            self.teacher_server_manager.generate_teacher_response_single(
-                prompt_ids=teacher_prompt_ids,
-                sampling_params=teacher_sampling_params,
-                multi_modal_data=multi_modal_data,
-                mm_processor_kwargs=mm_processor_kwargs,
-                routing_key=routing_key,
-            )
-        )
         kl_credit_task = asyncio.create_task(
             AgentLoopWorker._compute_opd_mm_state_kl_credit(
                 self,
@@ -997,10 +1123,42 @@ class AgentLoopWorker:
                 routing_key=routing_key,
             )
         )
-        teacher_response_ids, kl_credit = await asyncio.gather(teacher_response_task, kl_credit_task)
-        teacher_raw_response = self.tokenizer.decode(teacher_response_ids, skip_special_tokens=False)
-        correction = finalize_online_step_correction(request, teacher_raw_response=teacher_raw_response)
-        if correction is not None and kl_credit is not None:
+        if state_opsd:
+            # State OPSD only needs the teacher distribution under the
+            # privileged prefix. Generating a second XML action is correction
+            # SFT work, and coupling it here made malformed teacher XML discard
+            # otherwise valid logits.
+            kl_credit = await kl_credit_task
+            teacher_raw_response = ""
+            correction = {
+                "request_id": request.get("request_id", ""),
+                "sample_id": request.get("sample_id", ""),
+                "step_index": int(request.get("step_index") or 0),
+                "history": request.get("history", []),
+                "observation": request.get("observation", {}),
+                "feedback": verifier_feedback,
+                "teacher_actions": [],
+                "student_next_action": request.get("student_next_action"),
+                "teacher_raw_response": "",
+                "verifier_raw_response": request.get("verifier_raw_response", ""),
+                "verifier_feedback": verifier_feedback,
+                "opsd_only": True,
+                "kl_credit": kl_credit,
+            }
+        else:
+            teacher_response_task = asyncio.create_task(
+                self.teacher_server_manager.generate_teacher_response_single(
+                    prompt_ids=teacher_prompt_ids,
+                    sampling_params=teacher_sampling_params,
+                    multi_modal_data=multi_modal_data,
+                    mm_processor_kwargs=mm_processor_kwargs,
+                    routing_key=routing_key,
+                )
+            )
+            teacher_response_ids, kl_credit = await asyncio.gather(teacher_response_task, kl_credit_task)
+            teacher_raw_response = self.tokenizer.decode(teacher_response_ids, skip_special_tokens=False)
+            correction = finalize_online_step_correction(request, teacher_raw_response=teacher_raw_response)
+        if correction is not None and kl_credit is not None and not state_opsd:
             from verl.experimental.opd_mm.kl_credit import structured_action_disagreement
 
             teacher_actions = correction.get("teacher_actions") or []
@@ -1253,7 +1411,7 @@ class AgentLoopWorker:
         )
         await self._compute_score([output], kwargs=kwargs)
         if (
-            not AgentLoopWorker._is_opd_mm_online_self_distill(kwargs)
+            not AgentLoopWorker._uses_opd_mm_online_state_supervision(kwargs)
             and "opd_mm_step_corrections" not in output.extra_fields
         ):
             await self._compute_teacher_logprobs(
@@ -1498,14 +1656,13 @@ class AgentLoopWorker:
                         build_teacher_privileged_prompt,
                         should_use_teacher_privilege,
                     )
+                    from verl.experimental.opd_mm.tools import openai_tool_schemas
 
                     if should_use_teacher_privilege(sample_kwargs):
                         teacher_prompt = build_teacher_privileged_prompt(sample_kwargs, output.extra_fields)
-                        teacher_prompt_ids = normalize_token_ids(
-                            self.tokenizer(
-                                teacher_prompt,
-                                add_special_tokens=False,
-                            )["input_ids"]
+                        teacher_prompt_ids = self._encode_opd_mm_teacher_prompt(
+                            teacher_prompt,
+                            tools=openai_tool_schemas(),
                         )
                         sequence_ids = teacher_prompt_ids + response_ids
                         teacher_prompt_length = len(teacher_prompt_ids)
@@ -1560,6 +1717,40 @@ class AgentLoopWorker:
                 except Exception:
                     pass
         return isinstance(extra_info, dict) and bool(extra_info.get("opd_mm_online_self_distill"))
+
+    @staticmethod
+    def _uses_opd_mm_correction_sft(sample_kwargs: Optional[dict[str, Any]]) -> bool:
+        """Return whether OPD-MM should generate correction targets.
+
+        Existing OPD runs default to correction SFT. ``opsd`` instead scores
+        the student's sampled trajectory with privileged teacher logits, so it
+        must bypass correction generation without disabling the OPD-MM teacher
+        routing used by INSPECT_RAW.
+        """
+        mode = str(os.getenv("OPD_MM_ONLINE_SUPERVISION_MODE") or "correction_sft").strip().lower()
+        if mode in {"opsd", "logits", "logit_distillation"}:
+            return False
+        if mode not in {"correction_sft", "sft"}:
+            raise ValueError(
+                "OPD_MM_ONLINE_SUPERVISION_MODE must be one of "
+                "{correction_sft,sft,opsd,logits,logit_distillation}"
+            )
+        return AgentLoopWorker._is_opd_mm_online_self_distill(sample_kwargs)
+
+    @staticmethod
+    def _uses_opd_mm_state_opsd(sample_kwargs: Optional[dict[str, Any]]) -> bool:
+        """Return whether OPD-MM should collect per-state privileged logits."""
+        mode = str(os.getenv("OPD_MM_ONLINE_SUPERVISION_MODE") or "correction_sft").strip().lower()
+        if mode not in {"opsd", "logits", "logit_distillation"}:
+            return False
+        return AgentLoopWorker._is_opd_mm_online_self_distill(sample_kwargs)
+
+    @staticmethod
+    def _uses_opd_mm_online_state_supervision(sample_kwargs: Optional[dict[str, Any]]) -> bool:
+        """Return whether the live state callback is required for this sample."""
+        return AgentLoopWorker._uses_opd_mm_correction_sft(
+            sample_kwargs
+        ) or AgentLoopWorker._uses_opd_mm_state_opsd(sample_kwargs)
 
     def _postprocess(
         self,
@@ -1649,6 +1840,7 @@ class AgentLoopWorker:
             # batch size 48".
             "opd_mm",
             "opd_mm_policy_states",
+            "opd_mm_prompt_state",
             "opd_mm_step_corrections",
         }
         all_keys = set(key for input_item in inputs for key in input_item.extra_fields) | default_extra_keys
@@ -1741,13 +1933,17 @@ class AgentLoopManager:
         for i in range(num_workers):
             # Round-robin scheduling over the all nodes
             node_id = node_ids[i % len(node_ids)]
+            worker_options: dict[str, Any] = {
+                "name": f"agent_loop_worker_{i}_{uuid4().hex[:8]}",
+                "scheduling_strategy": ray.util.scheduling_strategies.NodeAffinitySchedulingStrategy(
+                    node_id=node_id, soft=True
+                ),
+            }
+            runtime_env = _agent_loop_worker_runtime_env(i)
+            if runtime_env is not None:
+                worker_options["runtime_env"] = runtime_env
             self.agent_loop_workers.append(
-                self.agent_loop_workers_class.options(
-                    name=f"agent_loop_worker_{i}" + f"_{uuid4().hex[:8]}",
-                    scheduling_strategy=ray.util.scheduling_strategies.NodeAffinitySchedulingStrategy(
-                        node_id=node_id, soft=True
-                    ),
-                ).remote(
+                self.agent_loop_workers_class.options(**worker_options).remote(
                     self.config,
                     self.llm_client,
                     self.teacher_client,

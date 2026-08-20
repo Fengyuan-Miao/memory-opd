@@ -840,8 +840,8 @@ class OPDFilterTool(OPDBaseTool):
         "op": _property("string", "The comparison operator.", sorted(FILTER_OPS)),
         "value": _property(
             ["string", "number", "boolean"],
-            "Allowed values by field: modality uses text or image; source_type uses dialogue_turn or "
-            "dialogue_image; status uses active; timestamp uses a public YYYY-MM-DD date or timestamp. "
+            "Allowed values by field: modality uses text or image; status uses active; timestamp uses a public "
+            "YYYY-MM-DD date or timestamp. "
             "Do not use memory IDs.",
         ),
     }
@@ -869,7 +869,8 @@ class OPDRetrieveTool(OPDBaseTool):
     tool_name = "retrieve"
     description = (
         "Rank hidden memories against the original user query or an optional rewritten query. "
-        "Always searches the original hidden memory store and replaces the working pool."
+        "Always searches the original hidden memory store and fuses deduplicated results into the bounded working "
+        "pool. Memories supported by multiple retrieval steps are prioritized."
     )
     properties = {
         "method": _property(
@@ -945,7 +946,7 @@ class OPDInspectRawTool(OPDBaseTool):
         agent_data = kwargs.get("agent_data")
         runtime = self._runtime(agent_data)
         backend = _optional_str(
-            runtime.get("raw_inspector_backend") or os.getenv("OPD_MM_RAW_INSPECTOR_BACKEND")
+            os.getenv("OPD_MM_RAW_INSPECTOR_BACKEND") or runtime.get("raw_inspector_backend")
         ).lower()
         if backend != "teacher":
             return await super().execute(instance_id, parameters, **kwargs)

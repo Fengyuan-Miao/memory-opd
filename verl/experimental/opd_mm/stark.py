@@ -362,6 +362,9 @@ def iter_stark_row_records(
             round_content = "\n".join(
                 message["content"] for message in messages_in_round if message["content"]
             )
+            has_dialogue_text = any(
+                bool(message["utterance"].strip()) for message in messages_in_round
+            )
             image_messages = [message for message in messages_in_round if message["has_image"]]
             user_messages = [message for message in messages_in_round if message["role"] == "user"]
             common_metadata: dict[str, Any] = {
@@ -396,17 +399,18 @@ def iter_stark_row_records(
                 ],
                 "image_captions": [message["image_description"] for message in image_messages],
             }
-            yield MemoryRecord(
-                memory_id=f"{STARK_DATASET}:{scenario}:{session_id}_R{round_index:04d}:text",
-                turn_id=turn_id,
-                timestamp=timestamp,
-                author="dialogue",
-                modality="text",
-                source_type="dialogue_turn",
-                summary=_summary(round_content),
-                content=round_content,
-                metadata=dict(common_metadata),
-            )
+            if has_dialogue_text:
+                yield MemoryRecord(
+                    memory_id=f"{STARK_DATASET}:{scenario}:{session_id}_R{round_index:04d}:text",
+                    turn_id=turn_id,
+                    timestamp=timestamp,
+                    author="dialogue",
+                    modality="text",
+                    source_type="dialogue_turn",
+                    summary=_summary(round_content),
+                    content=round_content,
+                    metadata=dict(common_metadata),
+                )
 
             for image_index, message in enumerate(image_messages, start=1):
                 metadata = dict(common_metadata)
@@ -486,6 +490,8 @@ def build_stark_memory_store(
     max_episodes: int | None = None,
     batch_size: int = 128,
     max_image_rank: int = 4,
+    episode_ids_path: str | Path | None = None,
+    drop_missing_images: bool = False,
     overwrite: bool = False,
 ) -> dict[str, Any]:
     """Build a streaming STARK ``records.jsonl`` compatible with Mem-Gallery."""
@@ -497,9 +503,21 @@ def build_stark_memory_store(
     output = Path(output_dir)
     output.mkdir(parents=True, exist_ok=True)
     records_path = output / "records.jsonl"
-    episode_ids_path = output / "episode_ids.txt"
+    output_episode_ids_path = output / "episode_ids.txt"
     manifest_path = output / "manifest.json"
-    existing = [path for path in (records_path, episode_ids_path, manifest_path) if path.exists()]
+    episode_ids_source = Path(episode_ids_path) if episode_ids_path is not None else None
+    episode_allowlist = (
+        {
+            value.strip()
+            for value in episode_ids_source.read_text(encoding="utf-8").splitlines()
+            if value.strip()
+        }
+        if episode_ids_source is not None
+        else None
+    )
+    existing = [
+        path for path in (records_path, output_episode_ids_path, manifest_path) if path.exists()
+    ]
     if existing and not overwrite:
         raise FileExistsError(
             f"Output already exists ({', '.join(str(path) for path in existing)}); pass --overwrite to replace it."
@@ -513,13 +531,15 @@ def build_stark_memory_store(
         with records_tmp.open("w", encoding="utf-8") as handle:
             for source_row_index, row in _iter_parquet_rows(source, batch_size=batch_size):
                 counts["source_episode_count"] += 1
+                conversation_id = _decode_unicode_escapes(row.get("index"))
+                if episode_allowlist is not None and conversation_id not in episode_allowlist:
+                    continue
                 if selection == "local_image_overlap" and not stark_row_has_local_image(
                     row,
                     local_images,
                     max_image_rank=max_image_rank,
                 ):
                     continue
-                conversation_id = _decode_unicode_escapes(row.get("index"))
                 selected_ids.append(conversation_id)
                 counts["episode_count"] += 1
                 for record in iter_stark_row_records(
@@ -529,6 +549,9 @@ def build_stark_memory_store(
                     local_images=local_images,
                     max_image_rank=max_image_rank,
                 ):
+                    if record.modality == "image" and not record.raw_pointer and drop_missing_images:
+                        counts["dropped_missing_image_record_count"] += 1
+                        continue
                     handle.write(json.dumps(record.to_dict(include_internal_id=True), ensure_ascii=False) + "\n")
                     counts["record_count"] += 1
                     counts[f"{record.modality}_record_count"] += 1
@@ -548,7 +571,9 @@ def build_stark_memory_store(
         records_tmp.unlink(missing_ok=True)
         raise
 
-    episode_ids_path.write_text("".join(f"{value}\n" for value in selected_ids), encoding="utf-8")
+    output_episode_ids_path.write_text(
+        "".join(f"{value}\n" for value in selected_ids), encoding="utf-8"
+    )
     manifest = {
         "dataset": STARK_DATASET,
         "dialogue_parquet": str(source.resolve()),
@@ -562,10 +587,15 @@ def build_stark_memory_store(
         "selection": selection,
         "max_episodes": max_episodes,
         "max_image_rank": max_image_rank,
+        "episode_ids_source": (
+            str(episode_ids_source.resolve()) if episode_ids_source is not None else None
+        ),
+        "episode_allowlist_count": len(episode_allowlist) if episode_allowlist is not None else None,
+        "drop_missing_images": drop_missing_images,
         "local_image_file_count": len(local_images),
         **dict(counts),
         "records_path": str(records_path.resolve()),
-        "episode_ids_path": str(episode_ids_path.resolve()),
+        "episode_ids_path": str(output_episode_ids_path.resolve()),
         "indexes": {},
     }
     manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
@@ -591,6 +621,15 @@ def _build_parser() -> argparse.ArgumentParser:
         default=4,
         help="Only materialize a local image when it is within the top-ranked candidates (zero based).",
     )
+    parser.add_argument(
+        "--episode-ids",
+        help="Optional newline-delimited episode allowlist used to reproduce an existing subset.",
+    )
+    parser.add_argument(
+        "--drop-missing-images",
+        action="store_true",
+        help="Do not emit image records whose selected image is unavailable locally.",
+    )
     parser.add_argument("--overwrite", action="store_true")
     return parser
 
@@ -605,6 +644,8 @@ def main(argv: Iterable[str] | None = None) -> None:
         max_episodes=args.max_episodes,
         batch_size=args.batch_size,
         max_image_rank=args.max_image_rank,
+        episode_ids_path=args.episode_ids,
+        drop_missing_images=args.drop_missing_images,
         overwrite=args.overwrite,
     )
     print(json.dumps(manifest, ensure_ascii=False, indent=2))
