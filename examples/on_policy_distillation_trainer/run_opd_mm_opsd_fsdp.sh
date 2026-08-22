@@ -187,6 +187,7 @@ case "${START_OUTCOME_SERVER,,}" in
             --max-model-len "$OUTCOME_SERVER_MAX_MODEL_LEN" \
             --max-num-seqs "$OUTCOME_SERVER_MAX_NUM_SEQS" \
             --max-num-batched-tokens "$OUTCOME_SERVER_MAX_NUM_BATCHED_TOKENS" \
+            --disable-custom-all-reduce \
             --limit-mm-per-prompt '{"image":2}' \
             --enable-auto-tool-choice \
             --tool-call-parser qwen3_coder \

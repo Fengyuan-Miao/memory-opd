@@ -50,9 +50,6 @@ export OUTCOME_SERVER_GPU_MEMORY_UTIL=${OUTCOME_SERVER_GPU_MEMORY_UTIL:-0.80}
 export OUTCOME_SERVER_MAX_MODEL_LEN=${OUTCOME_SERVER_MAX_MODEL_LEN:-40000}
 export OUTCOME_SERVER_MAX_NUM_SEQS=${OUTCOME_SERVER_MAX_NUM_SEQS:-32}
 export OUTCOME_SERVER_MAX_NUM_BATCHED_TOKENS=${OUTCOME_SERVER_MAX_NUM_BATCHED_TOKENS:-32768}
-# Leave contiguous headroom for multimodal forward passes and reduce allocator
-# fragmentation without truncating prompts or lowering the model context limit.
-export PYTORCH_CUDA_ALLOC_CONF=${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}
 export OPD_MM_VERIFIER_BASE_URL="$OUTCOME_SERVER_BASE_URL"
 export OPD_MM_VERIFIER_MODEL="$OUTCOME_SERVED_MODEL"
 export NO_PROXY="${NO_PROXY:+$NO_PROXY,}127.0.0.1,localhost"
