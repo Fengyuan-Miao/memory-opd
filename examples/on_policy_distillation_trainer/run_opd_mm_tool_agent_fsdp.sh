@@ -11,6 +11,11 @@ cd "$REPO_ROOT"
 RUN_TIMESTAMP=${RUN_TIMESTAMP:-$(date +%Y%m%d_%H%M%S)}
 WANDB_MODE=${WANDB_MODE:-online}
 WANDB_DISABLE_STATS=${WANDB_DISABLE_STATS:-True}
+WANDB_VAL_CASES=${WANDB_VAL_CASES:-4}
+export WANDB_CONSOLE=${WANDB_CONSOLE:-off}
+export WANDB_DISABLE_CODE=${WANDB_DISABLE_CODE:-true}
+export WANDB_SAVE_CODE=${WANDB_SAVE_CODE:-false}
+export WANDB_LOG_MODEL=${WANDB_LOG_MODEL:-false}
 WANDB_PROXY=${WANDB_PROXY:-}
 WANDB_PROXY_FALLBACK=${WANDB_PROXY_FALLBACK:-http://127.0.0.1:7896}
 WANDB_CONNECTIVITY_TIMEOUT=${WANDB_CONNECTIVITY_TIMEOUT:-5}
@@ -24,7 +29,10 @@ if [[ "${WANDB_MODE,,}" == "online" && -z "$WANDB_PROXY" ]] \
     fi
 fi
 export WANDB_MODE
-WANDB_TRAINER_ARGS=(+trainer.wandb_disable_stats=${WANDB_DISABLE_STATS})
+WANDB_TRAINER_ARGS=(
+    +trainer.wandb_disable_stats=${WANDB_DISABLE_STATS}
+    '+trainer.wandb_metric_include_patterns=["^(actor|critic|distillation)/.*loss$","^val-aux/.*/opd_mm/(answer_correct|evidence_answerable|evidence_count|action_count|repeated_actions|max_actions_reached|empty_evidence|trajectory_error|answer_request_failed|judge_request_failed|evidence_judge_request_failed)/mean@.*$","^training/(global_step|epoch)$"]'
+)
 if [[ -n "$WANDB_PROXY" ]]; then
     WANDB_TRAINER_ARGS+=(+trainer.wandb_proxy="$WANDB_PROXY")
 fi
@@ -45,7 +53,7 @@ TEACHER_NGPUS=${TEACHER_NGPUS:-2}
 
 distillation_loss_mode=${DISTILLATION_LOSS_MODE:-k1}
 use_policy_gradient=${USE_POLICY_GRADIENT:-True}
-distillation_topk=${DISTILLATION_TOPK:-64}
+distillation_topk=${DISTILLATION_TOPK:-50}
 
 per_gpu_batch_size=${PER_GPU_BATCH_SIZE:-8}
 train_batch_size=${TRAIN_BATCH_SIZE:-$(( NGPUS_PER_NODE * per_gpu_batch_size ))}
@@ -193,6 +201,7 @@ TRAINER=(
     trainer.use_v1=False
     trainer.balance_batch=True
     trainer.logger='["console","wandb"]'
+    trainer.log_val_generations=${WANDB_VAL_CASES}
     trainer.project_name=${project_name}
     trainer.experiment_name=${experiment_name}
     trainer.n_gpus_per_node=${NGPUS_PER_NODE}

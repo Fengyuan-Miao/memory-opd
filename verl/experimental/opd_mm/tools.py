@@ -15,13 +15,14 @@
 """verl-native tool adapters for the OPD-MM hidden-memory executor.
 
 These tools keep per-trajectory state through the agent_data object supplied by
-ToolAgentLoop. That lets FILTER, SORT, TOPK, RETRIEVE, EXPAND_NEIGHBORS, DROP,
-INSPECT_RAW, and STOP share one bounded working evidence pool
-while still exposing OpenAI function schemas to verl.
+ToolAgentLoop. FILTER, RETRIEVE, and EXPAND_NEIGHBORS build a bounded,
+high-recall candidate pool. A fixed model-based semantic layer then selects
+the smaller answer-evidence view exposed to the policy.
 """
 
 from __future__ import annotations
 
+import inspect
 import json
 import os
 from dataclasses import dataclass, field
@@ -33,6 +34,7 @@ from verl.experimental.opd_mm.executor import DEFAULT_MAX_POOL_SIZE, ToolExecuto
 from verl.experimental.opd_mm.models import EvidenceItem, ExecutionStep, MemoryRecord, PoolItem, ToolAction
 from verl.experimental.opd_mm.raw_inspector import DEFAULT_RAW_INSPECTOR_URL, RemoteVLLMRawInspector
 from verl.experimental.opd_mm.retrieval import HiddenMemoryStore, TurnAwareHybridRetriever
+from verl.experimental.opd_mm.semantic_selector import RemoteSemanticEvidenceSelector, SemanticSelection
 from verl.experimental.opd_mm.schema import (
     DEFAULT_MAX_ACTIONS,
     EXPAND_NEIGHBOR_WINDOWS,
@@ -41,8 +43,6 @@ from verl.experimental.opd_mm.schema import (
     INSPECT_INSTRUCTIONS,
     INSPECT_TARGETS,
     RETRIEVAL_METHODS,
-    SORT_FIELDS,
-    SORT_ORDERS,
     TrajectoryValidator,
 )
 from verl.tools.base_tool import BaseTool
@@ -56,6 +56,8 @@ DEFAULT_VISION_MODEL_PATH = "/home/miaofy/data/pretrained_models/SigLIP-Base-Pat
 DEFAULT_HYBRID_MODEL_PATH = "/home/miaofy/data/pretrained_models/gme-Qwen2-VL-2B-Instruct"
 DEFAULT_RAW_INSPECTOR_TIMEOUT = 60.0
 DEFAULT_RAW_INSPECTOR_MAX_TOKENS = 256
+DEFAULT_EVIDENCE_SELECTOR_TIMEOUT = 120.0
+DEFAULT_EVIDENCE_SELECTOR_MAX_TOKENS = 512
 OBSERVATION_TEXT_MAX_CHARS = 220
 
 
@@ -131,11 +133,85 @@ def _raw_inspector_from_runtime(runtime: dict[str, Any]) -> Any:
         return None
     return _cached_remote_raw_inspector(
         base_url,
-        _optional_str(runtime.get("raw_inspector_model")) or _optional_str(os.getenv("OPD_MM_RAW_INSPECTOR_MODEL")),
-        _optional_str(runtime.get("raw_inspector_api_key")) or _optional_str(os.getenv("OPD_MM_RAW_INSPECTOR_API_KEY")),
-        float(runtime.get("raw_inspector_timeout") or os.getenv("OPD_MM_RAW_INSPECTOR_TIMEOUT") or DEFAULT_RAW_INSPECTOR_TIMEOUT),
-        int(runtime.get("raw_inspector_max_tokens") or os.getenv("OPD_MM_RAW_INSPECTOR_MAX_TOKENS") or DEFAULT_RAW_INSPECTOR_MAX_TOKENS),
+        _optional_str(runtime.get("raw_inspector_model"))
+        or _optional_str(os.getenv("OPD_MM_RAW_INSPECTOR_MODEL")),
+        _optional_str(runtime.get("raw_inspector_api_key"))
+        or _optional_str(os.getenv("OPD_MM_RAW_INSPECTOR_API_KEY")),
+        float(
+            runtime.get("raw_inspector_timeout")
+            or os.getenv("OPD_MM_RAW_INSPECTOR_TIMEOUT")
+            or DEFAULT_RAW_INSPECTOR_TIMEOUT
+        ),
+        int(
+            runtime.get("raw_inspector_max_tokens")
+            or os.getenv("OPD_MM_RAW_INSPECTOR_MAX_TOKENS")
+            or DEFAULT_RAW_INSPECTOR_MAX_TOKENS
+        ),
         float(runtime.get("raw_inspector_temperature") or os.getenv("OPD_MM_RAW_INSPECTOR_TEMPERATURE") or 0.0),
+    )
+
+
+@lru_cache(maxsize=16)
+def _cached_remote_evidence_selector(
+    base_url: str,
+    model: str,
+    api_key: str,
+    timeout: float,
+    max_tokens: int,
+    retries: int,
+) -> RemoteSemanticEvidenceSelector:
+    return RemoteSemanticEvidenceSelector(
+        base_url=base_url,
+        model=model,
+        api_key=api_key,
+        timeout=timeout,
+        max_tokens=max_tokens,
+        retries=retries,
+    )
+
+
+def _evidence_selector_from_runtime(runtime: dict[str, Any]) -> Any:
+    if runtime.get("evidence_selector") is not None:
+        return runtime["evidence_selector"]
+    if not bool(runtime.get("semantic_evidence_selection", True)):
+        return None
+    backend = _optional_str(
+        os.getenv("OPD_MM_EVIDENCE_SELECTOR_BACKEND") or runtime.get("evidence_selector_backend")
+    ).lower()
+    if backend == "teacher":
+        return None
+    base_url = (
+        _optional_str(runtime.get("evidence_selector_base_url"))
+        or _optional_str(os.getenv("OPD_MM_EVIDENCE_SELECTOR_BASE_URL"))
+        or _optional_str(os.getenv("OPD_MM_VERIFIER_BASE_URL"))
+        or _optional_str(os.getenv("OPD_MM_OUTCOME_BASE_URL"))
+    )
+    model = (
+        _optional_str(runtime.get("evidence_selector_model"))
+        or _optional_str(os.getenv("OPD_MM_EVIDENCE_SELECTOR_MODEL"))
+        or _optional_str(os.getenv("OPD_MM_VERIFIER_MODEL"))
+        or _optional_str(os.getenv("OPD_MM_OUTCOME_MODEL"))
+        or _optional_str(os.getenv("OUTCOME_SERVED_MODEL"))
+    )
+    if not base_url or not model:
+        return None
+    return _cached_remote_evidence_selector(
+        base_url,
+        model,
+        _optional_str(runtime.get("evidence_selector_api_key"))
+        or _optional_str(os.getenv("OPD_MM_EVIDENCE_SELECTOR_API_KEY"))
+        or "EMPTY",
+        float(
+            runtime.get("evidence_selector_timeout")
+            or os.getenv("OPD_MM_EVIDENCE_SELECTOR_TIMEOUT")
+            or DEFAULT_EVIDENCE_SELECTOR_TIMEOUT
+        ),
+        int(
+            runtime.get("evidence_selector_max_tokens")
+            or os.getenv("OPD_MM_EVIDENCE_SELECTOR_MAX_TOKENS")
+            or DEFAULT_EVIDENCE_SELECTOR_MAX_TOKENS
+        ),
+        int(runtime.get("evidence_selector_retries") or os.getenv("OPD_MM_EVIDENCE_SELECTOR_RETRIES") or 2),
     )
 
 
@@ -155,6 +231,8 @@ def memory_record_from_dict(value: dict[str, Any], index: int = 0) -> MemoryReco
         "metadata",
     }
     metadata = dict(value.get("metadata") or {})
+    if metadata.get("scenario_file"):
+        metadata["scenario_file"] = _resolve_dataset_asset_path(metadata["scenario_file"])
     for key, item in value.items():
         if key not in known:
             metadata[key] = item
@@ -167,10 +245,32 @@ def memory_record_from_dict(value: dict[str, Any], index: int = 0) -> MemoryReco
         source_type=str(value.get("source_type", "memory")),
         summary=str(value.get("summary", "") or ""),
         content=str(value.get("content", "") or ""),
-        raw_pointer=value.get("raw_pointer"),
+        raw_pointer=_resolve_dataset_asset_path(value.get("raw_pointer")),
         status=str(value.get("status", "active")),
         metadata=metadata,
     )
+
+
+def _resolve_dataset_asset_path(value: Any) -> Any:
+    """Rebase serialized dataset assets onto the current dataset root.
+
+    Prepared parquet/JSONL files may have been built in a different checkout
+    and therefore contain absolute image/dialog paths from that machine.
+    """
+    if not isinstance(value, (str, Path)) or not str(value):
+        return value
+    path = Path(str(value)).expanduser()
+    if path.exists() or not path.is_absolute():
+        return str(path)
+    dataset_root = os.getenv("OPD_MM_DATASET_ROOT")
+    if not dataset_root:
+        return str(path)
+    root = Path(dataset_root).expanduser()
+    parts = path.parts
+    for marker in ("image", "dialog"):
+        if marker in parts:
+            return str(root.joinpath(*parts[parts.index(marker) :]))
+    return str(path)
 
 
 class _LazyEncoder:
@@ -374,9 +474,7 @@ def hidden_store_from_records(
     return HiddenMemoryStore(built)
 
 
-def _sanitize_evidence(
-    items: list[EvidenceItem], evidence_ids_by_memory: dict[str, str]
-) -> list[dict[str, Any]]:
+def _sanitize_evidence(items: list[EvidenceItem]) -> list[dict[str, Any]]:
     """Expose one complete public record per memory.
 
     A memory can have both a MEMORY item and an INSPECT_RAW item internally.
@@ -389,10 +487,7 @@ def _sanitize_evidence(
         data.pop("memory_id", None)
         data.pop("source", None)
         data.pop("author", None)
-        entry = sanitized_by_memory.setdefault(
-            item.memory_id,
-            {"evidence_id": evidence_ids_by_memory[item.memory_id]},
-        )
+        entry = sanitized_by_memory.setdefault(item.memory_id, {})
         entry.update({key: value for key, value in data.items() if value not in (None, "")})
     return list(sanitized_by_memory.values())
 
@@ -403,21 +498,6 @@ def _clip_text(value: Any, max_chars: int = OBSERVATION_TEXT_MAX_CHARS) -> Any:
     return value[:max_chars].rstrip() + "...(truncated)"
 
 
-def _update_dynamic_drop_schema(agent_data: Any, evidence_ids: list[str]) -> None:
-    """Constrain the next DROP call to IDs visible in the current observation."""
-    active_tools = getattr(agent_data, "_active_tools", None)
-    if not isinstance(active_tools, dict):
-        return
-    schemas = []
-    for tool in active_tools.values():
-        schema = tool.tool_schema.model_dump(exclude_unset=True, exclude_none=True)
-        if schema.get("function", {}).get("name") == "drop":
-            items = schema["function"]["parameters"]["properties"]["evidence_ids"].setdefault("items", {})
-            items["enum"] = list(evidence_ids)
-        schemas.append(schema)
-    agent_data._active_tool_schemas = schemas
-
-
 @dataclass
 class OPDToolSession:
     """Per-trajectory state shared by OPD-MM tools."""
@@ -426,6 +506,7 @@ class OPDToolSession:
     memory_store: HiddenMemoryStore
     query: str
     question_image: Optional[str] = None
+    evidence_selector: Any = None
     pool: list[PoolItem] = field(default_factory=list)
     evidence: list[EvidenceItem] = field(default_factory=list)
     steps: list[ExecutionStep] = field(default_factory=list)
@@ -435,18 +516,18 @@ class OPDToolSession:
     error: str = ""
     pool_has_candidates: bool = False
     max_actions_reached: bool = False
-    evidence_ids_by_memory: dict[str, str] = field(default_factory=dict)
     evidence_revision: int = 0
-    last_drop_revision: int = 0
     pool_overflow_count: int = 0
-    drop_calls: int = 0
-    dropped_evidence_count: int = 0
+    semantic_filter_status: str = "not_run"
+    semantic_filter_error: str = ""
+    semantic_filter_candidate_count: int = 0
+    semantic_filter_selected_count: int = 0
 
     def __post_init__(self) -> None:
         if not self.pool:
             self.pool = self.memory_store.initial_pool()
 
-    def execute(self, action: ToolAction) -> dict[str, Any]:
+    def execute(self, action: ToolAction, *, defer_semantic_filter: bool = False) -> dict[str, Any]:
         """Execute one validated action against the current hidden pool."""
         before = len(self.pool)
         step_error = ""
@@ -472,21 +553,6 @@ class OPDToolSession:
                     self.pool, filtered, self.pool_has_candidates
                 )
                 self.pool_has_candidates = True
-                new_evidence = self.executor._refresh_evidence_from_pool(
-                    self.evidence, self.pool, source="FILTER"
-                )
-            elif action.tool == "SORT":
-                self.pool = self.executor._sort(self.pool, **action.arguments)
-                if self.pool_has_candidates:
-                    new_evidence = self.executor._refresh_evidence_from_pool(
-                        self.evidence, self.pool, source="SORT"
-                    )
-            elif action.tool == "TOPK":
-                self.pool = self.executor._topk_turns(self.pool, action.arguments["k"])
-                if self.pool_has_candidates:
-                    new_evidence = self.executor._refresh_evidence_from_pool(
-                        self.evidence, self.pool, source="TOPK"
-                    )
             elif action.tool == "RETRIEVE":
                 retrieve_query = action.arguments.get("query") or self.query
                 retrieved = self.executor.retriever.retrieve(
@@ -501,14 +567,12 @@ class OPDToolSession:
                     self.pool, retrieved, self.pool_has_candidates
                 )
                 self.pool_has_candidates = True
-                new_evidence = self.executor._refresh_evidence_from_pool(
-                    self.evidence, self.pool, source="RETRIEVE"
-                )
             elif action.tool == "EXPAND_NEIGHBORS":
-                if not self.pool_has_candidates or not self.pool:
-                    raise ValueError("EXPAND_NEIGHBORS requires an existing candidate pool")
+                relevant_pool = self._evidence_pool()
+                if not relevant_pool:
+                    raise ValueError("EXPAND_NEIGHBORS requires existing answer evidence")
                 expanded = self.executor._expand_neighbors(
-                    self.pool,
+                    relevant_pool,
                     self.memory_store,
                     action.arguments["window"],
                 )
@@ -519,26 +583,10 @@ class OPDToolSession:
                     prioritize_incoming=False,
                 )
                 self.pool_has_candidates = True
-                new_evidence = self.executor._refresh_evidence_from_pool(
-                    self.evidence, self.pool, source="EXPAND_NEIGHBORS"
-                )
-            elif action.tool == "DROP":
-                if self.evidence_revision <= self.last_drop_revision:
-                    raise ValueError("DROP requires evidence added or enriched since the previous DROP")
-                self.pool = self.executor._drop_pool(
-                    self.pool,
-                    action.arguments["evidence_ids"],
-                    self.evidence_ids_by_memory,
-                )
-                self.pool_has_candidates = True
-                self.executor._refresh_evidence_from_pool(self.evidence, self.pool, source="DROP")
-                self.last_drop_revision = self.evidence_revision
-                self.drop_calls += 1
-                self.dropped_evidence_count += len(action.arguments["evidence_ids"])
             elif action.tool == "INSPECT_RAW":
                 remaining = max(0, self.executor.max_raw_inspections - self.raw_calls)
                 inspected = self.executor._inspect_raw(
-                    self.pool,
+                    self._evidence_pool(),
                     self.query,
                     remaining,
                     question_image=self.question_image,
@@ -552,8 +600,16 @@ class OPDToolSession:
             step_error = str(exc)
             self.error = step_error
 
-        if self.pool_has_candidates:
-            self.executor._ensure_public_evidence_ids(self.pool, self.evidence_ids_by_memory)
+        if (
+            not step_error
+            and action.tool in {"FILTER", "RETRIEVE", "EXPAND_NEIGHBORS"}
+            and not defer_semantic_filter
+        ):
+            new_evidence = self._apply_semantic_selection(
+                [f"C{index}" for index in range(1, len(self.pool) + 1)],
+                status="fallback_all_unconfigured",
+                error="semantic selector was not invoked by this synchronous caller",
+            )
         if new_evidence:
             self.evidence_revision += 1
 
@@ -569,6 +625,124 @@ class OPDToolSession:
             )
         )
         return self._observation(action, new_evidence, step_error)
+
+    async def execute_with_semantic_filter(self, action: ToolAction) -> dict[str, Any]:
+        """Execute one action and screen discovery results before exposing evidence."""
+        observation = self.execute(action, defer_semantic_filter=True)
+        executed_action = self.trace[-1] if self.trace else action
+        if (
+            observation.get("error")
+            or observation.get("stopped")
+            or executed_action.tool not in {"FILTER", "RETRIEVE", "EXPAND_NEIGHBORS"}
+        ):
+            return observation
+
+        candidates = self._selector_candidates()
+        if self.evidence_selector is None:
+            selection = SemanticSelection(
+                [str(item["candidate_id"]) for item in candidates],
+                status="fallback_all_unconfigured",
+                error="semantic evidence selector is not configured",
+            )
+        else:
+            try:
+                selector = getattr(self.evidence_selector, "select", self.evidence_selector)
+                try:
+                    result = selector(
+                        query=self.query,
+                        candidates=candidates,
+                        question_image=self.question_image,
+                        action=executed_action.to_dict(),
+                    )
+                except TypeError as exc:
+                    if "unexpected keyword argument" not in str(exc):
+                        raise
+                    result = selector(query=self.query, candidates=candidates)
+                if inspect.isawaitable(result):
+                    result = await result
+                if isinstance(result, SemanticSelection):
+                    selection = result
+                elif isinstance(result, list):
+                    selection = SemanticSelection([str(value) for value in result])
+                else:
+                    raise TypeError("semantic evidence selector must return SemanticSelection or list[str]")
+            except Exception as exc:
+                selection = SemanticSelection(
+                    [str(item["candidate_id"]) for item in candidates],
+                    status="fallback_all_error",
+                    error=str(exc),
+                )
+
+        if not selection.selected_candidate_ids and self.evidence:
+            previous_memory_ids = {item.memory_id for item in self.evidence}
+            preserved_ids = [
+                f"C{index}"
+                for index, item in enumerate(self.pool, start=1)
+                if item.memory.memory_id in previous_memory_ids
+            ]
+            if preserved_ids:
+                selection = SemanticSelection(
+                    preserved_ids,
+                    status="preserved_previous_on_empty",
+                    error="selector returned no candidates; preserved prior evidence",
+                )
+
+        new_evidence = self._apply_semantic_selection(
+            selection.selected_candidate_ids,
+            status=selection.status,
+            error=selection.error,
+        )
+        if new_evidence:
+            self.evidence_revision += 1
+        if self.steps:
+            self.steps[-1].evidence_added = len(new_evidence)
+        return self._observation(executed_action, new_evidence, "")
+
+    def _selector_candidates(self) -> list[dict[str, Any]]:
+        candidates = []
+        for index, item in enumerate(self.pool, start=1):
+            fields = self.executor._pool_evidence([item], source="CANDIDATE")[0].fields
+            candidates.append({"candidate_id": f"C{index}", **fields})
+        return candidates
+
+    def _apply_semantic_selection(
+        self,
+        selected_candidate_ids: list[str],
+        *,
+        status: str,
+        error: str,
+    ) -> list[EvidenceItem]:
+        candidate_by_id = {f"C{index}": item for index, item in enumerate(self.pool, start=1)}
+        selected_ids = list(dict.fromkeys(str(value).strip() for value in selected_candidate_ids))
+        unknown = [value for value in selected_ids if value not in candidate_by_id]
+        if unknown:
+            selected_ids = list(candidate_by_id)
+            status = "fallback_all_invalid_ids"
+            error = f"selector returned unknown candidate IDs: {unknown[:8]}"
+        selected_pool = [candidate_by_id[value] for value in selected_ids]
+        before_signature = self._evidence_signature()
+        new_evidence = self.executor._refresh_evidence_from_pool(
+            self.evidence,
+            selected_pool,
+            source="SEMANTIC_SELECTION",
+        )
+        self.semantic_filter_status = str(status or "ok")
+        self.semantic_filter_error = str(error or "")
+        self.semantic_filter_candidate_count = len(self.pool)
+        self.semantic_filter_selected_count = len(selected_pool)
+        if self._evidence_signature() != before_signature and not new_evidence:
+            self.evidence_revision += 1
+        return new_evidence
+
+    def _evidence_pool(self) -> list[PoolItem]:
+        memory_ids = {item.memory_id for item in self.evidence}
+        return [item for item in self.pool if item.memory.memory_id in memory_ids]
+
+    def _evidence_signature(self) -> tuple[Any, ...]:
+        return tuple(
+            (item.memory_id, item.source, json.dumps(item.fields, ensure_ascii=False, sort_keys=True, default=str))
+            for item in self.evidence
+        )
 
     async def execute_inspect_raw_with_teacher(self, action: ToolAction, inspect_fn: Any) -> dict[str, Any]:
         """Execute INSPECT_RAW using the async verl teacher service callback."""
@@ -599,7 +773,7 @@ class OPDToolSession:
         try:
             self.executor.validator._validate_action(action, len(self.trace))
             remaining = max(0, self.executor.max_raw_inspections - self.raw_calls)
-            inspect_pool = [item for item in self.pool if item.retrieved]
+            inspect_pool = self._evidence_pool()
             text_by_turn = self.executor._text_context_by_turn(inspect_pool)
             for item in inspect_pool:
                 if len(inspected) >= remaining:
@@ -662,15 +836,8 @@ class OPDToolSession:
         capacity bounds this complete evidence list without text truncation.
         """
         visible_pool = self.pool if self.pool_has_candidates else []
-        self.executor._ensure_public_evidence_ids(visible_pool, self.evidence_ids_by_memory)
-        new_evidence_ids = list(
-            dict.fromkeys(
-                self.evidence_ids_by_memory[item.memory_id]
-                for item in new_evidence
-                if item.memory_id in self.evidence_ids_by_memory
-            )
-        )
-        public_evidence = _sanitize_evidence(self.evidence, self.evidence_ids_by_memory)
+        new_evidence_count = len({item.memory_id for item in new_evidence})
+        public_evidence = _sanitize_evidence(self.evidence)
         observation = {
             "refresh_state": False,
             "tool": action.tool,
@@ -678,42 +845,38 @@ class OPDToolSession:
             "pool_capacity": self.executor.max_pool_size,
             "pool_overflow_count": self.pool_overflow_count,
             "evidence_count": len(public_evidence),
-            "evidence_memory_count": len(visible_pool),
-            "new_evidence_count": len(new_evidence_ids),
-            "new_evidence_ids": new_evidence_ids,
+            "evidence_memory_count": len(public_evidence),
+            "new_evidence_count": new_evidence_count,
             "evidence_revision": self.evidence_revision,
-            "last_drop_revision": self.last_drop_revision,
-            "drop_calls": self.drop_calls,
-            "dropped_evidence_count": self.dropped_evidence_count,
-            # This is the sole model-visible representation of the current
-            # pool. Each memory appears once with its complete public fields.
+            "semantic_filter_status": self.semantic_filter_status,
+            "semantic_filter_candidate_count": self.semantic_filter_candidate_count,
+            "semantic_filter_selected_count": self.semantic_filter_selected_count,
+            "semantic_filter_error": _clip_text(self.semantic_filter_error),
+            # The pool remains private. This is the sole model-visible,
+            # semantically screened answer-evidence representation.
             "evidence": public_evidence,
             "stopped": self.stopped,
             "error": _clip_text(error),
         }
-        if action.tool == "DROP" and not error:
-            observation["dropped_evidence_ids"] = [
-                str(value).strip() for value in action.arguments.get("evidence_ids", [])
-            ]
         return observation
 
     def public_state(self) -> dict[str, Any]:
         """Return serializable public state for AgentLoopOutput.extra_fields."""
         visible_pool = self.pool if self.pool_has_candidates else []
-        self.executor._ensure_public_evidence_ids(visible_pool, self.evidence_ids_by_memory)
-        public_evidence = _sanitize_evidence(self.evidence, self.evidence_ids_by_memory)
+        public_evidence = _sanitize_evidence(self.evidence)
         return {
             "query": self.query,
             "pool_count": len(visible_pool),
             "pool_capacity": self.executor.max_pool_size,
             "pool_overflow_count": self.pool_overflow_count,
             "evidence_count": len(public_evidence),
-            "evidence_memory_count": len(visible_pool),
+            "evidence_memory_count": len(public_evidence),
             "evidence": public_evidence,
             "evidence_revision": self.evidence_revision,
-            "last_drop_revision": self.last_drop_revision,
-            "drop_calls": self.drop_calls,
-            "dropped_evidence_count": self.dropped_evidence_count,
+            "semantic_filter_status": self.semantic_filter_status,
+            "semantic_filter_candidate_count": self.semantic_filter_candidate_count,
+            "semantic_filter_selected_count": self.semantic_filter_selected_count,
+            "semantic_filter_error": self.semantic_filter_error,
             "trace": [action.to_dict() for action in self.trace],
             "stopped": self.stopped,
             "error": self.error,
@@ -740,12 +903,7 @@ class OPDBaseTool(BaseTool):
         agent_data = kwargs.get("agent_data")
         session = self._session(agent_data)
         action = self._action(parameters)
-        observation = session.execute(action)
-        if agent_data is not None:
-            _update_dynamic_drop_schema(
-                agent_data,
-                [item["evidence_id"] for item in observation.get("evidence", [])],
-            )
+        observation = await session.execute_with_semantic_filter(action)
         if agent_data is not None and hasattr(agent_data, "extra_fields"):
             agent_data.extra_fields["opd_mm"] = session.public_state()
             agent_data.extra_fields["opd_mm_prompt_state"] = {
@@ -756,8 +914,9 @@ class OPDBaseTool(BaseTool):
         return ToolResponse(text=json.dumps(observation, ensure_ascii=False)), 0.0, {
             "opd_mm_pool_count": observation["pool_count"],
             "opd_mm_evidence_count": observation["evidence_count"],
-            "opd_mm_drop_calls": observation["drop_calls"],
-            "opd_mm_dropped_evidence_count": observation["dropped_evidence_count"],
+            "opd_mm_semantic_filter_fallback": float(
+                str(observation["semantic_filter_status"]).startswith("fallback_all")
+            ),
             "opd_mm_terminate": terminate_agent_loop,
             "agent_loop_terminate": terminate_agent_loop,
         }
@@ -778,6 +937,9 @@ class OPDBaseTool(BaseTool):
             return getattr(agent_data, _SESSION_ATTR)
 
         runtime = self._runtime(agent_data)
+        teacher_selector = getattr(agent_data, "teacher_evidence_selector", None) if agent_data is not None else None
+        if teacher_selector is not None:
+            runtime["evidence_selector"] = teacher_selector
 
         store = runtime.get("memory_store")
         if store is None:
@@ -812,7 +974,8 @@ class OPDBaseTool(BaseTool):
             ),
             memory_store=store,
             query=str(query or ""),
-            question_image=runtime.get("question_image"),
+            question_image=_resolve_dataset_asset_path(runtime.get("question_image")),
+            evidence_selector=_evidence_selector_from_runtime(runtime),
         )
         if agent_data is not None:
             setattr(agent_data, _SESSION_ATTR, session)
@@ -833,7 +996,7 @@ class OPDFilterTool(OPDBaseTool):
     tool_name = "filter"
     description = (
         "Select hidden memories from the original memory store by metadata and merge deduplicated matches into the "
-        "working pool. Use DROP to remove current evidence."
+        "private candidate pool. An internal semantic selector then exposes only question-relevant answer evidence."
     )
     properties = {
         "field": _property("string", "The memory field to filter.", sorted(FILTER_FIELDS)),
@@ -848,29 +1011,13 @@ class OPDFilterTool(OPDBaseTool):
     required = ["field", "op", "value"]
 
 
-class OPDSortTool(OPDBaseTool):
-    tool_name = "sort"
-    description = "Sort the current candidate pool when timestamp, recency, score, or turn order matters."
-    properties = {
-        "field": _property("string", "The field to sort by.", sorted(SORT_FIELDS)),
-        "order": _property("string", "Sort order.", sorted(SORT_ORDERS)),
-    }
-    required = ["field", "order"]
-
-
-class OPDTopKTool(OPDBaseTool):
-    tool_name = "topk"
-    description = "Keep the strongest k turns from the current candidate pool after retrieval, filtering, or sorting."
-    properties = {"k": _property("integer", "Positive number of candidate turns to keep.")}
-    required = ["k"]
-
-
 class OPDRetrieveTool(OPDBaseTool):
     tool_name = "retrieve"
     description = (
         "Rank hidden memories against the original user query or an optional rewritten query. "
         "Always searches the original hidden memory store and fuses deduplicated results into the bounded working "
-        "pool. Memories supported by multiple retrieval steps are prioritized."
+        "pool. Memories supported by multiple retrieval steps are prioritized, then an internal semantic selector "
+        "exposes only candidates relevant to answering the question."
     )
     properties = {
         "method": _property(
@@ -897,7 +1044,8 @@ class OPDExpandNeighborsTool(OPDBaseTool):
     tool_name = "expand_neighbors"
     description = (
         "Expand the current candidate pool with neighboring turns from the same session. "
-        "Use only after retrieval/filtering has selected relevant candidates."
+        "Expansion is anchored on current answer evidence, and the expanded pool is semantically screened again. "
+        "Use only after retrieval/filtering has produced relevant evidence."
     )
     properties = {
         "window": _property(
@@ -909,31 +1057,11 @@ class OPDExpandNeighborsTool(OPDBaseTool):
     required = ["window"]
 
 
-class OPDDropTool(OPDBaseTool):
-    tool_name = "drop"
-    description = (
-        "Remove clearly irrelevant, duplicate, or conflicting memories from the current candidate pool using "
-        "their public evidence_id values. Other useful evidence does not prevent removing such items. Submit all "
-        "removals in one call; skip this action when no item is clearly removable, and do not call again until a "
-        "later action adds or enriches evidence."
-    )
-    properties = {
-        "evidence_ids": {
-            "type": "array",
-            "description": "Non-empty unique list of public E1/E2/... IDs from the current evidence list.",
-            "items": {"type": "string", "pattern": "^E[1-9][0-9]*$"},
-            "minItems": 1,
-            "uniqueItems": True,
-        }
-    }
-    required = ["evidence_ids"]
-
-
 class OPDInspectRawTool(OPDBaseTool):
     tool_name = "inspect_raw"
     description = (
-        "Opt-in raw visual inspection for images/media in the current retrieved candidate pool. "
-        "Use only after retrieve/filter has selected candidate images. This cannot inspect the user's "
+        "Opt-in raw visual inspection for images/media in current semantically selected answer evidence. "
+        "Use only after retrieve/filter has selected relevant images. This cannot inspect the user's "
         "attached question image, cannot inspect an empty pool, and does not search the original full memory store."
     )
     properties = {
@@ -960,11 +1088,6 @@ class OPDInspectRawTool(OPDBaseTool):
 
             inspect_fn = unavailable
         observation = await session.execute_inspect_raw_with_teacher(action, inspect_fn)
-        if agent_data is not None:
-            _update_dynamic_drop_schema(
-                agent_data,
-                [item["evidence_id"] for item in observation.get("evidence", [])],
-            )
         if agent_data is not None and hasattr(agent_data, "extra_fields"):
             agent_data.extra_fields["opd_mm"] = session.public_state()
             agent_data.extra_fields["opd_mm_prompt_state"] = {
@@ -975,8 +1098,9 @@ class OPDInspectRawTool(OPDBaseTool):
         return ToolResponse(text=json.dumps(observation, ensure_ascii=False)), 0.0, {
             "opd_mm_pool_count": observation["pool_count"],
             "opd_mm_evidence_count": observation["evidence_count"],
-            "opd_mm_drop_calls": observation["drop_calls"],
-            "opd_mm_dropped_evidence_count": observation["dropped_evidence_count"],
+            "opd_mm_semantic_filter_fallback": float(
+                str(observation["semantic_filter_status"]).startswith("fallback_all")
+            ),
             "opd_mm_terminate": terminate_agent_loop,
             "agent_loop_terminate": terminate_agent_loop,
         }
@@ -991,11 +1115,8 @@ class OPDStopTool(OPDBaseTool):
 
 OPD_TOOL_CLASSES = [
     OPDFilterTool,
-    OPDSortTool,
-    OPDTopKTool,
     OPDRetrieveTool,
     OPDExpandNeighborsTool,
-    OPDDropTool,
     OPDInspectRawTool,
     OPDStopTool,
 ]
@@ -1003,7 +1124,6 @@ OPD_TOOL_CLASSES = [
 
 def openai_tool_schemas(
     include_inspect_raw: bool = True,
-    evidence_ids: Optional[list[str]] = None,
 ) -> list[dict[str, Any]]:
     """Return OpenAI tool schemas for OPD-MM tools."""
     classes = (
@@ -1011,20 +1131,12 @@ def openai_tool_schemas(
         if include_inspect_raw
         else [cls for cls in OPD_TOOL_CLASSES if cls is not OPDInspectRawTool]
     )
-    schemas = [
+    return [
         _schema(cls.tool_name, cls.description, cls.properties, cls.required).model_dump(
             exclude_unset=True, exclude_none=True
         )
         for cls in classes
     ]
-    if evidence_ids is not None:
-        for schema in schemas:
-            if schema["function"]["name"] != "drop":
-                continue
-            schema["function"]["parameters"]["properties"]["evidence_ids"]["items"]["enum"] = list(
-                evidence_ids
-            )
-    return schemas
 
 
 __all__ = [
@@ -1035,9 +1147,7 @@ __all__ = [
     "OPDRetrieveTool",
     "OPDStopTool",
     "OPDToolSession",
-    "OPDTopKTool",
     "OPD_TOOL_CLASSES",
-    "OPDSortTool",
     "hidden_store_from_records",
     "memory_record_from_dict",
     "openai_tool_schemas",

@@ -11,6 +11,11 @@ RUN_TIMESTAMP=${RUN_TIMESTAMP:-$(date +%Y%m%d_%H%M%S)}
 
 WANDB_MODE=${WANDB_MODE:-online}
 WANDB_DISABLE_STATS=${WANDB_DISABLE_STATS:-True}
+WANDB_VAL_CASES=${WANDB_VAL_CASES:-4}
+export WANDB_CONSOLE=${WANDB_CONSOLE:-off}
+export WANDB_DISABLE_CODE=${WANDB_DISABLE_CODE:-true}
+export WANDB_SAVE_CODE=${WANDB_SAVE_CODE:-false}
+export WANDB_LOG_MODEL=${WANDB_LOG_MODEL:-false}
 WANDB_PROXY=${WANDB_PROXY:-}
 WANDB_PROXY_FALLBACK=${WANDB_PROXY_FALLBACK:-http://127.0.0.1:7896}
 WANDB_CONNECTIVITY_TIMEOUT=${WANDB_CONNECTIVITY_TIMEOUT:-5}
@@ -24,7 +29,10 @@ if [[ "${WANDB_MODE,,}" == "online" && -z "$WANDB_PROXY" ]] \
     fi
 fi
 export WANDB_MODE
-WANDB_TRAINER_ARGS=(+trainer.wandb_disable_stats=${WANDB_DISABLE_STATS})
+WANDB_TRAINER_ARGS=(
+    +trainer.wandb_disable_stats=${WANDB_DISABLE_STATS}
+    '+trainer.wandb_metric_include_patterns=["^(actor|critic|distillation)/.*loss$","^val-aux/.*/opd_mm/(answer_correct|evidence_answerable|evidence_count|action_count|repeated_actions|max_actions_reached|empty_evidence|trajectory_error|answer_request_failed|judge_request_failed|evidence_judge_request_failed)/mean@.*$","^training/(global_step|epoch)$"]'
+)
 if [[ -n "$WANDB_PROXY" ]]; then
     WANDB_TRAINER_ARGS+=(+trainer.wandb_proxy="$WANDB_PROXY")
 fi
@@ -75,7 +83,7 @@ TEACHER_TP=${TEACHER_TP:-2}
 TEACHER_MAX_MODEL_LEN=${TEACHER_MAX_MODEL_LEN:-32768}
 TEACHER_MAX_NUM_BATCHED_TOKENS=${TEACHER_MAX_NUM_BATCHED_TOKENS:-4096}
 TEACHER_GPU_MEMORY_UTIL=${TEACHER_GPU_MEMORY_UTIL:-0.55}
-OPD_MM_KL_TOPK=${OPD_MM_KL_TOPK:-8}
+OPD_MM_KL_TOPK=${OPD_MM_KL_TOPK:-50}
 OPD_MM_KL_TOP_ACTIONS=${OPD_MM_KL_TOP_ACTIONS:-2}
 OPD_MM_GRPO_ACTION_SELECTION=${OPD_MM_GRPO_ACTION_SELECTION:-top_kl}
 OPD_MM_KL_CREDIT_ENABLED=${OPD_MM_KL_CREDIT_ENABLED:-True}
@@ -189,6 +197,9 @@ export OPD_MM_OUTCOME_REWARD_DUMP_DIR
 export OPD_MM_VECTOR_STORE_DIR
 export OPD_MM_OUTCOME_BASE_URL="$OUTCOME_SERVER_BASE_URL"
 export OPD_MM_OUTCOME_MODEL="$OUTCOME_SERVED_MODEL"
+export OPD_MM_EVIDENCE_SELECTOR_BASE_URL=${OPD_MM_EVIDENCE_SELECTOR_BASE_URL:-$OUTCOME_SERVER_BASE_URL}
+export OPD_MM_EVIDENCE_SELECTOR_MODEL=${OPD_MM_EVIDENCE_SELECTOR_MODEL:-$OUTCOME_SERVED_MODEL}
+export OPD_MM_EVIDENCE_SELECTOR_BACKEND=${OPD_MM_EVIDENCE_SELECTOR_BACKEND:-remote}
 export OPD_MM_JUDGE_BASE_URL="$OUTCOME_SERVER_BASE_URL"
 export OPD_MM_JUDGE_MODEL="$OUTCOME_SERVED_MODEL"
 export OPD_MM_RAW_INSPECTOR_BACKEND=vllm
@@ -247,6 +258,8 @@ echo "OPD_MODEL_PATH=${OPD_MODEL_PATH}"
 echo "EXPERIMENT_NAME=${experiment_name}"
 echo "TRAIN_GPUS=${TRAIN_GPUS}"
 echo "OUTCOME_SERVER_BASE_URL=${OUTCOME_SERVER_BASE_URL}"
+echo "OPD_MM_EVIDENCE_SELECTOR_BASE_URL=${OPD_MM_EVIDENCE_SELECTOR_BASE_URL}"
+echo "OPD_MM_EVIDENCE_SELECTOR_MODEL=${OPD_MM_EVIDENCE_SELECTOR_MODEL}"
 echo "OUTCOME_MODEL_PATH=${OUTCOME_MODEL_PATH}"
 echo "TEACHER_MODEL_PATH=${TEACHER_MODEL_PATH}"
 echo "OPD_MM_KL_TOPK=${OPD_MM_KL_TOPK}"
@@ -367,6 +380,7 @@ TRAINER=(
     trainer.use_v1=False
     trainer.balance_batch=True
     trainer.logger='["console","wandb"]'
+    trainer.log_val_generations=${WANDB_VAL_CASES}
     trainer.project_name=${project_name}
     trainer.experiment_name=${experiment_name}
     trainer.n_gpus_per_node=${NGPUS_PER_NODE}

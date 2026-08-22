@@ -58,6 +58,7 @@ from verl.experimental.opd_mm.executor import ToolExecutor
 from verl.experimental.opd_mm.models import ToolAction
 from verl.experimental.opd_mm.retrieval import TurnAwareHybridRetriever
 from verl.experimental.opd_mm.schema import TrajectoryValidator
+from verl.experimental.opd_mm.semantic_selector import RemoteSemanticEvidenceSelector
 from verl.experimental.opd_mm.tools import OPDToolSession, hidden_store_from_records, openai_tool_schemas
 
 
@@ -268,7 +269,9 @@ def _format_prompt(tokenizer: Any, messages: list[dict[str, Any]], tool_schemas:
     )
 
 
-def _make_session(qa: dict[str, Any], records: list[dict[str, Any]], max_turns: int) -> OPDToolSession:
+def _make_session(
+    qa: dict[str, Any], records: list[dict[str, Any]], max_turns: int, args: argparse.Namespace
+) -> OPDToolSession:
     return OPDToolSession(
         executor=ToolExecutor(
             retriever=TurnAwareHybridRetriever(),
@@ -278,6 +281,11 @@ def _make_session(qa: dict[str, Any], records: list[dict[str, Any]], max_turns: 
         memory_store=hidden_store_from_records(records),
         query=str(qa.get("question") or ""),
         question_image=_optional_path(qa.get("question_image")),
+        evidence_selector=RemoteSemanticEvidenceSelector(
+            base_url=args.evidence_selector_base_url or args.answer_base_url,
+            model=args.evidence_selector_model or args.answer_model,
+            timeout=args.evidence_selector_timeout,
+        ),
     )
 
 
@@ -326,7 +334,7 @@ def rollout_student(args: argparse.Namespace, qas: list[dict[str, Any]]) -> list
 
         base_messages = _messages_for_query(str(qa.get("question") or ""))
         messages = list(base_messages)
-        session = _make_session(qa, records, args.max_turns)
+        session = _make_session(qa, records, args.max_turns, args)
         final_answer = ""
         raw_generations = []
         generation_error = ""
@@ -359,7 +367,7 @@ def rollout_student(args: argparse.Namespace, qas: list[dict[str, Any]]) -> list
             call = calls[0]
             try:
                 action = ToolAction(call.name.upper(), json.loads(call.arguments or "{}"))
-                observation = session.execute(action)
+                observation = asyncio.run(session.execute_with_semantic_filter(action))
             except Exception as exc:  # keep the trajectory inspectable
                 observation = {
                     "tool": getattr(call, "name", ""),
@@ -724,6 +732,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--answer-timeout", type=float, default=60.0)
     parser.add_argument("--answer-max-new-tokens", type=int, default=256)
     parser.add_argument("--answer-temperature", type=float, default=0.0)
+    parser.add_argument("--evidence-selector-base-url", default="")
+    parser.add_argument("--evidence-selector-model", default="")
+    parser.add_argument("--evidence-selector-timeout", type=float, default=120.0)
     parser.add_argument("--answer-max-evidence", type=int, default=12)
     parser.add_argument("--skip-answer-model", action="store_true")
     parser.add_argument("--skip-rollout", action="store_true")

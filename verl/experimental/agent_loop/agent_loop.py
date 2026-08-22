@@ -811,6 +811,9 @@ class AgentLoopWorker:
             teacher_raw_inspector = self._make_opd_mm_teacher_raw_inspector(sample_kwargs=kwargs)
             if teacher_raw_inspector is not None and agent_name == "tool_agent":
                 run_kwargs["_opd_mm_teacher_raw_inspector"] = teacher_raw_inspector
+            teacher_evidence_selector = self._make_opd_mm_teacher_evidence_selector(sample_kwargs=kwargs)
+            if teacher_evidence_selector is not None and agent_name == "tool_agent":
+                run_kwargs["_opd_mm_teacher_evidence_selector"] = teacher_evidence_selector
             output: AgentLoopOutput = await agent_loop.run(sampling_params, **run_kwargs)
             return await self._agent_loop_postprocess(output, trajectory["validate"], **kwargs)
 
@@ -845,6 +848,74 @@ class AgentLoopWorker:
         if backend:
             config["raw_inspector_backend"] = str(backend)
         return config
+
+    def _opd_mm_evidence_selector_config(self) -> dict[str, Any]:
+        config: dict[str, Any] = {}
+        for tool in self.tools:
+            if getattr(tool, "name", "") not in {"filter", "retrieve", "expand_neighbors"}:
+                continue
+            raw_config = getattr(tool, "config", {}) or {}
+            if hasattr(raw_config, "items"):
+                config.update(dict(raw_config))
+            break
+        backend = os.getenv("OPD_MM_EVIDENCE_SELECTOR_BACKEND") or config.get("evidence_selector_backend")
+        if backend:
+            config["evidence_selector_backend"] = str(backend)
+        return config
+
+    def _make_opd_mm_teacher_evidence_selector(self, *, sample_kwargs: dict[str, Any]) -> Optional[Any]:
+        """Create a semantic evidence selector routed to the frozen teacher."""
+        config = self._opd_mm_evidence_selector_config()
+        tools_kwargs = sample_kwargs.get("tools_kwargs") or {}
+        is_opd_mm = hasattr(tools_kwargs, "get") and tools_kwargs.get("opd_mm") is not None
+        if (
+            not self.distillation_enabled
+            or not is_opd_mm
+            or str(config.get("evidence_selector_backend") or "").lower() != "teacher"
+        ):
+            return None
+
+        async def select(
+            *,
+            query: str,
+            candidates: list[dict[str, Any]],
+            question_image: Optional[str] = None,
+            action: Optional[dict[str, Any]] = None,
+        ) -> Any:
+            from verl.experimental.opd_mm.semantic_selector import (
+                SemanticSelection,
+                build_semantic_selector_prompt,
+                parse_semantic_selection,
+            )
+
+            prompt = build_semantic_selector_prompt(
+                query,
+                candidates,
+                action,
+                has_question_image=bool(question_image),
+            )
+            prompt_ids = self._encode_opd_mm_teacher_prompt(prompt)
+            routing_key = None
+            routing_value = sample_kwargs.get(self.teacher_key)
+            if routing_value is not None:
+                routing_key = routing_value.item() if hasattr(routing_value, "item") else routing_value
+            response_ids = await self.teacher_server_manager.generate_teacher_response_single(
+                prompt_ids=prompt_ids,
+                sampling_params={
+                    "max_tokens": int(config.get("evidence_selector_max_tokens") or 512),
+                    "temperature": 0.0,
+                    "top_p": 1.0,
+                    "top_k": -1,
+                },
+                multi_modal_data={},
+                mm_processor_kwargs={},
+                routing_key=routing_key,
+            )
+            raw_response = self.tokenizer.decode(response_ids, skip_special_tokens=True)
+            allowed_ids = {str(candidate["candidate_id"]) for candidate in candidates}
+            return SemanticSelection(parse_semantic_selection(raw_response, allowed_ids))
+
+        return select
 
     def _make_opd_mm_teacher_raw_inspector(
         self,
@@ -1097,18 +1168,8 @@ class AgentLoopWorker:
             allow_inspect_raw=bool(request.get("allow_inspect_raw", True)),
             tool_format=str(request.get("tool_format") or self.rollout_config.multi_turn.format),
         )
-        observation = request.get("observation") or {}
-        teacher_evidence = observation.get("evidence")
-        if not isinstance(teacher_evidence, list):
-            teacher_evidence = observation.get("evidence_catalog", [])
-        teacher_evidence_ids = [
-            str(item.get("evidence_id"))
-            for item in teacher_evidence
-            if isinstance(item, dict) and item.get("evidence_id")
-        ]
         teacher_tool_schemas = openai_tool_schemas(
             include_inspect_raw=bool(request.get("allow_inspect_raw", True)),
-            evidence_ids=teacher_evidence_ids,
         )
         teacher_prompt_ids = self._encode_opd_mm_teacher_prompt(
             request["teacher_prompt"], tools=teacher_tool_schemas

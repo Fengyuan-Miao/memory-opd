@@ -1895,7 +1895,7 @@ class RayPPOTrainer:
                 for row in rows
                 if row["teacher_ids"] and row["teacher_ids"][0]
             ),
-            max(1, int(credit_config.get("topk", 8))),
+            max(1, int(credit_config.get("topk", 50))),
         )
         tensor_values: dict[str, list[Any]] = defaultdict(list)
         for row in rows:

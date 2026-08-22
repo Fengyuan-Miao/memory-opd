@@ -132,3 +132,8 @@ log
 outputs
 .history
 experimental
+!verl/experimental/
+verl/experimental/*
+!verl/experimental/opd_mm/
+verl/experimental/opd_mm/*
+!verl/experimental/opd_mm/semantic_selector.py

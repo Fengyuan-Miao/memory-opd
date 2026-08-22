@@ -19,6 +19,7 @@ import dataclasses
 import json
 import logging
 import os
+import re
 from enum import Enum
 from functools import partial
 from pathlib import Path
@@ -67,6 +68,12 @@ class Tracking:
                 assert backend in self.supported_backend, f"{backend} is not supported"
 
         self.logger = {}
+        self._wandb_metric_include_patterns: list[re.Pattern[str]] = []
+        if config:
+            raw_patterns = config.get("trainer", {}).get("wandb_metric_include_patterns", []) or []
+            if isinstance(raw_patterns, str):
+                raw_patterns = [raw_patterns]
+            self._wandb_metric_include_patterns = [re.compile(str(pattern)) for pattern in raw_patterns]
 
         if "tracking" in default_backend or "wandb" in default_backend:
             import os
@@ -186,7 +193,15 @@ class Tracking:
     def log(self, data, step, backend=None):
         for default_backend, logger_instance in self.logger.items():
             if backend is None or default_backend in backend:
-                logger_instance.log(data=data, step=step)
+                backend_data = data
+                if default_backend == "wandb" and self._wandb_metric_include_patterns:
+                    backend_data = {
+                        key: value
+                        for key, value in data.items()
+                        if any(pattern.search(str(key)) for pattern in self._wandb_metric_include_patterns)
+                    }
+                if backend_data:
+                    logger_instance.log(data=backend_data, step=step)
 
     def __del__(self):
         if "wandb" in self.logger:

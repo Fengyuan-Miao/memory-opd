@@ -61,12 +61,14 @@ class ToolExecutor:
         retriever: Optional[HybridRetriever] = None,
         raw_inspector: Optional[RawInspector] = None,
         validator: Optional[TrajectoryValidator] = None,
+        evidence_selector: Any = None,
         max_raw_inspections: int = 3,
         max_pool_size: int = DEFAULT_MAX_POOL_SIZE,
     ):
         self.retriever = retriever or HybridRetriever()
         self.raw_inspector = raw_inspector
         self.validator = validator or TrajectoryValidator()
+        self.evidence_selector = evidence_selector
         self.max_raw_inspections = max(0, int(max_raw_inspections))
         self.max_pool_size = max(1, int(max_pool_size))
 
@@ -85,9 +87,6 @@ class ToolExecutor:
         stopped = False
         raw_calls = 0
         error = ""
-        evidence_ids_by_memory: dict[str, str] = {}
-        evidence_revision = 0
-        last_drop_revision = 0
 
         for index, action in enumerate(actions):
             before = len(pool)
@@ -103,15 +102,8 @@ class ToolExecutor:
                     )
                     pool, _ = self._merge_discovery_pool(pool, filtered, pool_has_candidates)
                     pool_has_candidates = True
-                    evidence_added = len(self._refresh_evidence_from_pool(evidence, pool, source="FILTER"))
-                elif action.tool == "SORT":
-                    pool = self._sort(pool, **action.arguments)
-                    if pool_has_candidates:
-                        evidence_added = len(self._refresh_evidence_from_pool(evidence, pool, source="SORT"))
-                elif action.tool == "TOPK":
-                    pool = self._topk_turns(pool, action.arguments["k"])
-                    if pool_has_candidates:
-                        evidence_added = len(self._refresh_evidence_from_pool(evidence, pool, source="TOPK"))
+                    selected = self._select_evidence_pool_sync(pool, query)
+                    evidence_added = len(self._refresh_evidence_from_pool(evidence, selected, source="FILTER"))
                 elif action.tool == "RETRIEVE":
                     retrieve_query = action.arguments.get("query") or query
                     retrieved = self.retriever.retrieve(
@@ -124,12 +116,15 @@ class ToolExecutor:
                     )
                     pool, _ = self._merge_discovery_pool(pool, retrieved, pool_has_candidates)
                     pool_has_candidates = True
-                    evidence_added = len(self._refresh_evidence_from_pool(evidence, pool, source="RETRIEVE"))
+                    selected = self._select_evidence_pool_sync(pool, query)
+                    evidence_added = len(self._refresh_evidence_from_pool(evidence, selected, source="RETRIEVE"))
                 elif action.tool == "EXPAND_NEIGHBORS":
-                    if not pool_has_candidates or not pool:
-                        raise ValueError("EXPAND_NEIGHBORS requires an existing candidate pool")
+                    evidence_memory_ids = {item.memory_id for item in evidence}
+                    relevant_pool = [item for item in pool if item.memory.memory_id in evidence_memory_ids]
+                    if not relevant_pool:
+                        raise ValueError("EXPAND_NEIGHBORS requires existing answer evidence")
                     expanded = self._expand_neighbors(
-                        pool,
+                        relevant_pool,
                         memory_store,
                         action.arguments["window"],
                     )
@@ -140,18 +135,15 @@ class ToolExecutor:
                         prioritize_incoming=False,
                     )
                     pool_has_candidates = True
-                    evidence_added = len(self._refresh_evidence_from_pool(evidence, pool, source="EXPAND_NEIGHBORS"))
-                elif action.tool == "DROP":
-                    if evidence_revision <= last_drop_revision:
-                        raise ValueError("DROP requires evidence added or enriched since the previous DROP")
-                    pool = self._drop_pool(pool, action.arguments["evidence_ids"], evidence_ids_by_memory)
-                    pool_has_candidates = True
-                    self._refresh_evidence_from_pool(evidence, pool, source="DROP")
-                    last_drop_revision = evidence_revision
+                    selected = self._select_evidence_pool_sync(pool, query)
+                    evidence_added = len(
+                        self._refresh_evidence_from_pool(evidence, selected, source="EXPAND_NEIGHBORS")
+                    )
                 elif action.tool == "INSPECT_RAW":
                     remaining = max(0, self.max_raw_inspections - raw_calls)
+                    evidence_memory_ids = {item.memory_id for item in evidence}
                     inspected = self._inspect_raw(
-                        pool,
+                        [item for item in pool if item.memory.memory_id in evidence_memory_ids],
                         query,
                         remaining,
                         question_image=question_image,
@@ -164,10 +156,6 @@ class ToolExecutor:
             except Exception as exc:
                 step_error = str(exc)
                 error = f"action {index} {action.tool}: {exc}"
-            if pool_has_candidates:
-                self._ensure_public_evidence_ids(pool, evidence_ids_by_memory)
-            if evidence_added:
-                evidence_revision += 1
             steps.append(
                 ExecutionStep(
                     index=index,
@@ -180,9 +168,6 @@ class ToolExecutor:
             )
             if stopped or step_error:
                 break
-        if not evidence and not error and pool_has_candidates:
-            evidence = self._pool_evidence(pool, source="FINAL_POOL")
-
         return ExecutionResult(
             evidence=evidence,
             steps=steps,
@@ -284,46 +269,31 @@ class ToolExecutor:
             overflow,
         )
 
-    @staticmethod
-    def _ensure_public_evidence_ids(pool: List[PoolItem], evidence_ids_by_memory: dict[str, str]) -> None:
-        """Assign stable trajectory-local IDs only to memories exposed in the working pool."""
-        next_id = len(evidence_ids_by_memory) + 1
-        for item in pool:
-            memory_id = item.memory.memory_id
-            if memory_id in evidence_ids_by_memory:
-                continue
-            evidence_ids_by_memory[memory_id] = f"E{next_id}"
-            next_id += 1
+    def _select_evidence_pool_sync(self, pool: List[PoolItem], query: str) -> List[PoolItem]:
+        """Apply an optional synchronous selector in legacy executor paths.
 
-    @staticmethod
-    def _drop_pool(
-        pool: List[PoolItem],
-        evidence_ids: List[str],
-        evidence_ids_by_memory: dict[str, str],
-    ) -> List[PoolItem]:
-        """Atomically remove current candidates referenced by public evidence IDs."""
-        current_memory_by_evidence_id = {
-            evidence_ids_by_memory.get(item.memory.memory_id): item.memory.memory_id for item in pool
-        }
-        normalized_ids = [value.strip() for value in evidence_ids]
-        unknown = [value for value in normalized_ids if value not in current_memory_by_evidence_id]
-        if unknown:
-            raise ValueError(f"DROP references unknown current evidence IDs: {unknown}")
-        dropped_memory_ids = {current_memory_by_evidence_id[value] for value in normalized_ids}
-        return [item for item in pool if item.memory.memory_id not in dropped_memory_ids]
-
-    @staticmethod
-    def _topk_turns(pool: List[PoolItem], k: int) -> List[PoolItem]:
-        selected_turns = []
-        selected = []
-        for item in pool:
-            turn_id = item.memory.turn_id
-            if turn_id not in selected_turns:
-                if len(selected_turns) >= k:
-                    continue
-                selected_turns.append(turn_id)
-            selected.append(item)
-        return selected
+        Native ToolAgentLoop execution uses the asynchronous model selector in
+        :class:`OPDToolSession`. This hook keeps direct ``ToolExecutor.run``
+        callers testable without coupling the executor to an HTTP event loop.
+        """
+        if self.evidence_selector is None:
+            return list(pool)
+        selector = getattr(self.evidence_selector, "select_sync", self.evidence_selector)
+        candidates = [
+            {
+                "candidate_id": f"C{index}",
+                **self._pool_evidence([item], source="CANDIDATE")[0].fields,
+            }
+            for index, item in enumerate(pool, start=1)
+        ]
+        selected = selector(query=query, candidates=candidates)
+        if hasattr(selected, "selected_candidate_ids"):
+            selected = selected.selected_candidate_ids
+        selected_ids = {str(value).strip() for value in selected}
+        allowed_ids = {f"C{index}" for index in range(1, len(pool) + 1)}
+        if not selected_ids.issubset(allowed_ids):
+            raise ValueError("semantic selector returned an unknown candidate ID")
+        return [item for index, item in enumerate(pool, start=1) if f"C{index}" in selected_ids]
 
     @staticmethod
     def _expand_neighbors(
@@ -512,29 +482,6 @@ class ToolExecutor:
             suffix = f"t{suffix}"
         return f"{cls._canonical_date(text)}{suffix}"
 
-    @classmethod
-    def _sort(
-        cls,
-        pool: List[PoolItem],
-        field: str,
-        order: str,
-    ) -> List[PoolItem]:
-        reverse = order == "desc"
-        if field == "score":
-            key = lambda item: item.score
-        elif field == "turn_id":
-            key = lambda item: cls._natural_key(item.memory.turn_id)
-        else:
-            key = lambda item: str(item.memory.field_value(field) or "")
-        return sorted(pool, key=key, reverse=reverse)
-
-    @staticmethod
-    def _natural_key(value: str) -> tuple[Any, ...]:
-        return tuple(
-            int(part) if part.isdigit() else part.lower()
-            for part in re.split(r"(\d+)", str(value or ""))
-        )
-
     @staticmethod
     def _public_content(memory: Any) -> str:
         """Return answer-bearing content with the public dialogue speaker name.
@@ -653,7 +600,7 @@ class ToolExecutor:
     ) -> List[EvidenceItem]:
         if self.raw_inspector is None:
             return []
-        inspect_pool = [item for item in pool if item.retrieved]
+        inspect_pool = list(pool)
         if not inspect_pool:
             return []
         evidence = []

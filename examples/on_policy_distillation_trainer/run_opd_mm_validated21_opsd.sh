@@ -1,0 +1,94 @@
+#!/usr/bin/env bash
+#
+# GPU layout: 0-3 student, 4-5 frozen teacher, 6-7 local Qwen3.5-9B service.
+
+set -euo pipefail
+
+SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+REPO_ROOT=$(cd "$SCRIPT_DIR/../.." && pwd)
+
+# Ray sees GPUs 0-5: four are assigned to the student and two to the teacher.
+# The outcome server is launched separately with physical GPUs 6-7.
+export TRAIN_GPUS=${TRAIN_GPUS:-0,1,2,3,4,5}
+export NGPUS_PER_NODE=${NGPUS_PER_NODE:-4}
+export TEACHER_NGPUS_PER_NODE=${TEACHER_NGPUS_PER_NODE:-2}
+export TEACHER_TP=${TEACHER_TP:-2}
+export VERL_AGENT_LOOP_WORKER_CUDA_DEVICES=${VERL_AGENT_LOOP_WORKER_CUDA_DEVICES:-0,1,2,3}
+
+export MODEL_ROOT=${MODEL_ROOT:-$REPO_ROOT/models}
+export MODEL_4B_PATH=${MODEL_4B_PATH:-/home/guojr/data/pretrained_models/Qwen/Qwen3.5-4B}
+export MODEL_9B_PATH=${MODEL_9B_PATH:-/home/guojr/data/pretrained_models/Qwen/Qwen3.5-9B}
+export STUDENT_MODEL=${STUDENT_MODEL:-$MODEL_4B_PATH}
+export TEACHER_MODEL=${TEACHER_MODEL:-$MODEL_4B_PATH}
+export OPD_MM_DENSE_MODEL_PATH=${OPD_MM_DENSE_MODEL_PATH:-$MODEL_ROOT/all-MiniLM-L6-v2}
+export OPD_MM_VISION_MODEL_PATH=${OPD_MM_VISION_MODEL_PATH:-$MODEL_ROOT/SigLIP-Base-Patch16-384}
+export OPD_MM_HYBRID_MODEL_PATH=${OPD_MM_HYBRID_MODEL_PATH:-$MODEL_ROOT/gme-Qwen2-VL-2B-Instruct}
+
+for model_dir in "$MODEL_4B_PATH" "$MODEL_9B_PATH"; do
+    if [[ ! -f "$model_dir/config.json" ]]; then
+        echo "Missing model directory: $model_dir" >&2
+        echo "Override MODEL_4B_PATH or MODEL_9B_PATH with a valid local model directory." >&2
+        exit 1
+    fi
+done
+
+download_hf_model() {
+    local repo_id=$1
+    local target_dir=$2
+    if [[ -f "$target_dir/config.json" ]]; then
+        echo "Using cached retrieval model: $target_dir"
+        return
+    fi
+    echo "Downloading $repo_id to $target_dir"
+    python3 - "$repo_id" "$target_dir" <<'PY'
+import os
+import sys
+
+from huggingface_hub import snapshot_download
+
+snapshot_download(
+    repo_id=sys.argv[1],
+    local_dir=sys.argv[2],
+    token=os.getenv("HF_TOKEN") or None,
+    endpoint="https://huggingface.co",
+)
+PY
+}
+
+download_hf_model "${DENSE_MODEL_REPO:-sentence-transformers/all-MiniLM-L6-v2}" "$OPD_MM_DENSE_MODEL_PATH"
+download_hf_model "${VISION_MODEL_REPO:-google/siglip2-base-patch16-384}" "$OPD_MM_VISION_MODEL_PATH"
+download_hf_model "${HYBRID_MODEL_REPO:-Alibaba-NLP/gme-Qwen2-VL-2B-Instruct}" "$OPD_MM_HYBRID_MODEL_PATH"
+
+export START_OUTCOME_SERVER=1
+export OUTCOME_SERVER_GPUS=${OUTCOME_SERVER_GPUS:-6,7}
+export OUTCOME_MODEL_PATH=${OUTCOME_MODEL_PATH:-$MODEL_9B_PATH}
+export OUTCOME_SERVED_MODEL=${OUTCOME_SERVED_MODEL:-Qwen3.5-9B}
+export OUTCOME_SERVER_HOST=${OUTCOME_SERVER_HOST:-127.0.0.1}
+export OUTCOME_SERVER_PORT=${OUTCOME_SERVER_PORT:-30803}
+export OUTCOME_SERVER_BASE_URL=${OUTCOME_SERVER_BASE_URL:-http://127.0.0.1:30803}
+export OUTCOME_SERVER_TP=${OUTCOME_SERVER_TP:-2}
+export OUTCOME_SERVER_GPU_MEMORY_UTIL=${OUTCOME_SERVER_GPU_MEMORY_UTIL:-0.90}
+export OUTCOME_SERVER_MAX_MODEL_LEN=${OUTCOME_SERVER_MAX_MODEL_LEN:-40000}
+export OUTCOME_SERVER_MAX_NUM_SEQS=${OUTCOME_SERVER_MAX_NUM_SEQS:-128}
+export OUTCOME_SERVER_MAX_NUM_BATCHED_TOKENS=${OUTCOME_SERVER_MAX_NUM_BATCHED_TOKENS:-65536}
+export OPD_MM_VERIFIER_BASE_URL="$OUTCOME_SERVER_BASE_URL"
+export OPD_MM_VERIFIER_MODEL="$OUTCOME_SERVED_MODEL"
+export NO_PROXY="${NO_PROXY:+$NO_PROXY,}127.0.0.1,localhost"
+export no_proxy="$NO_PROXY"
+
+export TRAIN_BATCH_SIZE=${TRAIN_BATCH_SIZE:-24}
+export PPO_MINI_BATCH_SIZE=${PPO_MINI_BATCH_SIZE:-24}
+export VAL_BATCH_SIZE=${VAL_BATCH_SIZE:-40}
+export AGENT_LOOP_NUM_WORKERS=${AGENT_LOOP_NUM_WORKERS:-12}
+export REWARD_WORKERS=${REWARD_WORKERS:-16}
+export ROLLOUT_GPU_MEM_UTIL=${ROLLOUT_GPU_MEM_UTIL:-0.50}
+export ROLLOUT_MAX_NUM_BATCHED_TOKENS=${ROLLOUT_MAX_NUM_BATCHED_TOKENS:-8192}
+export TEACHER_GPU_MEMORY_UTIL=${TEACHER_GPU_MEMORY_UTIL:-0.85}
+export TEACHER_MAX_NUM_BATCHED_TOKENS=${TEACHER_MAX_NUM_BATCHED_TOKENS:-8192}
+export DISTILLATION_TOPK=${DISTILLATION_TOPK:-50}
+export WANDB_MODE=${WANDB_MODE:-online}
+export WANDB_API_KEY=${WANDB_API_KEY:-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}
+export WANDB_ENTITY=${WANDB_ENTITY:-mmem}
+export WANDB_VAL_CASES=${WANDB_VAL_CASES:-4}
+
+exec bash "$SCRIPT_DIR/run_opd_mm_validated21_opsd_fsdp.sh" "$@"

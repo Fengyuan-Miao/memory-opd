@@ -41,7 +41,7 @@ HERMES_TOOL_CALL_XML_RE = re.compile(r"<tool_call>(.*?)</tool_call>", re.DOTALL)
 QWEN3_FUNCTION_RE = re.compile(r"<function=(.*?)</function>|<function=(.*)$", re.DOTALL)
 QWEN3_PARAMETER_START_RE = re.compile(r"<parameter=([^>\n]+)>", re.DOTALL)
 QWEN3_INLINE_XML_ARG_RE = re.compile(
-    r"<(field|op|value|method|top_k|query|target|instruction|window|k|order|evidence_ids)=([^>\n]+)>",
+    r"<(field|op|value|method|top_k|query|target|instruction|window)=([^>\n]+)>",
     re.IGNORECASE,
 )
 QWEN3_KEY_VALUE_ARG_RE = re.compile(
@@ -50,11 +50,8 @@ QWEN3_KEY_VALUE_ARG_RE = re.compile(
 )
 _TOOL_CALL_NAME_BY_ACTION = {
     "FILTER": "filter",
-    "SORT": "sort",
-    "TOPK": "topk",
     "RETRIEVE": "retrieve",
     "EXPAND_NEIGHBORS": "expand_neighbors",
-    "DROP": "drop",
     "INSPECT_RAW": "inspect_raw",
     "STOP": "stop",
 }
@@ -63,7 +60,6 @@ _VERIFIER_MISSING_EVIDENCE_TYPES = {
     "no_public_evidence",
     "irrelevant_evidence",
     "missing_metadata_constraint",
-    "candidate_set_too_broad",
     "missing_neighbor_context",
     "missing_temporal_order",
     "missing_raw_visual_detail",
@@ -217,11 +213,10 @@ def _normalize_missing_evidence_type(value: Any) -> str | None:
         "metadata_filter": "missing_metadata_constraint",
         "needs_metadata_filter": "missing_metadata_constraint",
         "filter": "missing_metadata_constraint",
-        "too_broad": "candidate_set_too_broad",
-        "broad": "candidate_set_too_broad",
-        "narrow": "candidate_set_too_broad",
-        "needs_narrowing": "candidate_set_too_broad",
-        "needs_topk": "candidate_set_too_broad",
+        "too_broad": "irrelevant_evidence",
+        "broad": "irrelevant_evidence",
+        "narrow": "irrelevant_evidence",
+        "needs_narrowing": "irrelevant_evidence",
         "neighbor_context": "missing_neighbor_context",
         "neighbour_context": "missing_neighbor_context",
         "needs_neighbor_context": "missing_neighbor_context",
@@ -232,7 +227,6 @@ def _normalize_missing_evidence_type(value: Any) -> str | None:
         "time_order": "missing_temporal_order",
         "needs_temporal_order": "missing_temporal_order",
         "order": "missing_temporal_order",
-        "sort": "missing_temporal_order",
         "visual_detail": "missing_raw_visual_detail",
         "raw_visual": "missing_raw_visual_detail",
         "needs_raw_visual_detail": "missing_raw_visual_detail",
@@ -278,22 +272,6 @@ def _observation_pool_count(observation: dict[str, Any]) -> int:
         if isinstance(items, list):
             return len(items)
     return 0
-
-
-def _observation_evidence_ids(observation: dict[str, Any]) -> set[str]:
-    """Return public IDs that the teacher is allowed to reference in DROP."""
-    evidence_ids: set[str] = set()
-    for key in ("evidence_catalog", "evidence_preview", "pool_preview", "evidence"):
-        items = observation.get(key)
-        if not isinstance(items, list):
-            continue
-        for item in items:
-            if not isinstance(item, dict):
-                continue
-            evidence_id = str(item.get("evidence_id") or "").strip()
-            if evidence_id:
-                evidence_ids.add(evidence_id)
-    return evidence_ids
 
 
 def _observation_has_candidate_context(observation: dict[str, Any]) -> bool:
@@ -658,19 +636,11 @@ def _normalize_teacher_tool_action(action: ToolAction) -> ToolAction:
         op_aliases = {"=": "eq", "==": "eq", "equals": "eq", "equal": "eq", "not_equal": "neq", "!=": "neq"}
         if op:
             args["op"] = op_aliases.get(op, op)
-    elif tool == "SORT":
-        if "field" in args:
-            field = str(args["field"]).strip().lower()
-            args["field"] = "timestamp" if field in {"date", "session_date", "time"} else field
-        if "order" in args:
-            args["order"] = str(args["order"]).strip().lower()
     elif tool == "INSPECT_RAW":
         if "target" in args:
             args["target"] = str(args["target"]).strip().lower()
         if "instruction" in args:
             args["instruction"] = str(args["instruction"]).strip()
-    elif tool == "DROP" and isinstance(args.get("evidence_ids"), list):
-        args["evidence_ids"] = [str(value).strip().upper() for value in args["evidence_ids"]]
     return ToolAction(tool, args)
 
 
@@ -682,8 +652,6 @@ def _has_explicit_teacher_sft_arguments(action: ToolAction) -> bool:
         return "method" in args and "top_k" in args
     if tool == "INSPECT_RAW":
         return "target" in args and "instruction" in args
-    if tool == "DROP":
-        return "evidence_ids" in args
     return True
 
 
@@ -969,16 +937,14 @@ observation. Do not copy verifier.reason or private content into an argument. A 
 question/history/observation text.
 
 Choose the schema-described tool whose effect addresses the gap and whose preconditions hold. Do not repeat an
-identical action when the latest observation is unchanged. DROP, SORT, and TOPK cannot recover a fact absent from
-the current candidates; use them only when removing noise or changing current-pool order/size resolves the gap.
-FILTER searches the complete hidden memory store and merges matching records into the working pool; it is not
-limited to currently visible evidence and does not remove unrelated items already in the pool. Use FILTER only when
-the question or public state provides a defensible modality, timestamp, or status condition. Never invent such a
-value. If the current pool is too broad, use DROP or TOPK as appropriate. If no metadata condition is supported and
-a semantic fact is missing, use RETRIEVE.
-Emit exactly one function call with no reasoning, markdown, JSON, hidden memory IDs, or unknown arguments. Public
-evidence_id values may be copied only into DROP.evidence_ids. The chat template supplies the tool descriptions and
-serialization.
+identical action when the latest observation is unchanged. FILTER searches the complete hidden memory store and
+merges matching records into a private candidate pool; it is not limited to currently visible evidence. Use FILTER
+only when the question or public state provides a defensible modality, timestamp, or status condition. Never invent
+such a value. RETRIEVE and FILTER results are automatically screened for answer relevance before becoming public
+evidence. EXPAND_NEIGHBORS is anchored on current evidence and is screened again. If no metadata condition is
+supported and a semantic fact is missing, use RETRIEVE.
+Emit exactly one function call with no reasoning, markdown, JSON, hidden memory IDs, or unknown arguments. The chat
+template supplies the tool descriptions and serialization.
 
 Question:
 {query}
@@ -1192,15 +1158,6 @@ def finalize_online_step_correction(
     sample_id = str(request["sample_id"])
     step_index = int(request["step_index"])
     verifier_feedback = _as_dict(request.get("verifier_feedback"))
-    if teacher_action.tool == "DROP":
-        observation = _as_dict(request.get("observation"))
-        requested_ids = set(teacher_action.arguments.get("evidence_ids") or [])
-        if not requested_ids or not requested_ids.issubset(_observation_evidence_ids(observation)):
-            return None
-        evidence_revision = int(observation.get("evidence_revision") or 0)
-        last_drop_revision = int(observation.get("last_drop_revision") or 0)
-        if evidence_revision <= last_drop_revision:
-            return None
     if verifier_feedback:
         evidence_sufficient = bool(verifier_feedback.get("evidence_sufficient"))
         if (teacher_action.tool == "STOP") != evidence_sufficient:
