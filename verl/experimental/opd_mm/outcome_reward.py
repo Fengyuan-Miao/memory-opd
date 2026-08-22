@@ -182,7 +182,7 @@ def _answer_messages(query: str, evidence: list[Any]) -> list[dict[str, str]]:
                 "Resolve relative dates from session_date and explicit event wording, not from an unrelated timestamp. "
                 "Return an image_id only when the question asks which image or asks for an image ID; an image attached "
                 "to the question or present in evidence does not by itself make an image ID the answer. "
-                "For ordinary factual questions, answer with the requested fact rather than an evidence_id or image_id."
+                "For ordinary factual questions, answer with the requested fact rather than an image_id."
             ),
         },
         {

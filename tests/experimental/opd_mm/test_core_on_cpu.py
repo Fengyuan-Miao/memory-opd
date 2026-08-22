@@ -67,13 +67,11 @@ from verl.experimental.opd_mm.teacher_privilege import (
     build_teacher_privileged_prompt,
 )
 from verl.experimental.opd_mm.tools import (
-    OPDDropTool,
     OPDExpandNeighborsTool,
     OPDFilterTool,
     OPDInspectRawTool,
     OPDRetrieveTool,
     OPDStopTool,
-    OPDTopKTool,
     hidden_store_from_records,
     openai_tool_schemas,
 )
@@ -757,15 +755,11 @@ def test_validator_accepts_expand_neighbors_and_rejects_invalid_arguments() -> N
         validator.validate([{"tool": "EXPAND_NEIGHBORS", "window": 1, "memory_id": "safe"}])
 
 
-def test_validator_accepts_drop_public_ids_and_rejects_invalid_sets() -> None:
+def test_validator_rejects_removed_pool_editing_actions() -> None:
     validator = TrajectoryValidator(max_actions=4)
-
-    validated = validator.validate([{"tool": "DROP", "evidence_ids": ["E1", "E12"]}])
-    assert validated[0] == ToolAction("DROP", {"evidence_ids": ["E1", "E12"]})
-
-    for evidence_ids in ([], ["E0"], ["m_001"], ["E1", "E1"], "E1"):
-        with pytest.raises(TrajectoryValidationError):
-            validator.validate([{"tool": "DROP", "evidence_ids": evidence_ids}])
+    for tool in ("SORT", "TOPK", "DROP"):
+        with pytest.raises(TrajectoryValidationError, match="unsupported tool"):
+            validator.validate([{"tool": tool}])
 
 
 def test_opd_state_prompt_keeps_action_history_and_only_latest_observation() -> None:
@@ -844,23 +838,6 @@ def test_repeated_retrieve_merges_pool_by_default() -> None:
     assert [item.memory_id for item in result.evidence] == ["m_assistant_image", "m_cat_text"]
 
 
-def test_drop_removes_public_evidence_ids_from_merged_pool() -> None:
-    result = ToolExecutor(retriever=QuerySwitchRetriever()).run(
-        [
-            {"tool": "RETRIEVE", "method": "hybrid", "top_k": 1, "query": "cat"},
-            {"tool": "RETRIEVE", "method": "hybrid", "top_k": 1, "query": "assistant"},
-            {"tool": "DROP", "evidence_ids": ["E1"]},
-            {"tool": "STOP"},
-        ],
-        query="Find multiple memories.",
-        memory_store=HiddenMemoryStore(_records()),
-    )
-
-    assert not result.error
-    assert result.final_memory_ids == ["m_assistant_image"]
-    assert [item.memory_id for item in result.evidence] == ["m_assistant_image"]
-
-
 def test_repeated_retrieve_always_searches_original_memory_store() -> None:
     retriever = PoolAwareRetriever()
     result = ToolExecutor(retriever=retriever).run(
@@ -883,8 +860,6 @@ def test_executor_composes_generic_tools_to_timestamped_image() -> None:
     result = ToolExecutor().run(
         [
             {"tool": "FILTER", "field": "timestamp", "op": "eq", "value": "2026-01-01T10:00:01"},
-            {"tool": "SORT", "field": "timestamp", "order": "desc"},
-            {"tool": "TOPK", "k": 1},
         ],
         query="Which image did I upload last?",
         memory_store=store,
@@ -1002,12 +977,12 @@ def test_expand_neighbors_requires_existing_candidate_pool_and_does_not_expose_f
         memory_store=HiddenMemoryStore(_neighbor_records()),
     )
 
-    assert "EXPAND_NEIGHBORS requires an existing candidate pool" in result.error
+    assert "EXPAND_NEIGHBORS requires existing answer evidence" in result.error
     assert result.evidence == []
     assert result.steps[0].error
 
 
-def test_inspect_raw_only_reads_retrieved_candidate_pool() -> None:
+def test_inspect_raw_only_reads_semantically_selected_evidence() -> None:
     store = HiddenMemoryStore(_records())
     inspector = FakeRawInspector()
 
@@ -1020,9 +995,9 @@ def test_inspect_raw_only_reads_retrieved_candidate_pool() -> None:
         memory_store=store,
     )
 
-    assert inspector.calls == []
-    assert filtered_result.steps[1].evidence_added == 0
-    assert all("visual_observation" not in item.fields for item in filtered_result.evidence)
+    assert inspector.calls == ["images/cat.png", "images/chart.png"]
+    assert filtered_result.steps[1].evidence_added == 2
+    assert sum(item.source == "INSPECT_RAW" for item in filtered_result.evidence) == 2
 
     retrieved_inspector = FakeRawInspector()
     retrieved_result = ToolExecutor(
@@ -1128,7 +1103,7 @@ async def test_verl_native_opd_tools_share_hidden_state_and_hide_ids() -> None:
     assert observation["pool_count"] == 1
     assert observation["evidence"][0]["content"] == "A tabby cat sitting on a sofa."
     assert observation["evidence"][0]["image_id"] == "D1:IMG_001"
-    assert observation["evidence"][0]["evidence_id"] == "E1"
+    assert "evidence_id" not in observation["evidence"][0]
     assert "raw_pointer" not in observation["evidence"][0]
     assert "summary" not in observation["evidence"][0]
     assert "source_type" not in observation["evidence"][0]
@@ -1141,7 +1116,6 @@ async def test_verl_native_opd_tools_share_hidden_state_and_hide_ids() -> None:
     assert agent_data.extra_fields["opd_mm"]["pool_count"] == 1
     assert agent_data.extra_fields["opd_mm"]["evidence_count"] == 1
     assert agent_data.extra_fields["opd_mm"]["evidence"][0]["image_id"] == "D1:IMG_001"
-    assert agent_data.extra_fields["opd_mm"]["evidence"][0]["evidence_id"] == "E1"
     assert "source" not in agent_data.extra_fields["opd_mm"]["evidence"][0]
     assert "author" not in agent_data.extra_fields["opd_mm"]["evidence"][0]
     assert "memory_id" not in json.dumps(agent_data.extra_fields["opd_mm"])
@@ -1175,7 +1149,7 @@ async def test_verl_native_filter_always_merges_from_full_memory() -> None:
     observation = json.loads(response.text)
     assert observation["pool_count"] == 4
     assert observation["evidence_count"] == 4
-    assert len({item["evidence_id"] for item in observation["evidence"]}) == 4
+    assert all("evidence_id" not in item for item in observation["evidence"])
 
 
 @pytest.mark.asyncio
@@ -1197,10 +1171,10 @@ async def test_retrieve_tool_adds_public_evidence_before_inspect_raw() -> None:
     assert observation["evidence_count"] == 2
     assert metrics["opd_mm_evidence_count"] == 2
     assert observation["new_evidence_count"] == 2
-    assert observation["new_evidence_ids"] == ["E1", "E2"]
+    assert "new_evidence_ids" not in observation
     assert observation["evidence_revision"] == 1
-    assert observation["last_drop_revision"] == 0
-    assert [item["evidence_id"] for item in observation["evidence"]] == ["E1", "E2"]
+    assert observation["semantic_filter_status"] == "fallback_all_unconfigured"
+    assert all("evidence_id" not in item for item in observation["evidence"])
     assert all("source" not in item and "author" not in item for item in observation["evidence"])
     assert {item["modality"] for item in observation["evidence"]} == {"text", "image"}
     assert any("tabby cat" in item["content"] for item in observation["evidence"])
@@ -1217,7 +1191,12 @@ async def test_retrieve_tool_adds_public_evidence_before_inspect_raw() -> None:
 
 
 @pytest.mark.asyncio
-async def test_verl_native_retrieve_merges_and_drop_is_atomic() -> None:
+async def test_verl_native_discovery_exposes_only_semantically_selected_evidence() -> None:
+    async def select_second(*, query: str, candidates: list[dict[str, Any]]) -> list[str]:
+        assert query == "Find the cat and assistant image."
+        assert all("memory_id" not in json.dumps(candidate) for candidate in candidates)
+        return ["C2" if len(candidates) > 1 else "C1"]
+
     records = [record.to_dict() for record in _records()]
     agent_data = FakeAgentData(
         messages=[{"role": "user", "content": "Find the cat and assistant image."}],
@@ -1226,73 +1205,55 @@ async def test_verl_native_retrieve_merges_and_drop_is_atomic() -> None:
                 "query": "Find the cat and assistant image.",
                 "records": records,
                 "retriever": QuerySwitchRetriever(),
+                "evidence_selector": select_second,
                 "vector_store_dir": None,
             }
         },
     )
     retrieve_tool = OPDRetrieveTool(config={"type": "native"}, tool_schema=None)
-    drop_tool = OPDDropTool(config={"type": "native"}, tool_schema=None)
-    agent_data._active_tools = {"retrieve": retrieve_tool, "drop": drop_tool}
-
-    first, _, _ = await retrieve_tool.execute(
+    await retrieve_tool.execute(
         "instance", {"method": "hybrid", "top_k": 1, "query": "cat"}, agent_data=agent_data
     )
-    second, _, _ = await retrieve_tool.execute(
+    response, _, metrics = await retrieve_tool.execute(
         "instance", {"method": "hybrid", "top_k": 1, "query": "assistant"}, agent_data=agent_data
     )
-    first_observation = json.loads(first.text)
-    second_observation = json.loads(second.text)
-    assert first_observation["evidence"][0]["evidence_id"] == "E1"
-    assert [item["evidence_id"] for item in second_observation["evidence"]] == ["E2", "E1"]
-    dynamic_drop_schema = next(
-        schema for schema in agent_data._active_tool_schemas if schema["function"]["name"] == "drop"
-    )
-    assert dynamic_drop_schema["function"]["parameters"]["properties"]["evidence_ids"]["items"]["enum"] == [
-        "E2",
-        "E1",
-    ]
+    observation = json.loads(response.text)
+    assert observation["pool_count"] == 2
+    assert observation["evidence_count"] == 1
+    assert observation["semantic_filter_candidate_count"] == 2
+    assert observation["semantic_filter_selected_count"] == 1
+    assert observation["semantic_filter_status"] == "ok"
+    assert metrics["opd_mm_semantic_filter_fallback"] == 0.0
 
-    failed, _, failed_metrics = await drop_tool.execute(
-        "instance", {"evidence_ids": ["E1", "E999"]}, agent_data=agent_data
-    )
-    failed_observation = json.loads(failed.text)
-    assert "unknown current evidence IDs" in failed_observation["error"]
-    assert failed_observation["pool_count"] == 2
-    assert failed_metrics["agent_loop_terminate"] is True
 
-    clean_agent_data = FakeAgentData(
-        messages=[{"role": "user", "content": "Find the cat and assistant image."}],
+@pytest.mark.asyncio
+async def test_semantic_selector_failure_preserves_candidates_and_is_visible() -> None:
+    async def fail_selection(**_: Any) -> list[str]:
+        raise RuntimeError("selector unavailable")
+
+    agent_data = FakeAgentData(
+        messages=[{"role": "user", "content": "Find active text memories."}],
         tools_kwargs={
             "opd_mm": {
-                "query": "Find the cat and assistant image.",
-                "records": records,
-                "retriever": QuerySwitchRetriever(),
+                "query": "Find active text memories.",
+                "records": [record.to_dict() for record in _records()],
+                "evidence_selector": fail_selection,
                 "vector_store_dir": None,
             }
         },
     )
-    await retrieve_tool.execute(
-        "instance", {"method": "hybrid", "top_k": 1, "query": "cat"}, agent_data=clean_agent_data
+    filter_tool = OPDFilterTool(config={"type": "native"}, tool_schema=None)
+    response, _, metrics = await filter_tool.execute(
+        "instance",
+        {"field": "modality", "op": "eq", "value": "text"},
+        agent_data=agent_data,
     )
-    await retrieve_tool.execute(
-        "instance", {"method": "hybrid", "top_k": 1, "query": "assistant"}, agent_data=clean_agent_data
-    )
-    dropped, _, _ = await drop_tool.execute(
-        "instance", {"evidence_ids": ["E1"]}, agent_data=clean_agent_data
-    )
-    dropped_observation = json.loads(dropped.text)
-    assert dropped_observation["pool_count"] == 1
-    assert dropped_observation["evidence_count"] == 1
-    assert dropped_observation["dropped_evidence_ids"] == ["E1"]
-    assert dropped_observation["last_drop_revision"] == dropped_observation["evidence_revision"]
-    assert dropped_observation["evidence"][0]["evidence_id"] == "E2"
-    repeated, _, repeated_metrics = await drop_tool.execute(
-        "instance", {"evidence_ids": ["E2"]}, agent_data=clean_agent_data
-    )
-    repeated_observation = json.loads(repeated.text)
-    assert "requires evidence added or enriched" in repeated_observation["error"]
-    assert repeated_observation["pool_count"] == 1
-    assert repeated_metrics["agent_loop_terminate"] is True
+    observation = json.loads(response.text)
+    assert observation["pool_count"] == observation["evidence_count"] == 2
+    assert observation["semantic_filter_status"] == "fallback_all_error"
+    assert "selector unavailable" in observation["semantic_filter_error"]
+    assert observation["error"] == ""
+    assert metrics["opd_mm_semantic_filter_fallback"] == 1.0
 
 
 @pytest.mark.asyncio
@@ -1324,7 +1285,6 @@ async def test_bounded_merge_prioritizes_latest_discovery_results() -> None:
     assert observation["pool_overflow_count"] == 1
     assert observation["evidence"] == [
         {
-            "evidence_id": "E2",
             "content": "An assistant-generated chart.",
             "image_id": "D1:IMG_002",
             "timestamp": "2026-01-01T11:00:00",
@@ -1390,7 +1350,7 @@ async def test_tool_observation_includes_complete_public_evidence() -> None:
     assert observation["pool_overflow_count"] == 6
     assert observation["evidence_count"] == 24
     assert len(observation["evidence"]) == 24
-    assert len({item["evidence_id"] for item in observation["evidence"]}) == 24
+    assert all("evidence_id" not in item for item in observation["evidence"])
     assert all(len(item["content"]) > 1000 for item in observation["evidence"])
     assert "pool_preview" not in observation
     assert "evidence_preview" not in observation
@@ -1445,9 +1405,7 @@ async def test_inspect_raw_can_use_async_teacher_service_callback() -> None:
     assert observation["error"] == ""
     assert observation["new_evidence_count"] == 1
     assert observation["evidence_revision"] == 2
-    assert observation["last_drop_revision"] == 0
-    evidence_ids = [item["evidence_id"] for item in observation["evidence"]]
-    assert len(evidence_ids) == len(set(evidence_ids))
+    assert all("evidence_id" not in item for item in observation["evidence"])
     inspected = next(item for item in observation["evidence"] if item.get("image_id") == "D1:IMG_001")
     assert "source" not in inspected
     assert "author" not in inspected
@@ -1505,7 +1463,7 @@ async def test_verl_native_expand_neighbors_without_candidates_errors_and_termin
     response, _, metrics = await expand_tool.execute("instance", {"window": 1}, agent_data=agent_data)
 
     observation = json.loads(response.text)
-    assert "EXPAND_NEIGHBORS requires an existing candidate pool" in observation["error"]
+    assert "EXPAND_NEIGHBORS requires existing answer evidence" in observation["error"]
     assert observation["evidence_count"] == 0
     assert metrics["agent_loop_terminate"] is True
 
@@ -1763,10 +1721,12 @@ async def test_opd_tool_session_marks_forced_max_action_stop() -> None:
         tools_kwargs={"opd_mm": {"query": "Find the tabby cat.", "records": records}},
     )
     retrieve_tool = OPDRetrieveTool(config={"type": "native", "max_actions": 2}, tool_schema=None)
-    topk_tool = OPDTopKTool(config={"type": "native", "max_actions": 2}, tool_schema=None)
+    filter_tool = OPDFilterTool(config={"type": "native", "max_actions": 2}, tool_schema=None)
 
     await retrieve_tool.execute("instance", {"method": "bm25", "top_k": 2}, agent_data=agent_data)
-    response, _, metrics = await topk_tool.execute("instance", {"k": 1}, agent_data=agent_data)
+    response, _, metrics = await filter_tool.execute(
+        "instance", {"field": "status", "op": "eq", "value": "active"}, agent_data=agent_data
+    )
 
     observation = json.loads(response.text)
     state = agent_data.extra_fields["opd_mm"]
@@ -1875,11 +1835,8 @@ def test_tool_config_loads_verl_native_opd_tools() -> None:
     )
     assert [tool.name for tool in tools] == [
         "filter",
-        "sort",
-        "topk",
         "retrieve",
         "expand_neighbors",
-        "drop",
         "inspect_raw",
         "stop",
     ]
@@ -1887,6 +1844,7 @@ def test_tool_config_loads_verl_native_opd_tools() -> None:
     assert inspect_tool.config["raw_inspector_backend"] == "teacher"
     assert inspect_tool.config["max_actions"] == 10
     assert inspect_tool.config["max_pool_size"] == 24
+    assert inspect_tool.config["evidence_selector_backend"] == "teacher"
     assert "raw_inspector_url" not in inspect_tool.config
 
 
@@ -1909,11 +1867,8 @@ def test_sft_converter_can_emit_native_tool_call_records() -> None:
     assert record["messages"][2]["tool_calls"][0]["function"]["name"] == "retrieve"
     assert [schema["function"]["name"] for schema in record["tools"]] == [
         "filter",
-        "sort",
-        "topk",
         "retrieve",
         "expand_neighbors",
-        "drop",
         "inspect_raw",
         "stop",
     ]
@@ -1941,10 +1896,9 @@ def test_opd_sample_converts_to_on_policy_distillation_row() -> None:
     ]
     system_prompt = row["prompt"][0]["content"]
     assert "RETRIEVE and FILTER search the original hidden store" in system_prompt
-    assert "DROP removes current evidence" in system_prompt
-    assert "assess the accumulated" in system_prompt
-    assert "call DROP next; otherwise continue without DROP" in system_prompt
-    assert "do not repeat an unchanged action without a state-based reason" in system_prompt
+    assert "internal semantic selector" in system_prompt
+    assert "private candidate pool" in system_prompt
+    assert "do not repeat an unchanged action" in system_prompt
     assert "hidden memory IDs" in system_prompt
     assert "READ" not in row["prompt"][0]["content"]
     assert row["extra_info"]["need_tools_kwargs"] is True
@@ -2291,47 +2245,6 @@ def test_teacher_xml_correction_accepts_expand_neighbors_tool_call() -> None:
     assert "<function=expand_neighbors>" in target_xml
 
 
-def test_teacher_xml_correction_accepts_drop_id_array() -> None:
-    teacher_xml = (
-        "<tool_call>\n"
-        "<function=drop>\n"
-        "<parameter=evidence_ids>\n[\"E1\", \"E3\"]\n</parameter>\n"
-        "</function>\n"
-        "</tool_call>"
-    )
-    parsed = extract_canonical_tool_call_xml(teacher_xml)
-
-    assert parsed is not None
-    target_xml, action, _ = parsed
-    assert action == ToolAction("DROP", {"evidence_ids": ["E1", "E3"]})
-    assert '["E1","E3"]' in target_xml
-
-    request = {
-        "sample_id": "drop-correction",
-        "step_index": 2,
-        "allow_inspect_raw": True,
-        "tool_format": "qwen3_coder",
-        "observation": {
-            "evidence_revision": 2,
-            "last_drop_revision": 1,
-            "evidence": [{"evidence_id": "E1"}, {"evidence_id": "E3"}],
-        },
-        "verifier_feedback": {
-            "evidence_sufficient": False,
-            "missing_evidence_type": "candidate_set_too_broad",
-        },
-    }
-    correction = finalize_online_step_correction(request, teacher_raw_response=teacher_xml)
-    assert correction is not None
-    assert correction["teacher_actions"] == [{"tool": "DROP", "evidence_ids": ["E1", "E3"]}]
-
-    request["observation"]["evidence"] = [{"evidence_id": "E1"}]
-    assert finalize_online_step_correction(request, teacher_raw_response=teacher_xml) is None
-    request["observation"]["evidence"] = [{"evidence_id": "E1"}, {"evidence_id": "E3"}]
-    request["observation"]["last_drop_revision"] = 2
-    assert finalize_online_step_correction(request, teacher_raw_response=teacher_xml) is None
-
-
 def test_teacher_xml_correction_recovers_unclosed_rewritten_retrieve_query() -> None:
     parsed = extract_canonical_tool_call_xml(
         "<tool_call>\n"
@@ -2636,11 +2549,8 @@ async def test_agent_loop_worker_generates_verifier_and_teacher_for_one_live_sta
     teacher_tools = encoded_tools[1]
     assert [tool["function"]["name"] for tool in teacher_tools] == [
         "filter",
-        "sort",
-        "topk",
         "retrieve",
         "expand_neighbors",
-        "drop",
         "inspect_raw",
         "stop",
     ]
@@ -2943,7 +2853,7 @@ def test_online_xml_correction_requests_include_invalid_student_state() -> None:
     assert "identical action" in requests[0]["teacher_prompt"]
     assert "Allowed calls and arguments:" not in requests[0]["teacher_prompt"]
     assert "Output contract" not in requests[0]["teacher_prompt"]
-    assert "chat template supplies the tool descriptions" in requests[0]["teacher_prompt"]
+    assert "template supplies the tool descriptions" in requests[0]["teacher_prompt"]
 
     correction = finalize_online_step_correction(
         requests[0],
@@ -3053,7 +2963,7 @@ def test_state_verifier_feedback_parser_falls_back_from_expand_neighbors_on_empt
     feedback = parse_state_verifier_feedback(
         '{"evidence_sufficient": false, "reason": "Need neighboring dialogue context.", '
         '"missing_evidence_type": "missing_neighbor_context"}',
-        {"evidence_count": 0, "pool_count": 5, "trace": [{"tool": "SORT"}]},
+        {"evidence_count": 0, "pool_count": 5, "trace": [{"tool": "STOP"}]},
     )
 
     assert feedback["evidence_sufficient"] is False
@@ -3299,11 +3209,8 @@ def test_helpers_build_hidden_store_from_dicts_and_schemas() -> None:
     schemas = openai_tool_schemas(include_inspect_raw=False)
     assert [schema["function"]["name"] for schema in schemas] == [
         "filter",
-        "sort",
-        "topk",
         "retrieve",
         "expand_neighbors",
-        "drop",
         "stop",
     ]
     filter_properties = schemas[0]["function"]["parameters"]["properties"]
@@ -3314,17 +3221,7 @@ def test_helpers_build_hidden_store_from_dicts_and_schemas() -> None:
     assert "modality uses text or image" in filter_value_description
     assert "MEMORY/user/assistant" not in filter_value_description
     assert schemas[0]["function"]["parameters"]["required"] == ["field", "op", "value"]
-    assert schemas[3]["function"]["parameters"]["required"] == ["method", "top_k"]
-    drop_schema = schemas[5]
-    assert drop_schema["function"]["parameters"]["required"] == ["evidence_ids"]
-    assert drop_schema["function"]["parameters"]["properties"]["evidence_ids"]["items"]["pattern"] == "^E[1-9][0-9]*$"
-    assert "Other useful evidence does not prevent removing such items" in drop_schema["function"]["description"]
-    dynamic_schemas = openai_tool_schemas(include_inspect_raw=False, evidence_ids=["E2", "E7"])
-    dynamic_drop_schema = dynamic_schemas[5]
-    assert dynamic_drop_schema["function"]["parameters"]["properties"]["evidence_ids"]["items"]["enum"] == [
-        "E2",
-        "E7",
-    ]
-    inspect_schema = openai_tool_schemas(include_inspect_raw=True)[6]
+    assert schemas[1]["function"]["parameters"]["required"] == ["method", "top_k"]
+    inspect_schema = openai_tool_schemas(include_inspect_raw=True)[3]
     assert inspect_schema["function"]["parameters"]["required"] == ["target", "instruction"]
-    assert "scope" not in schemas[3]["function"]["parameters"]["properties"]
+    assert "scope" not in schemas[1]["function"]["parameters"]["properties"]

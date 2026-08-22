@@ -332,6 +332,7 @@ class AgentData:
         self.last_assistant_content: str = ""
         self.online_state_corrector: Any = None
         self.teacher_raw_inspector: Any = None
+        self.teacher_evidence_selector: Any = None
 
         self.routed_experts = None
 
@@ -391,6 +392,7 @@ class ToolAgentLoop(AgentLoopBase):
         )
         agent_data.online_state_corrector = kwargs.get("_opd_mm_online_state_corrector")
         agent_data.teacher_raw_inspector = kwargs.get("_opd_mm_teacher_raw_inspector")
+        agent_data.teacher_evidence_selector = kwargs.get("_opd_mm_teacher_evidence_selector")
 
         # Per-sample tool selection: filter global tools by extra_info.tool_selection
         extra_info = kwargs.get("extra_info", {}) or {}

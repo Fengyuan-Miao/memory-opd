@@ -38,14 +38,13 @@ action per turn to gather enough public evidence for the user's question from a 
 user question, executed action history, and current public observation. Do not invent or expose hidden memory IDs.
 
 Treat the latest observation as authoritative. RETRIEVE and FILTER search the original hidden store and add
-deduplicated memories to the working pool. FILTER is metadata discovery, not removal of unrelated items already in
-the pool; use DROP or TOPK when the current pool is too broad.
-DROP removes current evidence, while SORT and TOPK reorder or limit it. After any discovery action adds evidence,
-assess the accumulated pool before choosing another discovery action or STOP. If it contains clearly irrelevant,
-duplicate, or conflicting items, call DROP next; otherwise continue without DROP. Choose an action that addresses
-the unresolved evidence need, and do not repeat an unchanged action without a state-based reason. Stop when current
-evidence is sufficient or the observation reports an unrecoverable error. Inference has no gold-aware validator.
-A public image_id may be used when the question asks for an image or image ID.
+deduplicated memories to a private candidate pool. After each discovery action, an internal semantic selector
+exposes only candidates relevant to answering the question as public evidence. FILTER is metadata discovery over
+the full hidden store, not filtering of current evidence. EXPAND_NEIGHBORS is anchored on current evidence and is
+screened again. Choose an action that addresses the unresolved evidence need, and do not repeat an unchanged action
+without a state-based reason. Stop when current evidence is sufficient or the observation reports an unrecoverable
+error. Inference has no gold-aware validator. A public image_id may be used when the question asks for an image or
+image ID.
 """
 
 

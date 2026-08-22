@@ -11,6 +11,11 @@ RUN_TIMESTAMP=${RUN_TIMESTAMP:-$(date +%Y%m%d_%H%M%S)}
 
 WANDB_MODE=${WANDB_MODE:-online}
 WANDB_DISABLE_STATS=${WANDB_DISABLE_STATS:-True}
+WANDB_VAL_CASES=${WANDB_VAL_CASES:-4}
+export WANDB_CONSOLE=${WANDB_CONSOLE:-off}
+export WANDB_DISABLE_CODE=${WANDB_DISABLE_CODE:-true}
+export WANDB_SAVE_CODE=${WANDB_SAVE_CODE:-false}
+export WANDB_LOG_MODEL=${WANDB_LOG_MODEL:-false}
 WANDB_PROXY=${WANDB_PROXY:-}
 WANDB_PROXY_FALLBACK=${WANDB_PROXY_FALLBACK:-http://127.0.0.1:7896}
 WANDB_CONNECTIVITY_TIMEOUT=${WANDB_CONNECTIVITY_TIMEOUT:-5}
@@ -24,7 +29,10 @@ if [[ "${WANDB_MODE,,}" == "online" && -z "$WANDB_PROXY" ]] \
     fi
 fi
 export WANDB_MODE
-WANDB_TRAINER_ARGS=(+trainer.wandb_disable_stats=${WANDB_DISABLE_STATS})
+WANDB_TRAINER_ARGS=(
+    +trainer.wandb_disable_stats=${WANDB_DISABLE_STATS}
+    '+trainer.wandb_metric_include_patterns=["^(actor|critic|distillation)/.*loss$","^val-aux/.*/opd_mm/(answer_correct|evidence_answerable|evidence_count|action_count|repeated_actions|max_actions_reached|empty_evidence|trajectory_error|answer_request_failed|judge_request_failed|evidence_judge_request_failed)/mean@.*$","^training/(global_step|epoch)$"]'
+)
 if [[ -n "$WANDB_PROXY" ]]; then
     WANDB_TRAINER_ARGS+=(+trainer.wandb_proxy="$WANDB_PROXY")
 fi
@@ -56,6 +64,8 @@ OUTCOME_SERVER_BASE_URL=${OUTCOME_SERVER_BASE_URL:-http://${OUTCOME_SERVER_HOST}
 OUTCOME_SERVER_TP=${OUTCOME_SERVER_TP:-2}
 OUTCOME_SERVER_GPU_MEMORY_UTIL=${OUTCOME_SERVER_GPU_MEMORY_UTIL:-0.85}
 OUTCOME_SERVER_MAX_MODEL_LEN=${OUTCOME_SERVER_MAX_MODEL_LEN:-40000}
+OUTCOME_SERVER_MAX_NUM_SEQS=${OUTCOME_SERVER_MAX_NUM_SEQS:-64}
+OUTCOME_SERVER_MAX_NUM_BATCHED_TOKENS=${OUTCOME_SERVER_MAX_NUM_BATCHED_TOKENS:-32768}
 OUTCOME_SERVER_START_TIMEOUT=${OUTCOME_SERVER_START_TIMEOUT:-900}
 
 train_batch_size=${TRAIN_BATCH_SIZE:-16}
@@ -80,7 +90,7 @@ teacher_tp=${TEACHER_TP:-2}
 teacher_gpu_mem_util=${TEACHER_GPU_MEMORY_UTIL:-0.55}
 teacher_max_model_len=${TEACHER_MAX_MODEL_LEN:-40000}
 teacher_max_num_batched_tokens=${TEACHER_MAX_NUM_BATCHED_TOKENS:-4096}
-distillation_topk=${DISTILLATION_TOPK:-64}
+distillation_topk=${DISTILLATION_TOPK:-50}
 distill_chunk_size=${DISTILL_CHUNK_SIZE:-256}
 
 total_epochs=${TOTAL_EPOCHS:-3}
@@ -138,6 +148,9 @@ export OPD_MM_VERIFIER_BASE_URL=${OPD_MM_VERIFIER_BASE_URL:-http://192.168.1.113
 export OPD_MM_VERIFIER_MODEL=${OPD_MM_VERIFIER_MODEL:-Qwen3.5-9B}
 export OPD_MM_VERIFIER_TIMEOUT=${OPD_MM_VERIFIER_TIMEOUT:-120}
 export OPD_MM_VERIFIER_RETRIES=${OPD_MM_VERIFIER_RETRIES:-3}
+export OPD_MM_EVIDENCE_SELECTOR_BASE_URL=${OPD_MM_EVIDENCE_SELECTOR_BASE_URL:-$OPD_MM_VERIFIER_BASE_URL}
+export OPD_MM_EVIDENCE_SELECTOR_MODEL=${OPD_MM_EVIDENCE_SELECTOR_MODEL:-$OPD_MM_VERIFIER_MODEL}
+export OPD_MM_EVIDENCE_SELECTOR_BACKEND=${OPD_MM_EVIDENCE_SELECTOR_BACKEND:-remote}
 export OPD_MM_RAW_INSPECTOR_BACKEND=vllm
 export OPD_MM_RAW_INSPECTOR_URL="$OUTCOME_SERVER_BASE_URL"
 export OPD_MM_RAW_INSPECTOR_MODEL="$OUTCOME_SERVED_MODEL"
@@ -164,6 +177,8 @@ case "${START_OUTCOME_SERVER,,}" in
             --tensor-parallel-size "$OUTCOME_SERVER_TP" \
             --gpu-memory-utilization "$OUTCOME_SERVER_GPU_MEMORY_UTIL" \
             --max-model-len "$OUTCOME_SERVER_MAX_MODEL_LEN" \
+            --max-num-seqs "$OUTCOME_SERVER_MAX_NUM_SEQS" \
+            --max-num-batched-tokens "$OUTCOME_SERVER_MAX_NUM_BATCHED_TOKENS" \
             --limit-mm-per-prompt '{"image":2}' \
             --enable-auto-tool-choice \
             --tool-call-parser qwen3_coder \
@@ -242,6 +257,8 @@ echo "STUDENT_MODEL=${STUDENT_MODEL}"
 echo "TEACHER_MODEL=${TEACHER_MODEL}"
 echo "OPD_MM_VERIFIER_MODEL=${OPD_MM_VERIFIER_MODEL}"
 echo "OPD_MM_VERIFIER_BASE_URL=${OPD_MM_VERIFIER_BASE_URL}"
+echo "OPD_MM_EVIDENCE_SELECTOR_BASE_URL=${OPD_MM_EVIDENCE_SELECTOR_BASE_URL}"
+echo "OPD_MM_EVIDENCE_SELECTOR_MODEL=${OPD_MM_EVIDENCE_SELECTOR_MODEL}"
 echo "TRAIN_GPUS=${TRAIN_GPUS}"
 echo "OUTCOME_SERVER_GPUS=${OUTCOME_SERVER_GPUS}"
 echo "TRAIN_SAMPLES=$(python3 -c "import pyarrow.parquet as pq; print(pq.read_metadata('${DATA_DIR}/train.parquet').num_rows)")"
@@ -333,6 +350,7 @@ TRAINER=(
     trainer.use_v1=False
     trainer.balance_batch=True
     trainer.logger='["console","wandb"]'
+    trainer.log_val_generations=${WANDB_VAL_CASES}
     trainer.project_name=${project_name}
     trainer.experiment_name=${experiment_name}
     trainer.n_gpus_per_node=${NGPUS_PER_NODE}

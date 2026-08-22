@@ -25,11 +25,8 @@ from .models import ToolAction
 
 ALLOWED_TOOLS = {
     "FILTER",
-    "SORT",
-    "TOPK",
     "RETRIEVE",
     "EXPAND_NEIGHBORS",
-    "DROP",
     "INSPECT_RAW",
     "STOP",
 }
@@ -40,8 +37,6 @@ FILTER_VALUE_ENUMS = {
     "modality": {"image", "text"},
     "status": {"active"},
 }
-SORT_FIELDS = {"timestamp", "turn_id", "score"}
-SORT_ORDERS = {"asc", "desc"}
 RETRIEVAL_METHODS = {"bm25", "dense", "vision", "hybrid"}
 EXPAND_NEIGHBOR_WINDOWS = {1, 2, 3}
 INSPECT_TARGETS = {"current_pool"}
@@ -54,17 +49,13 @@ FORBIDDEN_ARGUMENT_KEYS = {
     "search_query",
 }
 MEMORY_ID_PATTERN = re.compile(r"\b(?:m|memory|mau)[-_]?\d+\b", re.IGNORECASE)
-EVIDENCE_ID_PATTERN = re.compile(r"^E[1-9]\d*$")
 
 TOOL_SCHEMA_TEXT = """Allowed executable tools:
 FILTER(field=modality|timestamp|status,
        op=eq|neq|before|after|contains, value=...)
-SORT(field=timestamp|turn_id|score, order=asc|desc)
-TOPK(k=positive integer)
 RETRIEVE(method=bm25|dense|vision|hybrid, top_k=positive integer,
          query=optional rewritten search text)
 EXPAND_NEIGHBORS(window=1|2|3)
-DROP(evidence_ids=[public evidence IDs])
 STOP()
 
 Return only a JSON array of tool calls. Do not emit memory IDs. RETRIEVE uses
@@ -74,13 +65,12 @@ original hidden memory store and merges deduplicated results into the current
 candidate pool. For timestamp filters, date-only values
 such as YYYY-MM-DD match all memory timestamps from that date. Every FILTER
 searches the original hidden memory store and merges deduplicated matches into
-the current pool. Use DROP to remove evidence from the current pool.
+the current pool. After each discovery action, an internal semantic selector
+chooses which candidates become public answer evidence.
 For Mem-Gallery, modality values are text and image; status value is active.
 EXPAND_NEIGHBORS adds
-nearby turns around the current candidate pool; use it only after a retrieve or
-filter step has selected relevant candidates. DROP removes clearly irrelevant,
-duplicate, or conflicting current evidence by its public evidence_id. Submit all
-such IDs in one call, and do not call DROP again until evidence is added or enriched."""
+nearby turns around current answer evidence; use it only after a retrieve or
+filter step has produced relevant evidence."""
 
 
 def build_tool_schema(allow_inspect_raw: bool = True) -> str:
@@ -196,14 +186,6 @@ class TrajectoryValidator:
             )
         if args["field"] == "timestamp" and (not isinstance(args["value"], str) or not args["value"].strip()):
             raise TrajectoryValidationError(f"action {index}: invalid FILTER timestamp value")
-    def _validate_sort(self, args: Dict[str, Any], index: int) -> None:
-        self._require_exact_keys(args, {"field", "order"}, set(), index)
-        if args["field"] not in SORT_FIELDS or args["order"] not in SORT_ORDERS:
-            raise TrajectoryValidationError(f"action {index}: invalid SORT arguments")
-
-    def _validate_topk(self, args: Dict[str, Any], index: int) -> None:
-        self._require_exact_keys(args, {"k"}, set(), index)
-        self._validate_k(args["k"], index, "k")
 
     def _validate_retrieve(self, args: Dict[str, Any], index: int) -> None:
         self._require_exact_keys(args, set(), {"method", "top_k", "query"}, index)
@@ -218,19 +200,6 @@ class TrajectoryValidator:
         window = args["window"]
         if not isinstance(window, int) or isinstance(window, bool) or window not in EXPAND_NEIGHBOR_WINDOWS:
             raise TrajectoryValidationError(f"action {index}: window must be one of {sorted(EXPAND_NEIGHBOR_WINDOWS)}")
-
-    def _validate_drop(self, args: Dict[str, Any], index: int) -> None:
-        self._require_exact_keys(args, {"evidence_ids"}, set(), index)
-        evidence_ids = args["evidence_ids"]
-        if not isinstance(evidence_ids, list) or not evidence_ids:
-            raise TrajectoryValidationError(f"action {index}: evidence_ids must be a non-empty list")
-        if len(evidence_ids) != len(set(evidence_ids)):
-            raise TrajectoryValidationError(f"action {index}: evidence_ids must be unique")
-        if any(
-            not isinstance(value, str) or EVIDENCE_ID_PATTERN.fullmatch(value.strip()) is None
-            for value in evidence_ids
-        ):
-            raise TrajectoryValidationError(f"action {index}: invalid public evidence_id")
 
     def _validate_inspect_raw(self, args: Dict[str, Any], index: int) -> None:
         self._require_exact_keys(args, set(), {"target", "instruction"}, index)
