@@ -117,7 +117,9 @@ OPD_MM_TEACHER_CORRECTION_DUMP_DIR=${OPD_MM_TEACHER_CORRECTION_DUMP_DIR:-${LOG_D
 OPD_MM_OUTCOME_REWARD_DUMP_DIR=${OPD_MM_OUTCOME_REWARD_DUMP_DIR:-${LOG_DIR}/opd_mm_opsd_validation_${RUN_TIMESTAMP}}
 VALIDATION_DATA_DIR=${VALIDATION_DATA_DIR:-${LOG_DIR}/opd_mm_opsd_validation_generations_${RUN_TIMESTAMP}}
 
-RAY_TMP_ROOT=${RAY_TMP_ROOT:-$REPO_ROOT/.runtime/ray}
+# Ray appends long session/socket suffixes, while AF_UNIX paths are limited to
+# 107 bytes on Linux. Keep the default root independent of the checkout path.
+RAY_TMP_ROOT=${RAY_TMP_ROOT:-/tmp/verl_ray_$(id -u)}
 RAY_TMPDIR=${RAY_TMPDIR:-${RAY_TMP_ROOT}/opsd${RUN_TIMESTAMP:9}}
 TMPDIR=${TMPDIR:-$RAY_TMPDIR}
 

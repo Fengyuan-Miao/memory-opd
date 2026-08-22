@@ -69,6 +69,8 @@ export TEST_FREQ=${TEST_FREQ:-10}
 export SAVE_FREQ=${SAVE_FREQ:-1000000}
 export PROJECT_NAME=${PROJECT_NAME:-verl_opsd_opd_mm_validated21}
 export EXPERIMENT_NAME=${EXPERIMENT_NAME:-opd_mm_qwen35_4b_validated21_pure_opsd_gpuencoder_$(date +%Y%m%d_%H%M%S)}
-export RAY_TMP_ROOT=${RAY_TMP_ROOT:-$REPO_ROOT/.runtime/ray}
+# Ray appends long session/socket suffixes, while AF_UNIX paths are limited to
+# 107 bytes on Linux. Keep the default root independent of the checkout path.
+export RAY_TMP_ROOT=${RAY_TMP_ROOT:-/tmp/verl_ray_$(id -u)}
 
 exec bash "$SCRIPT_DIR/run_opd_mm_opsd_fsdp.sh" "$@"
