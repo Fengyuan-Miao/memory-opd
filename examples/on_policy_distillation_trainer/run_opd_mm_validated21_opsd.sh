@@ -16,48 +16,27 @@ export TEACHER_TP=${TEACHER_TP:-2}
 export VERL_AGENT_LOOP_WORKER_CUDA_DEVICES=${VERL_AGENT_LOOP_WORKER_CUDA_DEVICES:-0,1,2,3}
 
 export MODEL_ROOT=${MODEL_ROOT:-$REPO_ROOT/models}
-export MODEL_4B_PATH=${MODEL_4B_PATH:-/home/guojr/data/pretrained_models/Qwen/Qwen3.5-4B}
-export MODEL_9B_PATH=${MODEL_9B_PATH:-/home/guojr/data/pretrained_models/Qwen/Qwen3.5-9B}
+export MODEL_4B_PATH=${MODEL_4B_PATH:-$MODEL_ROOT/Qwen3.5-4B}
+export MODEL_9B_PATH=${MODEL_9B_PATH:-$MODEL_ROOT/Qwen3.5-9B}
 export STUDENT_MODEL=${STUDENT_MODEL:-$MODEL_4B_PATH}
 export TEACHER_MODEL=${TEACHER_MODEL:-$MODEL_4B_PATH}
 export OPD_MM_DENSE_MODEL_PATH=${OPD_MM_DENSE_MODEL_PATH:-$MODEL_ROOT/all-MiniLM-L6-v2}
 export OPD_MM_VISION_MODEL_PATH=${OPD_MM_VISION_MODEL_PATH:-$MODEL_ROOT/SigLIP-Base-Patch16-384}
 export OPD_MM_HYBRID_MODEL_PATH=${OPD_MM_HYBRID_MODEL_PATH:-$MODEL_ROOT/gme-Qwen2-VL-2B-Instruct}
 
-for model_dir in "$MODEL_4B_PATH" "$MODEL_9B_PATH"; do
+for model_dir in \
+    "$MODEL_4B_PATH" \
+    "$MODEL_9B_PATH" \
+    "$OPD_MM_DENSE_MODEL_PATH" \
+    "$OPD_MM_VISION_MODEL_PATH" \
+    "$OPD_MM_HYBRID_MODEL_PATH"; do
     if [[ ! -f "$model_dir/config.json" ]]; then
         echo "Missing model directory: $model_dir" >&2
-        echo "Override MODEL_4B_PATH or MODEL_9B_PATH with a valid local model directory." >&2
+        echo "Run: bash $SCRIPT_DIR/download_opd_mm_models.sh" >&2
+        echo "Or override the corresponding model path environment variable." >&2
         exit 1
     fi
 done
-
-download_hf_model() {
-    local repo_id=$1
-    local target_dir=$2
-    if [[ -f "$target_dir/config.json" ]]; then
-        echo "Using cached retrieval model: $target_dir"
-        return
-    fi
-    echo "Downloading $repo_id to $target_dir"
-    python3 - "$repo_id" "$target_dir" <<'PY'
-import os
-import sys
-
-from huggingface_hub import snapshot_download
-
-snapshot_download(
-    repo_id=sys.argv[1],
-    local_dir=sys.argv[2],
-    token=os.getenv("HF_TOKEN") or None,
-    endpoint="https://huggingface.co",
-)
-PY
-}
-
-download_hf_model "${DENSE_MODEL_REPO:-sentence-transformers/all-MiniLM-L6-v2}" "$OPD_MM_DENSE_MODEL_PATH"
-download_hf_model "${VISION_MODEL_REPO:-google/siglip2-base-patch16-384}" "$OPD_MM_VISION_MODEL_PATH"
-download_hf_model "${HYBRID_MODEL_REPO:-Alibaba-NLP/gme-Qwen2-VL-2B-Instruct}" "$OPD_MM_HYBRID_MODEL_PATH"
 
 export START_OUTCOME_SERVER=1
 export OUTCOME_SERVER_GPUS=${OUTCOME_SERVER_GPUS:-6,7}
