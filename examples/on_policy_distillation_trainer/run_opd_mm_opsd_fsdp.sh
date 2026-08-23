@@ -12,6 +12,7 @@ RUN_TIMESTAMP=${RUN_TIMESTAMP:-$(date +%Y%m%d_%H%M%S)}
 WANDB_MODE=${WANDB_MODE:-online}
 WANDB_DISABLE_STATS=${WANDB_DISABLE_STATS:-True}
 WANDB_VAL_CASES=${WANDB_VAL_CASES:-4}
+WANDB_VAL_ACTIONS_ONLY=${WANDB_VAL_ACTIONS_ONLY:-False}
 export WANDB_CONSOLE=${WANDB_CONSOLE:-wrap}
 export WANDB_DISABLE_CODE=${WANDB_DISABLE_CODE:-true}
 export WANDB_SAVE_CODE=${WANDB_SAVE_CODE:-false}
@@ -31,6 +32,7 @@ fi
 export WANDB_MODE
 WANDB_TRAINER_ARGS=(
     +trainer.wandb_disable_stats=${WANDB_DISABLE_STATS}
+    +trainer.wandb_val_actions_only=${WANDB_VAL_ACTIONS_ONLY}
     '+trainer.wandb_metric_include_patterns=["^(actor|critic|distillation)/.*loss$","^val-aux/.*/opd_mm/(answer_correct|evidence_answerable|evidence_count|action_count|repeated_actions|max_actions_reached|empty_evidence|trajectory_error|answer_request_failed|judge_request_failed|evidence_judge_request_failed)/mean@.*$","^training/(global_step|epoch)$"]'
 )
 if [[ -n "$WANDB_PROXY" ]]; then

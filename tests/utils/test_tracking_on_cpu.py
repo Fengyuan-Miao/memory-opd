@@ -74,3 +74,16 @@ def test_validation_generations_logger_logs_trackio_traces():
     assert trace_kwargs["metadata"]["score"] == 0.5
     mock_trackio.log.assert_called_once()
     assert mock_trackio.log.call_args.kwargs["step"] == 7
+
+
+def test_validation_generations_logger_compacts_xml_action_trajectory():
+    output = """<tool_call>
+<function=retrieve>
+<parameter=method>hybrid</parameter>
+<parameter=top_k>10</parameter>
+</function>
+</tool_call><tool_call><function=stop></function></tool_call>"""
+
+    trace = ValidationGenerationsLogger._compact_action_trajectory(output)
+
+    assert trace == 'RETRIEVE{"method":"hybrid","top_k":"10"} -> STOP'

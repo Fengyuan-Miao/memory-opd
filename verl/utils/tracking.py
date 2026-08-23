@@ -418,6 +418,38 @@ def _flatten_dict(raw: dict[str, Any], *, sep: str) -> dict[str, Any]:
 class ValidationGenerationsLogger:
     project_name: str = None
     experiment_name: str = None
+    wandb_actions_only: bool = False
+
+    @staticmethod
+    def _compact_action_trajectory(output: Any) -> str:
+        """Return a bounded action-only trace from Qwen XML tool calls."""
+
+        text = str(output or "")
+        calls = re.findall(r"<tool_call>(.*?)</tool_call>", text, flags=re.DOTALL)
+        if not calls:
+            calls = [text]
+
+        actions = []
+        for call in calls[:16]:
+            function = re.search(r"<function=([^>\n]+)>(.*?)</function>", call, flags=re.DOTALL)
+            if function is None:
+                name = re.search(r"<function=([^>\n]+)>", call)
+                if name is not None:
+                    actions.append(f"{name.group(1).strip().upper()}(?)")
+                continue
+            name, body = function.groups()
+            parameters = {}
+            for key, value in re.findall(
+                r"<parameter=([^>\n]+)>\s*(.*?)\s*</parameter>", body, flags=re.DOTALL
+            ):
+                compact_value = re.sub(r"\s+", " ", value).strip()
+                parameters[key.strip()] = compact_value[:512]
+            action = name.strip().upper()
+            if parameters:
+                action += json.dumps(parameters, ensure_ascii=False, separators=(",", ":"))
+            actions.append(action)
+
+        return (" -> ".join(actions) or "NO_TOOL_CALL")[:4096]
 
     def log(self, loggers, samples, step):
         if "wandb" in loggers:
@@ -449,6 +481,14 @@ class ValidationGenerationsLogger:
 
     def _log_generations_to_wandb(self, samples, step, wandb):
         """Log samples to wandb as a table"""
+
+        if self.wandb_actions_only:
+            columns = ["step"] + [f"action_trajectory_{i + 1}" for i in range(len(samples))]
+            table = wandb.Table(columns=columns)
+            table.add_data(step, *(self._compact_action_trajectory(sample[1]) for sample in samples))
+            if wandb.run is not None:
+                wandb.log({"val/action_trajectories": table}, step=step)
+            return
 
         # Create column names for all samples
         columns = ["step"] + sum(

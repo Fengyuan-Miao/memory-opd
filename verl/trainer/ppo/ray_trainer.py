@@ -353,6 +353,7 @@ class RayPPOTrainer:
         self.validation_generations_logger = ValidationGenerationsLogger(
             project_name=self.config.trainer.project_name,
             experiment_name=self.config.trainer.experiment_name,
+            wandb_actions_only=bool(self.config.trainer.get("wandb_val_actions_only", False)),
         )
 
         # if ref_in_actor is True, the reference policy will be actor without lora applied
