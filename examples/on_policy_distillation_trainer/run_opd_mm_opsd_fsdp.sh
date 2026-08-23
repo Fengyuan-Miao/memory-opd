@@ -96,6 +96,7 @@ teacher_tp=${TEACHER_TP:-2}
 teacher_gpu_mem_util=${TEACHER_GPU_MEMORY_UTIL:-0.55}
 teacher_max_model_len=${TEACHER_MAX_MODEL_LEN:-40000}
 teacher_max_num_batched_tokens=${TEACHER_MAX_NUM_BATCHED_TOKENS:-4096}
+teacher_max_num_seqs=${TEACHER_MAX_NUM_SEQS:-16}
 distillation_topk=${DISTILLATION_TOPK:-50}
 distill_chunk_size=${DISTILL_CHUNK_SIZE:-256}
 
@@ -278,6 +279,9 @@ echo "VAL_BATCH_SIZE=${val_batch_size}"
 echo "TEST_FREQ=${test_freq}"
 echo "SAVE_FREQ=${save_freq}"
 echo "DISTILLATION_TOPK=${distillation_topk}"
+echo "TEACHER_GPU_MEMORY_UTIL=${teacher_gpu_mem_util}"
+echo "TEACHER_MAX_NUM_BATCHED_TOKENS=${teacher_max_num_batched_tokens}"
+echo "TEACHER_MAX_NUM_SEQS=${teacher_max_num_seqs}"
 echo "AGENT_LOOP_NUM_WORKERS=${agent_loop_num_workers}"
 echo "VERL_AGENT_LOOP_WORKER_CUDA_DEVICES=${VERL_AGENT_LOOP_WORKER_CUDA_DEVICES:-disabled}"
 echo "ROLLOUT_GPU_MEM_UTIL=${rollout_gpu_mem_util}"
@@ -410,6 +414,7 @@ DISTILLATION=(
     distillation.teacher_models.teacher_model.inference.gpu_memory_utilization=${teacher_gpu_mem_util}
     distillation.teacher_models.teacher_model.inference.max_model_len=${teacher_max_model_len}
     distillation.teacher_models.teacher_model.inference.max_num_batched_tokens=${teacher_max_num_batched_tokens}
+    distillation.teacher_models.teacher_model.inference.max_num_seqs=${teacher_max_num_seqs}
     distillation.teacher_models.teacher_model.inference.enable_prefix_caching=True
     distillation.teacher_models.teacher_model.inference.enforce_eager=False
 )
