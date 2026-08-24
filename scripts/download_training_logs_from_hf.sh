@@ -11,7 +11,6 @@ HF_REPO_ID=${HF_REPO_ID:-memory-rl/opd-mm-training-logs}
 HF_REPO_TYPE=${HF_REPO_TYPE:-dataset}
 HF_REVISION=${HF_REVISION:-main}
 HF_MAX_WORKERS=${HF_MAX_WORKERS:-8}
-LATEST_DIR_ONLY=${LATEST_DIR_ONLY:-1}
 LOG_SUBDIR=${LOG_SUBDIR:-}
 FORCE_DOWNLOAD=${FORCE_DOWNLOAD:-0}
 
@@ -22,75 +21,80 @@ for command_name in hf python3; do
   fi
 done
 
-token=${HF_TOKEN:-${HUGGING_FACE_HUB_TOKEN:-}}
-token_args=()
-if [[ -n "$token" ]]; then
-  token_args=(--token "$token")
-elif ! hf auth whoami >/dev/null 2>&1; then
-  echo "No Hugging Face authentication found." >&2
-  echo "Set HF_TOKEN or run: hf auth login" >&2
-  exit 1
-fi
+mkdir -p "$LOGS_DIR"
 
-include_args=()
-selected_source="all logs"
-if [[ -n "$LOG_SUBDIR" ]]; then
-  if [[ "$LOG_SUBDIR" == /* || "$LOG_SUBDIR" == *".."* ]]; then
-    echo "LOG_SUBDIR must be a relative directory without '..': $LOG_SUBDIR" >&2
-    exit 1
-  fi
-  include_args=(--include "$LOG_SUBDIR/*" --include "$LOG_SUBDIR/**")
-  selected_source=$LOG_SUBDIR
-elif [[ "$LATEST_DIR_ONLY" != "0" && "$LATEST_DIR_ONLY" != "false" ]]; then
-  latest_dir=$(
-    HF_DOWNLOAD_TOKEN="$token" \
-    HF_DOWNLOAD_REPO_ID="$HF_REPO_ID" \
-    HF_DOWNLOAD_REPO_TYPE="$HF_REPO_TYPE" \
-    HF_DOWNLOAD_REVISION="$HF_REVISION" \
-    python3 - <<'PY'
+remote_dir_output=$(
+  HF_SYNC_REPO_ID="$HF_REPO_ID" \
+  HF_SYNC_REPO_TYPE="$HF_REPO_TYPE" \
+  HF_SYNC_REVISION="$HF_REVISION" \
+  python3 - <<'PY'
 import os
-import sys
 
 from huggingface_hub import HfApi
 from huggingface_hub.hf_api import RepoFolder
 
-folders = [
-    entry
-    for entry in HfApi().list_repo_tree(
-        repo_id=os.environ["HF_DOWNLOAD_REPO_ID"],
-        repo_type=os.environ["HF_DOWNLOAD_REPO_TYPE"],
-        revision=os.environ["HF_DOWNLOAD_REVISION"],
-        token=os.environ.get("HF_DOWNLOAD_TOKEN") or None,
-        expand=True,
-    )
-    if isinstance(entry, RepoFolder)
-]
-if not folders:
-    sys.exit("No log directories found in the Hugging Face repository")
-
-folders.sort(
-    key=lambda entry: (
-        entry.last_commit.date.timestamp() if entry.last_commit is not None else float("-inf"),
-        entry.path,
-    ),
-    reverse=True,
-)
-print(folders[0].path)
+for entry in HfApi().list_repo_tree(
+    repo_id=os.environ["HF_SYNC_REPO_ID"],
+    repo_type=os.environ["HF_SYNC_REPO_TYPE"],
+    revision=os.environ["HF_SYNC_REVISION"],
+):
+    if isinstance(entry, RepoFolder):
+        print(entry.path)
 PY
-  )
-  include_args=(--include "$latest_dir/*" --include "$latest_dir/**")
-  selected_source=$latest_dir
+)
+remote_dirs=()
+if [[ -n "$remote_dir_output" ]]; then
+  mapfile -t remote_dirs <<<"$remote_dir_output"
 fi
+
+selected_dirs=()
+if [[ -n "$LOG_SUBDIR" ]]; then
+  if [[ "$LOG_SUBDIR" == /* || "$LOG_SUBDIR" == *".."* || "$LOG_SUBDIR" == */* ]]; then
+    echo "LOG_SUBDIR must be a single relative directory name: $LOG_SUBDIR" >&2
+    exit 1
+  fi
+  remote_found=0
+  for directory in "${remote_dirs[@]}"; do
+    if [[ "$directory" == "$LOG_SUBDIR" ]]; then
+      remote_found=1
+      break
+    fi
+  done
+  if (( ! remote_found )); then
+    echo "Requested log directory does not exist on Hugging Face: $LOG_SUBDIR" >&2
+    exit 1
+  fi
+  if [[ ! -d "$LOGS_DIR/$LOG_SUBDIR" ]]; then
+    selected_dirs+=("$LOG_SUBDIR")
+  fi
+else
+  for directory in "${remote_dirs[@]}"; do
+    if [[ ! -d "$LOGS_DIR/$directory" ]]; then
+      selected_dirs+=("$directory")
+    fi
+  done
+fi
+
+if (( ${#selected_dirs[@]} == 0 )); then
+  echo "No new Hugging Face log directories to download."
+  exit 0
+fi
+
+include_args=()
+for directory in "${selected_dirs[@]}"; do
+  include_args+=(--include "$directory/*" --include "$directory/**")
+done
 
 force_arg=--no-force-download
 if [[ "$FORCE_DOWNLOAD" == "1" || "$FORCE_DOWNLOAD" == "true" ]]; then
   force_arg=--force-download
 fi
 
-mkdir -p "$LOGS_DIR"
-
 echo "Downloading training logs"
-echo "  source:   hf://datasets/$HF_REPO_ID ($selected_source)"
+echo "  source:   hf://datasets/$HF_REPO_ID"
+printf '  directories:'
+printf ' %q' "${selected_dirs[@]}"
+printf '\n'
 echo "  revision: $HF_REVISION"
 echo "  target:   $LOGS_DIR"
 
@@ -102,7 +106,6 @@ hf download "$HF_REPO_ID" \
   --local-dir "$LOGS_DIR" \
   --max-workers "$HF_MAX_WORKERS" \
   "$force_arg" \
-  "${include_args[@]}" \
-  "${token_args[@]}"
+  "${include_args[@]}"
 
 echo "Download completed: $LOGS_DIR"

@@ -727,6 +727,15 @@ def test_validator_rejects_memory_ids_and_accepts_rewritten_retrieve_query() -> 
                 [{"tool": "FILTER", "field": field, "op": "eq", "value": value}]
             )
 
+    with pytest.raises(TrajectoryValidationError, match="invalid FILTER op for modality"):
+        validator.validate(
+            [{"tool": "FILTER", "field": "modality", "op": "contains", "value": "image"}]
+        )
+    with pytest.raises(TrajectoryValidationError, match="invalid FILTER timestamp value"):
+        validator.validate(
+            [{"tool": "FILTER", "field": "timestamp", "op": "contains", "value": "dinner"}]
+        )
+
     validated = validator.validate([{"tool": "RETRIEVE", "query": "custom query", "top_k": 3}])
     assert validated[0].arguments["query"] == "custom query"
 
@@ -909,7 +918,7 @@ def test_timestamp_filter_accepts_date_only_model_values() -> None:
                 "tool": "FILTER",
                 "field": "timestamp",
                 "op": "contains",
-                "value": "2026/1/1",
+                "value": "2026-01-01",
             }
         ],
         query="Which memories are from 2026-01-01?",
@@ -1150,6 +1159,38 @@ async def test_verl_native_filter_always_merges_from_full_memory() -> None:
     assert observation["pool_count"] == 4
     assert observation["evidence_count"] == 4
     assert all("evidence_id" not in item for item in observation["evidence"])
+
+
+@pytest.mark.asyncio
+async def test_distinct_stagnant_discovery_actions_mark_search_exhausted() -> None:
+    agent_data = FakeAgentData(
+        messages=[{"role": "user", "content": "Was a dessert mentioned?"}],
+        tools_kwargs={
+            "opd_mm": {
+                "query": "Was a dessert mentioned?",
+                "records": [record.to_dict() for record in _records()],
+                "vector_store_dir": None,
+            }
+        },
+    )
+    filter_tool = OPDFilterTool(config={"type": "native"}, tool_schema=None)
+
+    first, _, _ = await filter_tool.execute(
+        "instance", {"field": "status", "op": "eq", "value": "active"}, agent_data=agent_data
+    )
+    second, _, _ = await filter_tool.execute(
+        "instance", {"field": "timestamp", "op": "before", "value": "2027"}, agent_data=agent_data
+    )
+    third, _, _ = await filter_tool.execute(
+        "instance", {"field": "timestamp", "op": "after", "value": "2020"}, agent_data=agent_data
+    )
+
+    assert json.loads(first.text)["search_exhausted"] is False
+    assert json.loads(second.text)["search_exhausted"] is False
+    final_observation = json.loads(third.text)
+    assert final_observation["search_exhausted"] is True
+    assert final_observation["distinct_search_count"] == 3
+    assert final_observation["stagnant_search_count"] == 2
 
 
 @pytest.mark.asyncio
@@ -2921,6 +2962,19 @@ def test_state_verifier_feedback_accepts_missing_factual_support() -> None:
     assert feedback["evidence_sufficient"] is False
     assert feedback["missing_evidence_type"] == "missing_factual_support"
     assert feedback["parse_error"] == ""
+
+
+def test_state_verifier_accepts_exhausted_empty_search_for_absence_answer() -> None:
+    feedback = parse_state_verifier_feedback(
+        '{"evidence_sufficient": true, "reason": "The query-focused search is exhausted.", '
+        '"missing_evidence_type": "none"}',
+        {"evidence_count": 0, "search_exhausted": True},
+        gold_answer="Not mentioned.",
+        query="What dessert was served?",
+    )
+
+    assert feedback["evidence_sufficient"] is True
+    assert feedback["missing_evidence_type"] == "none"
 
 
 def test_state_verifier_feedback_distinguishes_nonempty_irrelevant_evidence() -> None:

@@ -522,6 +522,9 @@ class OPDToolSession:
     semantic_filter_error: str = ""
     semantic_filter_candidate_count: int = 0
     semantic_filter_selected_count: int = 0
+    discovery_signatures: set[str] = field(default_factory=set)
+    stagnant_discovery_signatures: set[str] = field(default_factory=set)
+    search_exhausted: bool = False
 
     def __post_init__(self) -> None:
         if not self.pool:
@@ -530,6 +533,7 @@ class OPDToolSession:
     def execute(self, action: ToolAction, *, defer_semantic_filter: bool = False) -> dict[str, Any]:
         """Execute one validated action against the current hidden pool."""
         before = len(self.pool)
+        evidence_ids_before = {item.memory_id for item in self.evidence}
         step_error = ""
         new_evidence: list[EvidenceItem] = []
         self.pool_overflow_count = 0
@@ -612,6 +616,12 @@ class OPDToolSession:
             )
         if new_evidence:
             self.evidence_revision += 1
+        if (
+            not step_error
+            and not defer_semantic_filter
+            and action.tool in {"FILTER", "RETRIEVE", "EXPAND_NEIGHBORS"}
+        ):
+            self._record_discovery_progress(action, evidence_ids_before)
 
         self.trace.append(action)
         self.steps.append(
@@ -628,6 +638,7 @@ class OPDToolSession:
 
     async def execute_with_semantic_filter(self, action: ToolAction) -> dict[str, Any]:
         """Execute one action and screen discovery results before exposing evidence."""
+        evidence_ids_before = {item.memory_id for item in self.evidence}
         observation = self.execute(action, defer_semantic_filter=True)
         executed_action = self.trace[-1] if self.trace else action
         if (
@@ -696,7 +707,20 @@ class OPDToolSession:
             self.evidence_revision += 1
         if self.steps:
             self.steps[-1].evidence_added = len(new_evidence)
+        self._record_discovery_progress(executed_action, evidence_ids_before)
         return self._observation(executed_action, new_evidence, "")
+
+    def _record_discovery_progress(self, action: ToolAction, evidence_ids_before: set[str]) -> None:
+        """Track when distinct searches stop surfacing new relevant memories."""
+        signature = f"{action.tool}:{json.dumps(action.arguments, ensure_ascii=False, sort_keys=True, default=str)}"
+        self.discovery_signatures.add(signature)
+        evidence_ids_after = {item.memory_id for item in self.evidence}
+        if evidence_ids_after - evidence_ids_before:
+            self.stagnant_discovery_signatures.clear()
+            self.search_exhausted = False
+            return
+        self.stagnant_discovery_signatures.add(signature)
+        self.search_exhausted = len(self.stagnant_discovery_signatures) >= 2
 
     def _selector_candidates(self) -> list[dict[str, Any]]:
         candidates = []
@@ -852,6 +876,9 @@ class OPDToolSession:
             "semantic_filter_candidate_count": self.semantic_filter_candidate_count,
             "semantic_filter_selected_count": self.semantic_filter_selected_count,
             "semantic_filter_error": _clip_text(self.semantic_filter_error),
+            "distinct_search_count": len(self.discovery_signatures),
+            "stagnant_search_count": len(self.stagnant_discovery_signatures),
+            "search_exhausted": self.search_exhausted,
             # The pool remains private. This is the sole model-visible,
             # semantically screened answer-evidence representation.
             "evidence": public_evidence,
@@ -877,6 +904,9 @@ class OPDToolSession:
             "semantic_filter_candidate_count": self.semantic_filter_candidate_count,
             "semantic_filter_selected_count": self.semantic_filter_selected_count,
             "semantic_filter_error": self.semantic_filter_error,
+            "distinct_search_count": len(self.discovery_signatures),
+            "stagnant_search_count": len(self.stagnant_discovery_signatures),
+            "search_exhausted": self.search_exhausted,
             "trace": [action.to_dict() for action in self.trace],
             "stopped": self.stopped,
             "error": self.error,
@@ -999,13 +1029,20 @@ class OPDFilterTool(OPDBaseTool):
         "private candidate pool. An internal semantic selector then exposes only question-relevant answer evidence."
     )
     properties = {
-        "field": _property("string", "The memory field to filter.", sorted(FILTER_FIELDS)),
-        "op": _property("string", "The comparison operator.", sorted(FILTER_OPS)),
+        "field": _property(
+            "string",
+            "Metadata field. modality is only text/image; status is only active; timestamp is only a public ISO date.",
+            sorted(FILTER_FIELDS),
+        ),
+        "op": _property(
+            "string",
+            "Field-specific operator: modality uses eq/neq; status uses eq; timestamp uses eq/contains/before/after.",
+            sorted(FILTER_OPS),
+        ),
         "value": _property(
             ["string", "number", "boolean"],
-            "Allowed values by field: modality uses text or image; status uses active; timestamp uses a public "
-            "YYYY-MM-DD date or timestamp. "
-            "Do not use memory IDs.",
+            "Literal metadata value only: text/image for modality, active for status, or a public YYYY, YYYY-MM, "
+            "YYYY-MM-DD, or ISO timestamp. Never put a topic, entity, event, or memory ID here; use RETRIEVE for those.",
         ),
     }
     required = ["field", "op", "value"]

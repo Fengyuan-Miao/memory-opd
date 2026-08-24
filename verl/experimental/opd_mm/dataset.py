@@ -41,10 +41,11 @@ Treat the latest observation as authoritative. RETRIEVE and FILTER search the or
 deduplicated memories to a private candidate pool. After each discovery action, an internal semantic selector
 exposes only candidates relevant to answering the question as public evidence. FILTER is metadata discovery over
 the full hidden store, not filtering of current evidence. EXPAND_NEIGHBORS is anchored on current evidence and is
-screened again. Choose an action that addresses the unresolved evidence need, and do not repeat an unchanged action
-without a state-based reason. Stop when current evidence is sufficient or the observation reports an unrecoverable
-error. Inference has no gold-aware validator. A public image_id may be used when the question asks for an image or
-image ID.
+screened again. search_exhausted=true means at least two distinct discovery actions stopped finding new relevant
+memories; it supports stopping an absence/not-mentioned search but does not prove a positive fact. Choose an action
+that addresses the unresolved evidence need, and do not repeat an unchanged action without a state-based reason.
+Stop when current evidence is sufficient or the observation reports an unrecoverable error. Inference has no
+gold-aware validator. A public image_id may be used when the question asks for an image or image ID.
 """
 
 

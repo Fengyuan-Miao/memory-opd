@@ -304,6 +304,16 @@ def _verifier_parse_fallback(error: Exception | str) -> dict[str, Any]:
 
 
 _GENERIC_GOLD_ANSWERS = {"yes", "no", "none", "unknown", "not mentioned", "no mention"}
+_ABSENCE_GOLD_ANSWERS = {"none", "unknown", "not mentioned", "no mention", "not specified", "not provided"}
+
+
+def _gold_is_absence_answer(value: str) -> bool:
+    normalized = re.sub(r"[^a-z0-9 ]+", " ", str(value or "").casefold())
+    normalized = " ".join(normalized.split())
+    return normalized in _ABSENCE_GOLD_ANSWERS or any(
+        phrase in normalized
+        for phrase in ("does not mention", "did not mention", "is not mentioned", "was not mentioned")
+    )
 
 
 def _normalize_leak_text(value: Any) -> str:
@@ -764,6 +774,10 @@ For a yes/no question, evidence that proves or contradicts the claim is sufficie
 records and their public timestamp/image_id as one event. A matching public image description plus image_id is
 sufficient for identification; require raw visual detail only when the queried attribute remains undescribed or
 ambiguous.
+For a private answer that means absent, unknown, or not mentioned, direct positive evidence is not expected.
+search_exhausted=true means at least two distinct, query-grounded discovery actions stopped adding relevant
+memories. When that condition holds and no public evidence contradicts the absence answer, treat the evidence state
+as sufficient. Do not use search_exhausted to make a positive factual answer sufficient.
 
 Your output is shown to the teacher. Write the reason using only query-visible concepts, public-evidence content,
 and generic terms such as "requested fact", "relevant event", or "required list coverage". State what structural
@@ -789,7 +803,9 @@ Choose exactly one evidence type:
 {visual_decision_line}
 - missing_factual_support: an identifiable query-required entity, relation, attribute, event, or list item is absent.
 - incomplete_coverage: relevant items are present, but evidence cannot establish that a requested list/count is exhaustive.
-- insufficient_absence_support: absence/conflict/not-mentioned claims lack enough supporting scope.
+- insufficient_absence_support: an absence/not-mentioned answer is expected but search_exhausted is false, or the
+  executed searches do not cover the query-visible subject. Conflict questions still require evidence that proves
+  or contradicts the stated claim.
 
 Selection rules: choose the most specific applicable type before missing_factual_support. In particular, use
 missing_raw_visual_detail for an unresolved visual attribute of a retrieved image, missing_neighbor_context for a
@@ -836,6 +852,7 @@ def parse_state_verifier_feedback(
         observation = _as_dict(observation)
         evidence_count = _observation_evidence_count(observation)
         has_candidate_context = _observation_has_candidate_context(observation)
+        exhausted_absence_search = bool(observation.get("search_exhausted")) and _gold_is_absence_answer(gold_answer)
         evidence_sufficient = _coerce_bool(payload.get("evidence_sufficient"))
         reason = str(payload.get("reason") or "").strip()
         missing_type = _normalize_missing_evidence_type(
@@ -853,7 +870,7 @@ def parse_state_verifier_feedback(
                 "no_public_evidence" if evidence_count <= 0 else "missing_factual_support"
             )
 
-        if evidence_count <= 0:
+        if evidence_count <= 0 and not exhausted_absence_search:
             evidence_sufficient = False
             missing_type = "no_public_evidence"
             reason = reason or "Need public evidence before answering."

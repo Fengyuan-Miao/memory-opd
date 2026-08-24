@@ -32,11 +32,20 @@ ALLOWED_TOOLS = {
 }
 DEFAULT_MAX_ACTIONS = 10
 FILTER_FIELDS = {"modality", "timestamp", "status"}
-FILTER_OPS = {"eq", "neq", "before", "after", "contains"}
+FILTER_OPS_BY_FIELD = {
+    "modality": {"eq", "neq"},
+    "status": {"eq"},
+    "timestamp": {"eq", "before", "after", "contains"},
+}
+FILTER_OPS = set().union(*FILTER_OPS_BY_FIELD.values())
 FILTER_VALUE_ENUMS = {
     "modality": {"image", "text"},
     "status": {"active"},
 }
+FILTER_TIMESTAMP_PATTERN = re.compile(
+    r"^\d{4}(?:-\d{2})?(?:-\d{2})?"
+    r"(?:T\d{2}:\d{2}(?::\d{2}(?:\.\d+)?)?(?:Z|[+-]\d{2}:\d{2})?)?$"
+)
 RETRIEVAL_METHODS = {"bm25", "dense", "vision", "hybrid"}
 EXPAND_NEIGHBOR_WINDOWS = {1, 2, 3}
 INSPECT_TARGETS = {"current_pool"}
@@ -176,6 +185,12 @@ class TrajectoryValidator:
             raise TrajectoryValidationError(f"action {index}: invalid FILTER field")
         if args["op"] not in FILTER_OPS:
             raise TrajectoryValidationError(f"action {index}: invalid FILTER op")
+        allowed_ops = FILTER_OPS_BY_FIELD[args["field"]]
+        if args["op"] not in allowed_ops:
+            raise TrajectoryValidationError(
+                f"action {index}: invalid FILTER op for {args['field']}; "
+                f"expected one of {sorted(allowed_ops)}"
+            )
         if not isinstance(args["value"], (str, int, float, bool)):
             raise TrajectoryValidationError(f"action {index}: invalid FILTER value")
         allowed_values = FILTER_VALUE_ENUMS.get(args["field"])
@@ -184,8 +199,13 @@ class TrajectoryValidator:
                 f"action {index}: invalid FILTER value for {args['field']}; "
                 f"expected one of {sorted(allowed_values)}"
             )
-        if args["field"] == "timestamp" and (not isinstance(args["value"], str) or not args["value"].strip()):
-            raise TrajectoryValidationError(f"action {index}: invalid FILTER timestamp value")
+        if args["field"] == "timestamp" and (
+            not isinstance(args["value"], str)
+            or not FILTER_TIMESTAMP_PATTERN.fullmatch(args["value"].strip())
+        ):
+            raise TrajectoryValidationError(
+                f"action {index}: invalid FILTER timestamp value; expected YYYY, YYYY-MM, YYYY-MM-DD, or ISO timestamp"
+            )
 
     def _validate_retrieve(self, args: Dict[str, Any], index: int) -> None:
         self._require_exact_keys(args, set(), {"method", "top_k", "query"}, index)

@@ -12,13 +12,14 @@ HF_REPO_TYPE=${HF_REPO_TYPE:-dataset}
 HF_REVISION=${HF_REVISION:-main}
 HF_PRIVATE=${HF_PRIVATE:-1}
 HF_NUM_WORKERS=${HF_NUM_WORKERS:-8}
-LATEST_DIR_ONLY=${LATEST_DIR_ONLY:-1}
 LOG_SUBDIR=${LOG_SUBDIR:-}
 
-if ! command -v hf >/dev/null 2>&1; then
-  echo "Missing 'hf' CLI. Install it with: pip install -U huggingface_hub" >&2
-  exit 1
-fi
+for command_name in hf python3; do
+  if ! command -v "$command_name" >/dev/null 2>&1; then
+    echo "Missing '$command_name'. Install huggingface_hub with: pip install -U huggingface_hub" >&2
+    exit 1
+  fi
+done
 
 if [[ ! -d "$LOGS_DIR" ]]; then
   echo "Logs directory does not exist: $LOGS_DIR" >&2
@@ -40,30 +41,76 @@ if [[ "$HF_PRIVATE" == "0" || "$HF_PRIVATE" == "false" ]]; then
   privacy_arg=--no-private
 fi
 
-include_args=()
-selected_source=$LOGS_DIR
+remote_dir_output=$(
+  HF_SYNC_TOKEN="$token" \
+  HF_SYNC_REPO_ID="$HF_REPO_ID" \
+  HF_SYNC_REPO_TYPE="$HF_REPO_TYPE" \
+  HF_SYNC_REVISION="$HF_REVISION" \
+  python3 - <<'PY'
+import os
+
+from huggingface_hub import HfApi
+from huggingface_hub.hf_api import RepoFolder
+
+for entry in HfApi().list_repo_tree(
+    repo_id=os.environ["HF_SYNC_REPO_ID"],
+    repo_type=os.environ["HF_SYNC_REPO_TYPE"],
+    revision=os.environ["HF_SYNC_REVISION"],
+    token=os.environ.get("HF_SYNC_TOKEN") or None,
+):
+    if isinstance(entry, RepoFolder):
+        print(entry.path)
+PY
+)
+remote_dirs=()
+if [[ -n "$remote_dir_output" ]]; then
+  mapfile -t remote_dirs <<<"$remote_dir_output"
+fi
+
+declare -A remote_dir_set=()
+for directory in "${remote_dirs[@]}"; do
+  remote_dir_set["$directory"]=1
+done
+
+selected_dirs=()
 if [[ -n "$LOG_SUBDIR" ]]; then
+  if [[ "$LOG_SUBDIR" == /* || "$LOG_SUBDIR" == *".."* || "$LOG_SUBDIR" == */* ]]; then
+    echo "LOG_SUBDIR must be a single relative directory name: $LOG_SUBDIR" >&2
+    exit 1
+  fi
   selected_dir=$LOGS_DIR/$LOG_SUBDIR
   if [[ ! -d "$selected_dir" ]]; then
     echo "Requested log subdirectory does not exist: $selected_dir" >&2
     exit 1
   fi
-  include_args=(--include "$LOG_SUBDIR/*" --include "$LOG_SUBDIR/**")
-  selected_source=$selected_dir
-elif [[ "$LATEST_DIR_ONLY" != "0" && "$LATEST_DIR_ONLY" != "false" ]]; then
-  latest_dir=$(find "$LOGS_DIR" -mindepth 1 -maxdepth 1 -type d -printf '%T@ %p\n' \
-    | sort -nr | sed -n '1p' | cut -d' ' -f2-)
-  if [[ -z "$latest_dir" ]]; then
-    echo "No subdirectories found under: $LOGS_DIR" >&2
-    exit 1
+  if [[ -z "${remote_dir_set[$LOG_SUBDIR]+x}" ]]; then
+    selected_dirs+=("$LOG_SUBDIR")
   fi
-  latest_name=${latest_dir#"$LOGS_DIR"/}
-  include_args=(--include "$latest_name/*" --include "$latest_name/**")
-  selected_source=$latest_dir
+else
+  mapfile -t local_dirs < <(
+    find "$LOGS_DIR" -mindepth 1 -maxdepth 1 -type d ! -name .cache -printf '%f\n' | sort
+  )
+  for directory in "${local_dirs[@]}"; do
+    if [[ -z "${remote_dir_set[$directory]+x}" ]]; then
+      selected_dirs+=("$directory")
+    fi
+  done
 fi
 
+if (( ${#selected_dirs[@]} == 0 )); then
+  echo "No new local log directories to upload."
+  exit 0
+fi
+
+include_args=()
+for directory in "${selected_dirs[@]}"; do
+  include_args+=(--include "$directory/*" --include "$directory/**")
+done
+
 echo "Uploading logs"
-echo "  source:   $selected_source"
+printf '  directories:'
+printf ' %q' "${selected_dirs[@]}"
+printf '\n'
 echo "  target:   https://huggingface.co/datasets/$HF_REPO_ID"
 echo "  revision: $HF_REVISION"
 
