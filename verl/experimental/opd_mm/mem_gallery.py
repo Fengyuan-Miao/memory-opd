@@ -97,6 +97,7 @@ def _summary(text: str, limit: int = 220) -> str:
 
 def _base_metadata(
     *,
+    dataset_name: str,
     scenario: str,
     scenario_file: Path,
     profile: dict[str, Any],
@@ -107,7 +108,7 @@ def _base_metadata(
     round_id = str(round_data.get("round") or "")
     session_id = str(session.get("session_id") or "")
     return {
-        "dataset": MEM_GALLERY_DATASET,
+        "dataset": dataset_name,
         "scenario": scenario,
         "scenario_file": str(scenario_file),
         "character_profile": profile,
@@ -121,8 +122,12 @@ def _base_metadata(
     }
 
 
-def load_mem_gallery_records(dataset_root: str | Path) -> list[MemoryRecord]:
-    """Convert Mem-Gallery dialogue rounds/images into OPD-MM memory records."""
+def load_mem_gallery_records(
+    dataset_root: str | Path,
+    *,
+    dataset_name: str = MEM_GALLERY_DATASET,
+) -> list[MemoryRecord]:
+    """Convert a Mem-Gallery-layout corpus into OPD-MM memory records."""
     root = Path(dataset_root)
     records: list[MemoryRecord] = []
     for scenario_file in sorted((_data_dir(root) / "dialog").glob("*.json")):
@@ -138,6 +143,7 @@ def load_mem_gallery_records(dataset_root: str | Path) -> list[MemoryRecord]:
                 turn_id = _scenario_turn_id(scenario, round_id)
                 timestamp = f"{session.get('date', '')}T{turn_index:04d}"
                 metadata = _base_metadata(
+                    dataset_name=dataset_name,
                     scenario=scenario,
                     scenario_file=scenario_file,
                     profile=profile,
@@ -161,7 +167,7 @@ def load_mem_gallery_records(dataset_root: str | Path) -> list[MemoryRecord]:
                     records.append(
                         MemoryRecord(
                             memory_id=(
-                                f"{MEM_GALLERY_DATASET}:{_safe_id(scenario)}:"
+                                f"{dataset_name}:{_safe_id(scenario)}:"
                                 f"{_safe_id(round_id)}:text"
                             ),
                             turn_id=turn_id,
@@ -200,7 +206,7 @@ def load_mem_gallery_records(dataset_root: str | Path) -> list[MemoryRecord]:
                     records.append(
                         MemoryRecord(
                             memory_id=(
-                                f"{MEM_GALLERY_DATASET}:{_safe_id(scenario)}:"
+                                f"{dataset_name}:{_safe_id(scenario)}:"
                                 f"{_safe_id(image_id)}:image"
                             ),
                             turn_id=turn_id,
@@ -217,8 +223,12 @@ def load_mem_gallery_records(dataset_root: str | Path) -> list[MemoryRecord]:
     return records
 
 
-def load_mem_gallery_qas(dataset_root: str | Path) -> list[dict[str, Any]]:
-    """Load Mem-Gallery human annotated QAs with resolved support metadata."""
+def load_mem_gallery_qas(
+    dataset_root: str | Path,
+    *,
+    dataset_name: str = MEM_GALLERY_DATASET,
+) -> list[dict[str, Any]]:
+    """Load QAs from a Mem-Gallery-layout corpus with resolved support metadata."""
     root = Path(dataset_root)
     qas: list[dict[str, Any]] = []
     for scenario_file in sorted((_data_dir(root) / "dialog").glob("*.json")):
@@ -230,10 +240,10 @@ def load_mem_gallery_qas(dataset_root: str | Path) -> list[dict[str, Any]]:
             qas.append(
                 {
                     "sample_id": (
-                        f"{MEM_GALLERY_DATASET}:{_safe_id(scenario)}:"
+                        f"{dataset_name}:{_safe_id(scenario)}:"
                         f"qa:{index:04d}"
                     ),
-                    "dataset": MEM_GALLERY_DATASET,
+                    "dataset": dataset_name,
                     "scenario": scenario,
                     "scenario_file": str(scenario_file),
                     "qa_index": index,
