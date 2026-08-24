@@ -24,7 +24,6 @@ scenario memories in ``extra_info.tools_kwargs``.
 from __future__ import annotations
 
 import argparse
-import hashlib
 import json
 import random
 import sys
@@ -197,28 +196,6 @@ def _scenario_point_counts(rows: Iterable[dict[str, Any]]) -> list[dict[str, Any
     ]
 
 
-def vary_cell_quotas(
-    rows: list[dict[str, Any]],
-    *,
-    max_drop_per_cell: int,
-    seed: int,
-) -> list[dict[str, Any]]:
-    """Deterministically remove 0..N rows per cell to avoid a quota prior."""
-
-    if max_drop_per_cell <= 0:
-        return rows
-    selected: list[dict[str, Any]] = []
-    for (scenario, point), group in sorted(_group_qas(rows).items()):
-        digest = hashlib.sha1(f"{seed}:{scenario}:{point}".encode("utf-8")).digest()
-        drop_count = min(digest[0] % (max_drop_per_cell + 1), max(0, len(group) - 1))
-        ranked = sorted(
-            group,
-            key=lambda qa: hashlib.sha1(f"{seed}:{qa['sample_id']}".encode("utf-8")).digest(),
-        )
-        selected.extend(ranked[drop_count:])
-    return sorted(selected, key=lambda qa: (qa["scenario"], qa["point"], qa["sample_id"]))
-
-
 def _summary(rows: list[dict[str, Any]]) -> dict[str, Any]:
     support_lengths = [len(row.get("support_turn_ids") or []) for row in rows]
     return {
@@ -251,10 +228,9 @@ def _samples_for_qas(
     dataset_root: str | Path,
     data_source: str,
     agent_name: str,
-    dataset_name: str,
 ) -> list[OPDSample]:
     dataset_root = Path(dataset_root).resolve()
-    records = load_mem_gallery_records(dataset_root, dataset_name=dataset_name)
+    records = load_mem_gallery_records(dataset_root)
     records_by_scenario: dict[str, list[Any]] = defaultdict(list)
     for record in records:
         records_by_scenario[str(record.metadata.get("scenario") or "")].append(record)
@@ -277,7 +253,7 @@ def _samples_for_qas(
             # process-wide OPD_MM_VECTOR_STORE_DIR selecting the wrong index.
             "vector_store_dir": str(dataset_root / "opd_mm_store"),
             "extra_info": {
-                "dataset_sample_id": qa.get("sample_id"),
+                "mem_gallery_sample_id": qa.get("sample_id"),
                 "scenario": scenario,
                 "point": qa.get("point"),
                 "qa_index": qa.get("qa_index"),
@@ -307,15 +283,13 @@ def build_subset(
     seed: int,
     data_source: str,
     agent_name: str,
-    dataset_name: str = "mem_gallery",
     write_rlhf: bool = True,
     base_sample_ids: Iterable[str] | None = None,
     excluded_sample_ids: Iterable[str] | None = None,
     reserve_eval_samples: int = 0,
     reserve_eval_seed: int = 20260705,
-    max_drop_per_cell: int = 0,
 ) -> dict[str, Any]:
-    qas = load_mem_gallery_qas(dataset_root, dataset_name=dataset_name)
+    qas = load_mem_gallery_qas(dataset_root)
     base_ids = {str(sample_id).strip() for sample_id in (base_sample_ids or []) if str(sample_id).strip()}
     excluded_ids = {
         str(sample_id).strip() for sample_id in (excluded_sample_ids or []) if str(sample_id).strip()
@@ -350,11 +324,6 @@ def build_subset(
             per_cell_cap=per_cell_cap,
             seed=seed,
         )
-    selected = vary_cell_quotas(
-        selected,
-        max_drop_per_cell=max_drop_per_cell,
-        seed=seed,
-    )
 
     output = Path(output_dir)
     output.mkdir(parents=True, exist_ok=True)
@@ -385,7 +354,6 @@ def build_subset(
             dataset_root=dataset_root,
             data_source=data_source,
             agent_name=agent_name,
-            dataset_name=dataset_name,
         )
         write_opd_rlhf_jsonl(samples, output / "train.jsonl", data_source=data_source, agent_name=agent_name)
         write_opd_rlhf_parquet(samples, output / "train.parquet", data_source=data_source, agent_name=agent_name)
@@ -397,7 +365,7 @@ def build_subset(
         )
 
     manifest = {
-        "dataset": dataset_name,
+        "dataset": "mem_gallery",
         "dataset_root": str(Path(dataset_root).resolve()),
         "output_dir": str(output.resolve()),
         "selection_policy": {
@@ -410,7 +378,6 @@ def build_subset(
             "excluded_sample_count": len(excluded_ids),
             "reserve_eval_samples": reserve_eval_samples,
             "reserve_eval_seed": reserve_eval_seed,
-            "max_drop_per_cell": max_drop_per_cell,
         },
         "full": _summary(qas),
         "train": _summary(selected),
@@ -429,12 +396,10 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=20260705)
     parser.add_argument("--data-source", default=DEFAULT_DATA_SOURCE)
     parser.add_argument("--agent-name", default=DEFAULT_AGENT_NAME)
-    parser.add_argument("--dataset-name", default="mem_gallery")
     parser.add_argument("--base-sample-ids", default="")
     parser.add_argument("--exclude-sample-ids", default="")
     parser.add_argument("--reserve-eval-samples", type=int, default=0)
     parser.add_argument("--reserve-eval-seed", type=int, default=20260705)
-    parser.add_argument("--max-drop-per-cell", type=int, default=0)
     parser.add_argument("--skip-rlhf", action="store_true")
     return parser.parse_args()
 
@@ -454,13 +419,11 @@ def main() -> None:
         seed=args.seed,
         data_source=args.data_source,
         agent_name=args.agent_name,
-        dataset_name=args.dataset_name,
         write_rlhf=not args.skip_rlhf,
         base_sample_ids=_read_sample_ids(args.base_sample_ids),
         excluded_sample_ids=_read_sample_ids(args.exclude_sample_ids),
         reserve_eval_samples=args.reserve_eval_samples,
         reserve_eval_seed=args.reserve_eval_seed,
-        max_drop_per_cell=args.max_drop_per_cell,
     )
     print(json.dumps(manifest, ensure_ascii=False, indent=2))
 

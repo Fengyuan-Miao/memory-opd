@@ -35,7 +35,6 @@ def main() -> None:
     parser.add_argument("--qas-jsonl", required=True)
     parser.add_argument("--output", required=True)
     parser.add_argument("--dataset-root", default="dataset/mem_gallery")
-    parser.add_argument("--dataset-name", default="mem_gallery")
     parser.add_argument("--data-source", default="opd_mm_eval")
     parser.add_argument("--agent-name", default="tool_agent")
     args = parser.parse_args()
@@ -50,7 +49,6 @@ def main() -> None:
         dataset_root=args.dataset_root,
         data_source=args.data_source,
         agent_name=args.agent_name,
-        dataset_name=args.dataset_name,
     )
     output = Path(args.output)
     output.parent.mkdir(parents=True, exist_ok=True)
