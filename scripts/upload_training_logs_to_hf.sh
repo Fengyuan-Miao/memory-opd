@@ -7,7 +7,7 @@ SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 REPO_ROOT=$(cd -- "$SCRIPT_DIR/.." && pwd)
 
 LOGS_DIR=${LOGS_DIR:-$REPO_ROOT/logs}
-HF_REPO_ID=${HF_REPO_ID:-memory-r1/opd-mm-training-logs}
+HF_REPO_ID=${HF_REPO_ID:-memory-rl/opd-mm-training-logs}
 HF_REPO_TYPE=${HF_REPO_TYPE:-dataset}
 HF_REVISION=${HF_REVISION:-main}
 HF_PRIVATE=${HF_PRIVATE:-1}
