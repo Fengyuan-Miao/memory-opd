@@ -11,6 +11,7 @@ RUN_TIMESTAMP=${RUN_TIMESTAMP:-$(date +%Y%m%d_%H%M%S)}
 
 WANDB_MODE=${WANDB_MODE:-online}
 WANDB_DISABLE_STATS=${WANDB_DISABLE_STATS:-True}
+WANDB_GPU_MEMORY_METRICS=${WANDB_GPU_MEMORY_METRICS:-False}
 WANDB_VAL_CASES=${WANDB_VAL_CASES:-4}
 export WANDB_CONSOLE=${WANDB_CONSOLE:-off}
 export WANDB_DISABLE_CODE=${WANDB_DISABLE_CODE:-true}
@@ -31,7 +32,8 @@ fi
 export WANDB_MODE
 WANDB_TRAINER_ARGS=(
     +trainer.wandb_disable_stats=${WANDB_DISABLE_STATS}
-    '+trainer.wandb_metric_include_patterns=["^(actor|critic|distillation)/.*loss$","^val-aux/.*/opd_mm/(answer_correct|evidence_answerable|evidence_count|action_count|repeated_actions|max_actions_reached|empty_evidence|trajectory_error|answer_request_failed|judge_request_failed|evidence_judge_request_failed)/mean@.*$","^training/(global_step|epoch)$"]'
+    +trainer.wandb_gpu_memory_metrics=${WANDB_GPU_MEMORY_METRICS}
+    '+trainer.wandb_metric_include_patterns=["^(actor|critic|distillation)/.*loss$","^val-aux/.*/opd_mm/(answer_correct|evidence_answerable|evidence_count|action_count|repeated_actions|max_actions_reached|empty_evidence|trajectory_error|answer_request_failed|judge_request_failed|evidence_judge_request_failed)/mean@.*$","^training/(global_step|epoch)$","^gpu_memory/.*$"]'
 )
 if [[ -n "$WANDB_PROXY" ]]; then
     WANDB_TRAINER_ARGS+=(+trainer.wandb_proxy="$WANDB_PROXY")
@@ -103,6 +105,8 @@ OUTCOME_SERVER_BASE_URL=${OUTCOME_SERVER_BASE_URL:-http://${OUTCOME_SERVER_HOST}
 OUTCOME_SERVER_TP=${OUTCOME_SERVER_TP:-2}
 OUTCOME_SERVER_GPU_MEMORY_UTIL=${OUTCOME_SERVER_GPU_MEMORY_UTIL:-0.9}
 OUTCOME_SERVER_MAX_MODEL_LEN=${OUTCOME_SERVER_MAX_MODEL_LEN:-40000}
+OUTCOME_SERVER_MAX_NUM_SEQS=${OUTCOME_SERVER_MAX_NUM_SEQS:-16}
+OUTCOME_SERVER_MAX_NUM_BATCHED_TOKENS=${OUTCOME_SERVER_MAX_NUM_BATCHED_TOKENS:-16384}
 OUTCOME_SERVER_START_TIMEOUT=${OUTCOME_SERVER_START_TIMEOUT:-900}
 
 rollout_n=${ROLLOUT_N:-4}
@@ -126,6 +130,9 @@ use_reference_kl=${USE_REFERENCE_KL:-False}
 reference_kl_coef=${REFERENCE_KL_COEF:-0.005}
 rollout_tp=${ROLLOUT_TP:-2}
 rollout_gpu_mem_util=${ROLLOUT_GPU_MEM_UTIL:-0.4}
+rollout_max_num_seqs=${ROLLOUT_MAX_NUM_SEQS:-16}
+rollout_max_num_batched_tokens=${ROLLOUT_MAX_NUM_BATCHED_TOKENS:-8192}
+agent_loop_num_workers=${AGENT_LOOP_NUM_WORKERS:-8}
 rollout_temperature=${ROLLOUT_TEMPERATURE:-0.8}
 rollout_top_p=${ROLLOUT_TOP_P:-0.95}
 val_do_sample=${VAL_DO_SAMPLE:-True}
@@ -178,7 +185,7 @@ export HYDRA_FULL_ERROR=${HYDRA_FULL_ERROR:-1}
 export RAY_TMPDIR TMPDIR
 export OPD_MM_STUDENT_ROLLOUT_DUMP_DIR
 export OPD_MM_STUDENT_ROLLOUT_DUMP_MAX_CHARS=${OPD_MM_STUDENT_ROLLOUT_DUMP_MAX_CHARS:-12000}
-export OPD_MM_RECORD_POLICY_STATES=1
+export OPD_MM_RECORD_POLICY_STATES=${OPD_MM_RECORD_POLICY_STATES:-1}
 export OPD_MM_KL_TOPK
 case "${OPD_MM_KL_CREDIT_ENABLED,,}" in
     1|true|yes|on) export OPD_MM_KL_CREDIT_ASSIGNMENT=1 ;;
@@ -228,6 +235,8 @@ case "${START_OUTCOME_SERVER,,}" in
             --tensor-parallel-size "$OUTCOME_SERVER_TP" \
             --gpu-memory-utilization "$OUTCOME_SERVER_GPU_MEMORY_UTIL" \
             --max-model-len "$OUTCOME_SERVER_MAX_MODEL_LEN" \
+            --max-num-seqs "$OUTCOME_SERVER_MAX_NUM_SEQS" \
+            --max-num-batched-tokens "$OUTCOME_SERVER_MAX_NUM_BATCHED_TOKENS" \
             --trust-remote-code \
             >"$OUTCOME_SERVER_LOG" 2>&1 &
         outcome_server_pid=$!
@@ -289,6 +298,7 @@ echo "OPD_MM_OUTCOME_REWARD_DUMP_DIR=${OPD_MM_OUTCOME_REWARD_DUMP_DIR}"
 echo "WANDB_MODE=${WANDB_MODE}"
 echo "WANDB_PROXY=${WANDB_PROXY:-direct}"
 echo "WANDB_DISABLE_STATS=${WANDB_DISABLE_STATS}"
+echo "WANDB_GPU_MEMORY_METRICS=${WANDB_GPU_MEMORY_METRICS}"
 
 max_num_tokens=$(( max_prompt_length + max_response_length + 1 ))
 
@@ -353,6 +363,8 @@ ROLLOUT=(
     actor_rollout_ref.rollout.name=vllm
     actor_rollout_ref.rollout.tensor_model_parallel_size=${rollout_tp}
     actor_rollout_ref.rollout.gpu_memory_utilization=${rollout_gpu_mem_util}
+    actor_rollout_ref.rollout.max_num_seqs=${rollout_max_num_seqs}
+    actor_rollout_ref.rollout.max_num_batched_tokens=${rollout_max_num_batched_tokens}
     actor_rollout_ref.rollout.n=${rollout_n}
     actor_rollout_ref.rollout.temperature=${rollout_temperature}
     actor_rollout_ref.rollout.top_p=${rollout_top_p}
@@ -371,7 +383,7 @@ ROLLOUT=(
     actor_rollout_ref.rollout.multi_turn.format=qwen3_coder
     actor_rollout_ref.rollout.multi_turn.tokenization_sanity_check_mode=disable
     actor_rollout_ref.rollout.agent.default_agent_loop=tool_agent
-    actor_rollout_ref.rollout.agent.num_workers=8
+    actor_rollout_ref.rollout.agent.num_workers=${agent_loop_num_workers}
     actor_rollout_ref.rollout.calculate_log_probs=True
     actor_rollout_ref.rollout.load_format=dummy
 )

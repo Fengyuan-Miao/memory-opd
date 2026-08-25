@@ -20,6 +20,7 @@ import json
 import logging
 import os
 import re
+import subprocess
 from enum import Enum
 from functools import partial
 from pathlib import Path
@@ -31,6 +32,46 @@ logger = logging.getLogger(__name__)
 
 MLFLOW_MAX_ATTEMPTS = 3
 MLFLOW_SLEEP_SECONDS = 5
+
+
+def _gpu_memory_utilization_metrics() -> dict[str, float]:
+    """Read lightweight per-GPU memory percentages without enabling W&B system stats."""
+    try:
+        result = subprocess.run(
+            [
+                "nvidia-smi",
+                "--query-gpu=index,memory.used,memory.total",
+                "--format=csv,noheader,nounits",
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+    except (FileNotFoundError, subprocess.SubprocessError):
+        return {}
+
+    metrics: dict[str, float] = {}
+    percentages: list[float] = []
+    for line in result.stdout.splitlines():
+        fields = [field.strip() for field in line.split(",")]
+        if len(fields) != 3:
+            continue
+        try:
+            index = int(fields[0])
+            used_mib = float(fields[1])
+            total_mib = float(fields[2])
+        except ValueError:
+            continue
+        if total_mib <= 0:
+            continue
+        percentage = 100.0 * used_mib / total_mib
+        percentages.append(percentage)
+        metrics[f"gpu_memory/gpu_{index}_percent"] = percentage
+    if percentages:
+        metrics["gpu_memory/mean_percent"] = sum(percentages) / len(percentages)
+        metrics["gpu_memory/max_percent"] = max(percentages)
+    return metrics
 
 
 class Tracking:
@@ -69,11 +110,15 @@ class Tracking:
 
         self.logger = {}
         self._wandb_metric_include_patterns: list[re.Pattern[str]] = []
+        self._wandb_gpu_memory_metrics = False
         if config:
             raw_patterns = config.get("trainer", {}).get("wandb_metric_include_patterns", []) or []
             if isinstance(raw_patterns, str):
                 raw_patterns = [raw_patterns]
             self._wandb_metric_include_patterns = [re.compile(str(pattern)) for pattern in raw_patterns]
+            self._wandb_gpu_memory_metrics = bool(
+                config.get("trainer", {}).get("wandb_gpu_memory_metrics", False)
+            )
 
         if "tracking" in default_backend or "wandb" in default_backend:
             import os
@@ -194,6 +239,8 @@ class Tracking:
         for default_backend, logger_instance in self.logger.items():
             if backend is None or default_backend in backend:
                 backend_data = data
+                if default_backend == "wandb" and self._wandb_gpu_memory_metrics:
+                    backend_data = {**data, **_gpu_memory_utilization_metrics()}
                 if default_backend == "wandb" and self._wandb_metric_include_patterns:
                     backend_data = {
                         key: value
