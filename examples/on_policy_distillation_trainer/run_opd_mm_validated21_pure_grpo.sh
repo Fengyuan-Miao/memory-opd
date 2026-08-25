@@ -8,7 +8,19 @@ SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 REPO_ROOT=$(cd "$SCRIPT_DIR/../.." && pwd)
 cd "$REPO_ROOT"
 
-DATASET_ROOT=${DATASET_ROOT:-$REPO_ROOT/dataset/mmem/data/batches/validated21_final}
+if [[ -z "${DATASET_ROOT:-}" ]]; then
+    # The portable MMEM archive extracts to dataset/mmem/batches. Keep the
+    # original development-tree location as a compatibility fallback.
+    for candidate in \
+        "$REPO_ROOT/dataset/mmem/batches/validated21_final" \
+        "$REPO_ROOT/dataset/mmem/data/batches/validated21_final"; do
+        if [[ -d "$candidate/opd_mm_store" ]]; then
+            DATASET_ROOT=$candidate
+            break
+        fi
+    done
+    DATASET_ROOT=${DATASET_ROOT:-$REPO_ROOT/dataset/mmem/batches/validated21_final}
+fi
 STORE_DIR=${STORE_DIR:-$DATASET_ROOT/opd_mm_store}
 SPLIT_DIR=${SPLIT_DIR:-$STORE_DIR/subsets/grpo_holdout100_20260813}
 MMEM_VAL_PARQUET=${MMEM_VAL_PARQUET:-$SPLIT_DIR/heldout_mmem_val.parquet}
@@ -16,6 +28,7 @@ MEMGALLERY_VAL_PARQUET=${MEMGALLERY_VAL_PARQUET:-$SPLIT_DIR/heldout_memgallery_v
 
 for required_path in \
     "$SPLIT_DIR/train.parquet" \
+    "$SPLIT_DIR/heldout_qas.jsonl" \
     "$MMEM_VAL_PARQUET" \
     "$MEMGALLERY_VAL_PARQUET" \
     "$STORE_DIR/indexes/dense/embeddings.npy" \
@@ -49,8 +62,11 @@ done
 
 export OPD_MODEL_PATH=${OPD_MODEL_PATH:-$MODEL_4B_PATH}
 export GRPO_DATA_DIR="$SPLIT_DIR"
+export OPD_MM_DATASET_ROOT="$DATASET_ROOT"
 export OPD_MM_TRAIN_FILES="['$SPLIT_DIR/train.parquet']"
 export OPD_MM_VAL_FILES="['$MMEM_VAL_PARQUET','$MEMGALLERY_VAL_PARQUET']"
+export OPD_MM_HELDOUT_QAS="$SPLIT_DIR/heldout_qas.jsonl"
+export OPD_MM_VAL_PARQUET="$MMEM_VAL_PARQUET"
 export OPD_MM_VECTOR_STORE_DIR="$STORE_DIR"
 export OPD_MM_REWARD_PATH=${OPD_MM_REWARD_PATH:-$REPO_ROOT/verl/experimental/opd_mm/outcome_reward.py}
 
@@ -99,6 +115,9 @@ export OUTCOME_SERVER_MAX_NUM_SEQS=${OUTCOME_SERVER_MAX_NUM_SEQS:-8}
 export OUTCOME_SERVER_MAX_NUM_BATCHED_TOKENS=${OUTCOME_SERVER_MAX_NUM_BATCHED_TOKENS:-8192}
 export OPD_MM_VERIFIER_BASE_URL="$OUTCOME_SERVER_BASE_URL"
 export OPD_MM_VERIFIER_MODEL="$OUTCOME_SERVED_MODEL"
+export OPD_MM_RAW_INSPECTOR_TIMEOUT=${OPD_MM_RAW_INSPECTOR_TIMEOUT:-120}
+export OPD_MM_RAW_INSPECTOR_BYPASS_PROXY=${OPD_MM_RAW_INSPECTOR_BYPASS_PROXY:-1}
+export OPD_MM_RAW_INSPECTOR_HEALTHCHECK_IMAGE=${OPD_MM_RAW_INSPECTOR_HEALTHCHECK_IMAGE:-$DATASET_ROOT/image/Museum_Urban_Nature_Cat_London_Exhibition_Community_Life/D8_IMG_003.jpg}
 export NO_PROXY="${NO_PROXY:+$NO_PROXY,}127.0.0.1,localhost"
 export no_proxy="$NO_PROXY"
 
@@ -119,6 +138,7 @@ export RAY_TMP_ROOT=${RAY_TMP_ROOT:-/tmp/verl_ray_$(id -u)}
 export CHECKPOINT_ROOT=${CHECKPOINT_ROOT:-/tmp/memory-opd-checkpoints/$PROJECT_NAME/$EXPERIMENT_NAME}
 
 export WANDB_MODE=${WANDB_MODE:-online}
+export WANDB_API_KEY=${WANDB_API_KEY:-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}
 export WANDB_ENTITY=${WANDB_ENTITY:-mmem}
 export WANDB_VAL_CASES=${WANDB_VAL_CASES:-0}
 export WANDB_DISABLE_STATS=${WANDB_DISABLE_STATS:-True}
