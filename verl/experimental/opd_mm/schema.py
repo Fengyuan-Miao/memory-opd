@@ -24,31 +24,31 @@ from .models import ToolAction
 
 
 ALLOWED_TOOLS = {
-    "FILTER",
+    "SEARCH_METADATA",
     "RETRIEVE",
     "EXPAND_NEIGHBORS",
-    "INSPECT_RAW",
+    "INSPECT_EVIDENCE_IMAGE",
     "STOP",
 }
 DEFAULT_MAX_ACTIONS = 10
-FILTER_FIELDS = {"modality", "timestamp", "status"}
-FILTER_OPS_BY_FIELD = {
+METADATA_SEARCH_FIELDS = {"modality", "timestamp", "status"}
+METADATA_SEARCH_OPS_BY_FIELD = {
     "modality": {"eq", "neq"},
     "status": {"eq"},
     "timestamp": {"eq", "before", "after", "contains"},
 }
-FILTER_OPS = set().union(*FILTER_OPS_BY_FIELD.values())
-FILTER_VALUE_ENUMS = {
+METADATA_SEARCH_OPS = set().union(*METADATA_SEARCH_OPS_BY_FIELD.values())
+METADATA_SEARCH_VALUE_ENUMS = {
     "modality": {"image", "text"},
     "status": {"active"},
 }
-FILTER_TIMESTAMP_PATTERN = re.compile(
+METADATA_SEARCH_TIMESTAMP_PATTERN = re.compile(
     r"^\d{4}(?:-\d{2})?(?:-\d{2})?"
     r"(?:T\d{2}:\d{2}(?::\d{2}(?:\.\d+)?)?(?:Z|[+-]\d{2}:\d{2})?)?$"
 )
 RETRIEVAL_METHODS = {"bm25", "dense", "vision", "hybrid"}
 EXPAND_NEIGHBOR_WINDOWS = {1, 2, 3}
-INSPECT_TARGETS = {"current_pool"}
+INSPECT_TARGETS = {"current_evidence_images"}
 INSPECT_INSTRUCTIONS = {"answer_query_related_visual_details"}
 FORBIDDEN_ARGUMENT_KEYS = {
     "memory_id",
@@ -60,8 +60,8 @@ FORBIDDEN_ARGUMENT_KEYS = {
 MEMORY_ID_PATTERN = re.compile(r"\b(?:m|memory|mau)[-_]?\d+\b", re.IGNORECASE)
 
 TOOL_SCHEMA_TEXT = """Allowed executable tools:
-FILTER(field=modality|timestamp|status,
-       op=eq|neq|before|after|contains, value=...)
+SEARCH_METADATA(field=modality|timestamp|status,
+                op=eq|neq|before|after|contains, value=...)
 RETRIEVE(method=bm25|dense|vision|hybrid, top_k=positive integer,
          query=optional rewritten search text)
 EXPAND_NEIGHBORS(window=1|2|3)
@@ -71,15 +71,14 @@ Return only a JSON array of tool calls. Do not emit memory IDs. RETRIEVE uses
 the original user query by default; optionally provide query to rewrite the
 search text for the current retrieval step. Every RETRIEVE searches the
 original hidden memory store and merges deduplicated results into the current
-candidate pool. For timestamp filters, date-only values
-such as YYYY-MM-DD match all memory timestamps from that date. Every FILTER
-searches the original hidden memory store and merges deduplicated matches into
-the current pool. After each discovery action, an internal semantic selector
+candidate pool. SEARCH_METADATA searches the original hidden memory store;
+date-only timestamp values such as YYYY-MM-DD match all memory timestamps from
+that date. After each discovery action, an internal semantic selector
 chooses which candidates become public answer evidence.
 For Mem-Gallery, modality values are text and image; status value is active.
 EXPAND_NEIGHBORS adds
 nearby turns around current answer evidence; use it only after a retrieve or
-filter step has produced relevant evidence."""
+metadata-search step has produced relevant evidence."""
 
 
 def build_tool_schema(allow_inspect_raw: bool = True) -> str:
@@ -87,11 +86,9 @@ def build_tool_schema(allow_inspect_raw: bool = True) -> str:
     if allow_inspect_raw:
         stop_index = lines.index("STOP()")
         lines[stop_index:stop_index] = [
-            "INSPECT_RAW(target=current_pool,",
+            "INSPECT_EVIDENCE_IMAGE(target=current_evidence_images,",
             "            instruction=answer_query_related_visual_details)",
-            "# INSPECT_RAW calls a visual inspector only for the current retrieved candidate pool;",
-            "# it cannot inspect the user's attached question image, cannot inspect an empty pool,",
-            "# and is not a search over the original full memory store. Use vision/hybrid RETRIEVE first.",
+            "# This inspects only images already present in public answer evidence.",
         ]
     return "\n".join(lines)
 
@@ -143,9 +140,9 @@ class TrajectoryValidator:
             raise TrajectoryValidationError(
                 f"action {index}: unsupported tool {action.tool!r}"
             )
-        if action.tool == "INSPECT_RAW" and not self.allow_inspect_raw:
+        if action.tool == "INSPECT_EVIDENCE_IMAGE" and not self.allow_inspect_raw:
             raise TrajectoryValidationError(
-                f"action {index}: INSPECT_RAW is unavailable in this run"
+                f"action {index}: INSPECT_EVIDENCE_IMAGE is unavailable in this run"
             )
         forbidden = FORBIDDEN_ARGUMENT_KEYS & set(action.arguments)
         if forbidden:
@@ -179,32 +176,32 @@ class TrajectoryValidator:
                 f"action {index}: unknown arguments {sorted(unknown)}"
             )
 
-    def _validate_filter(self, args: Dict[str, Any], index: int) -> None:
+    def _validate_search_metadata(self, args: Dict[str, Any], index: int) -> None:
         self._require_exact_keys(args, {"field", "op", "value"}, set(), index)
-        if args["field"] not in FILTER_FIELDS:
-            raise TrajectoryValidationError(f"action {index}: invalid FILTER field")
-        if args["op"] not in FILTER_OPS:
-            raise TrajectoryValidationError(f"action {index}: invalid FILTER op")
-        allowed_ops = FILTER_OPS_BY_FIELD[args["field"]]
+        if args["field"] not in METADATA_SEARCH_FIELDS:
+            raise TrajectoryValidationError(f"action {index}: invalid SEARCH_METADATA field")
+        if args["op"] not in METADATA_SEARCH_OPS:
+            raise TrajectoryValidationError(f"action {index}: invalid SEARCH_METADATA op")
+        allowed_ops = METADATA_SEARCH_OPS_BY_FIELD[args["field"]]
         if args["op"] not in allowed_ops:
             raise TrajectoryValidationError(
-                f"action {index}: invalid FILTER op for {args['field']}; "
+                f"action {index}: invalid SEARCH_METADATA op for {args['field']}; "
                 f"expected one of {sorted(allowed_ops)}"
             )
         if not isinstance(args["value"], (str, int, float, bool)):
-            raise TrajectoryValidationError(f"action {index}: invalid FILTER value")
-        allowed_values = FILTER_VALUE_ENUMS.get(args["field"])
+            raise TrajectoryValidationError(f"action {index}: invalid SEARCH_METADATA value")
+        allowed_values = METADATA_SEARCH_VALUE_ENUMS.get(args["field"])
         if allowed_values is not None and args["value"] not in allowed_values:
             raise TrajectoryValidationError(
-                f"action {index}: invalid FILTER value for {args['field']}; "
+                f"action {index}: invalid SEARCH_METADATA value for {args['field']}; "
                 f"expected one of {sorted(allowed_values)}"
             )
         if args["field"] == "timestamp" and (
             not isinstance(args["value"], str)
-            or not FILTER_TIMESTAMP_PATTERN.fullmatch(args["value"].strip())
+            or not METADATA_SEARCH_TIMESTAMP_PATTERN.fullmatch(args["value"].strip())
         ):
             raise TrajectoryValidationError(
-                f"action {index}: invalid FILTER timestamp value; expected YYYY, YYYY-MM, YYYY-MM-DD, or ISO timestamp"
+                f"action {index}: invalid SEARCH_METADATA timestamp value; expected YYYY, YYYY-MM, YYYY-MM-DD, or ISO timestamp"
             )
 
     def _validate_retrieve(self, args: Dict[str, Any], index: int) -> None:
@@ -221,16 +218,16 @@ class TrajectoryValidator:
         if not isinstance(window, int) or isinstance(window, bool) or window not in EXPAND_NEIGHBOR_WINDOWS:
             raise TrajectoryValidationError(f"action {index}: window must be one of {sorted(EXPAND_NEIGHBOR_WINDOWS)}")
 
-    def _validate_inspect_raw(self, args: Dict[str, Any], index: int) -> None:
+    def _validate_inspect_evidence_image(self, args: Dict[str, Any], index: int) -> None:
         self._require_exact_keys(args, set(), {"target", "instruction"}, index)
-        if args.get("target", "current_pool") not in INSPECT_TARGETS:
-            raise TrajectoryValidationError(f"action {index}: invalid INSPECT_RAW target")
+        if args.get("target", "current_evidence_images") not in INSPECT_TARGETS:
+            raise TrajectoryValidationError(f"action {index}: invalid INSPECT_EVIDENCE_IMAGE target")
         if (
             args.get("instruction", "answer_query_related_visual_details")
             not in INSPECT_INSTRUCTIONS
         ):
             raise TrajectoryValidationError(
-                f"action {index}: invalid INSPECT_RAW instruction"
+                f"action {index}: invalid INSPECT_EVIDENCE_IMAGE instruction"
             )
 
     def _validate_stop(self, args: Dict[str, Any], index: int) -> None:

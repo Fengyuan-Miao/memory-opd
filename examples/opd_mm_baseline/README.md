@@ -83,7 +83,7 @@ Each row contains:
 The default OPD-MM system prompt gives policy-level guidance while OpenAI tool
 schemas define each action. Discovery actions merge into a bounded working
 pool. A fixed model-based semantic selector screens that pool and exposes only
-question-relevant answer evidence. INSPECT_RAW enriches selected image evidence, and STOP ends the
+question-relevant answer evidence. INSPECT_EVIDENCE_IMAGE enriches selected image evidence, and STOP ends the
 trajectory when the accumulated evidence is sufficient. Hidden memory IDs and
 the gold answer are never exposed to the student.
 

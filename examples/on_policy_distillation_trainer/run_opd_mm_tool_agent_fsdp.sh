@@ -38,7 +38,7 @@ if [[ -n "$WANDB_PROXY" ]]; then
 fi
 STUDENT_MODEL=${STUDENT_MODEL:-/home/guojr/data/pretrained_models/Qwen/Qwen3.5-4B}
 # Frozen-teacher OPD-MM path. The same teacher vLLM service is also used by the
-# verifier and INSPECT_RAW when OPD_MM_RAW_INSPECTOR_BACKEND=teacher.
+# verifier and INSPECT_EVIDENCE_IMAGE when OPD_MM_RAW_INSPECTOR_BACKEND=teacher.
 TEACHER_MODEL=${TEACHER_MODEL:-/home/guojr/data/pretrained_models/Qwen/Qwen3.5-9B}
 
 OPD_MM_TRAIN_FILES=${OPD_MM_TRAIN_FILES:-"['/home/miaofy/memory-opd/dataset/mem_gallery/opd_mm_store/subsets/balanced_train_cap2/train.parquet']"}

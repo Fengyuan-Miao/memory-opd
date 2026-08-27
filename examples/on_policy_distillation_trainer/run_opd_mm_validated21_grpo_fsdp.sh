@@ -63,7 +63,7 @@ export OPD_MM_VAL_FILES="['$MMEM_VAL_PARQUET','$MEMGALLERY_VAL_PARQUET']"
 export OPD_MM_VECTOR_STORE_DIR="$STORE_DIR"
 
 # Two visible GPUs host the student actor/rollout and two host the local 4B
-# teacher. The answer/judge/INSPECT_RAW service is external, so all currently
+# teacher. The answer/judge/INSPECT_EVIDENCE_IMAGE service is external, so all currently
 # idle GPUs are used without touching unrelated processes on GPUs 0-3.
 export TRAIN_GPUS=${TRAIN_GPUS:-4,5,6,7}
 export NGPUS_PER_NODE=${NGPUS_PER_NODE:-2}

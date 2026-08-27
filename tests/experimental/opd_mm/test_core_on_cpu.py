@@ -68,8 +68,8 @@ from verl.experimental.opd_mm.teacher_privilege import (
 )
 from verl.experimental.opd_mm.tools import (
     OPDExpandNeighborsTool,
-    OPDFilterTool,
-    OPDInspectRawTool,
+    OPDSearchMetadataTool,
+    OPDInspectEvidenceImageTool,
     OPDRetrieveTool,
     OPDStopTool,
     hidden_store_from_records,
@@ -699,22 +699,22 @@ def test_validator_rejects_memory_ids_and_accepts_rewritten_retrieve_query() -> 
     validator = TrajectoryValidator(max_actions=4)
 
     with pytest.raises(TrajectoryValidationError, match="memory IDs"):
-        validator.validate([{"tool": "FILTER", "field": "status", "op": "eq", "value": "m_001"}])
+        validator.validate([{"tool": "SEARCH_METADATA", "field": "status", "op": "eq", "value": "m_001"}])
 
     validated_filter = validator.validate(
-        [{"tool": "FILTER", "field": "modality", "op": "eq", "value": "image"}]
+        [{"tool": "SEARCH_METADATA", "field": "modality", "op": "eq", "value": "image"}]
     )
     assert validated_filter[0].arguments == {"field": "modality", "op": "eq", "value": "image"}
 
     for removed_field in ("author", "source_type"):
-        with pytest.raises(TrajectoryValidationError, match="invalid FILTER field"):
+        with pytest.raises(TrajectoryValidationError, match="invalid SEARCH_METADATA field"):
             validator.validate(
-                [{"tool": "FILTER", "field": removed_field, "op": "eq", "value": "user"}]
+                [{"tool": "SEARCH_METADATA", "field": removed_field, "op": "eq", "value": "user"}]
             )
 
     with pytest.raises(TrajectoryValidationError, match="unknown arguments"):
         validator.validate(
-            [{"tool": "FILTER", "field": "modality", "op": "eq", "value": "image", "scope": "full_memory"}]
+            [{"tool": "SEARCH_METADATA", "field": "modality", "op": "eq", "value": "image", "scope": "full_memory"}]
         )
 
     invalid_filter_values = (
@@ -722,18 +722,18 @@ def test_validator_rejects_memory_ids_and_accepts_rewritten_retrieve_query() -> 
         ("status", "completed"),
     )
     for field, value in invalid_filter_values:
-        with pytest.raises(TrajectoryValidationError, match=f"invalid FILTER value for {field}"):
+        with pytest.raises(TrajectoryValidationError, match=f"invalid SEARCH_METADATA value for {field}"):
             validator.validate(
-                [{"tool": "FILTER", "field": field, "op": "eq", "value": value}]
+                [{"tool": "SEARCH_METADATA", "field": field, "op": "eq", "value": value}]
             )
 
-    with pytest.raises(TrajectoryValidationError, match="invalid FILTER op for modality"):
+    with pytest.raises(TrajectoryValidationError, match="invalid SEARCH_METADATA op for modality"):
         validator.validate(
-            [{"tool": "FILTER", "field": "modality", "op": "contains", "value": "image"}]
+            [{"tool": "SEARCH_METADATA", "field": "modality", "op": "contains", "value": "image"}]
         )
-    with pytest.raises(TrajectoryValidationError, match="invalid FILTER timestamp value"):
+    with pytest.raises(TrajectoryValidationError, match="invalid SEARCH_METADATA timestamp value"):
         validator.validate(
-            [{"tool": "FILTER", "field": "timestamp", "op": "contains", "value": "dinner"}]
+            [{"tool": "SEARCH_METADATA", "field": "timestamp", "op": "contains", "value": "dinner"}]
         )
 
     validated = validator.validate([{"tool": "RETRIEVE", "query": "custom query", "top_k": 3}])
@@ -782,7 +782,7 @@ def test_opd_state_prompt_keeps_action_history_and_only_latest_observation() -> 
         base,
         [
             {"tool": "RETRIEVE", "method": "bm25", "top_k": 5},
-            {"tool": "FILTER", "field": "timestamp", "op": "eq", "value": "2024-09-01"},
+            {"tool": "SEARCH_METADATA", "field": "timestamp", "op": "eq", "value": "2024-09-01"},
         ],
         {"pool_count": 2, "evidence_preview": [{"content": "latest refreshed result"}]},
     )
@@ -791,7 +791,7 @@ def test_opd_state_prompt_keeps_action_history_and_only_latest_observation() -> 
     assert "old retrieval result" not in second[-1]["content"]
     assert "latest refreshed result" in second[-1]["content"]
     assert '"tool":"RETRIEVE"' in second[-1]["content"]
-    assert '"tool":"FILTER"' in second[-1]["content"]
+    assert '"tool":"SEARCH_METADATA"' in second[-1]["content"]
     assert len(second) == len(base)
 
 
@@ -811,9 +811,9 @@ def test_repeated_filters_always_search_full_memory_and_merge_results() -> None:
 
     result = ToolExecutor().run(
         [
-            {"tool": "FILTER", "field": "modality", "op": "eq", "value": "image"},
-            {"tool": "FILTER", "field": "modality", "op": "eq", "value": "text"},
-            {"tool": "FILTER", "field": "status", "op": "eq", "value": "active"},
+            {"tool": "SEARCH_METADATA", "field": "modality", "op": "eq", "value": "image"},
+            {"tool": "SEARCH_METADATA", "field": "modality", "op": "eq", "value": "text"},
+            {"tool": "SEARCH_METADATA", "field": "status", "op": "eq", "value": "active"},
         ],
         query="Collect several independently filtered memory sets.",
         memory_store=store,
@@ -868,7 +868,7 @@ def test_executor_composes_generic_tools_to_timestamped_image() -> None:
     store = HiddenMemoryStore(_records())
     result = ToolExecutor().run(
         [
-            {"tool": "FILTER", "field": "timestamp", "op": "eq", "value": "2026-01-01T10:00:01"},
+            {"tool": "SEARCH_METADATA", "field": "timestamp", "op": "eq", "value": "2026-01-01T10:00:01"},
         ],
         query="Which image did I upload last?",
         memory_store=store,
@@ -901,7 +901,7 @@ def test_timestamp_filter_accepts_date_only_model_values() -> None:
     store = HiddenMemoryStore(records)
 
     eq_result = ToolExecutor().run(
-        [{"tool": "FILTER", "field": "timestamp", "op": "eq", "value": "2026-01-01"}],
+        [{"tool": "SEARCH_METADATA", "field": "timestamp", "op": "eq", "value": "2026-01-01"}],
         query="Which memories are from 2026-01-01?",
         memory_store=store,
     )
@@ -915,7 +915,7 @@ def test_timestamp_filter_accepts_date_only_model_values() -> None:
     contains_result = ToolExecutor().run(
         [
             {
-                "tool": "FILTER",
+                "tool": "SEARCH_METADATA",
                 "field": "timestamp",
                 "op": "contains",
                 "value": "2026-01-01",
@@ -927,14 +927,14 @@ def test_timestamp_filter_accepts_date_only_model_values() -> None:
     assert set(contains_result.final_memory_ids) == set(eq_result.final_memory_ids)
 
     before_result = ToolExecutor().run(
-        [{"tool": "FILTER", "field": "timestamp", "op": "before", "value": "2026-01-02"}],
+        [{"tool": "SEARCH_METADATA", "field": "timestamp", "op": "before", "value": "2026-01-02"}],
         query="Which memories are before 2026-01-02?",
         memory_store=store,
     )
     assert set(before_result.final_memory_ids) == set(eq_result.final_memory_ids)
 
     after_result = ToolExecutor().run(
-        [{"tool": "FILTER", "field": "timestamp", "op": "after", "value": "2026-01-01"}],
+        [{"tool": "SEARCH_METADATA", "field": "timestamp", "op": "after", "value": "2026-01-01"}],
         query="Which memories are after 2026-01-01?",
         memory_store=store,
     )
@@ -997,8 +997,8 @@ def test_inspect_raw_only_reads_semantically_selected_evidence() -> None:
 
     filtered_result = ToolExecutor(raw_inspector=inspector).run(
         [
-            {"tool": "FILTER", "field": "modality", "op": "eq", "value": "image"},
-            {"tool": "INSPECT_RAW"},
+            {"tool": "SEARCH_METADATA", "field": "modality", "op": "eq", "value": "image"},
+            {"tool": "INSPECT_EVIDENCE_IMAGE"},
         ],
         query="What is in the cat image?",
         memory_store=store,
@@ -1006,7 +1006,7 @@ def test_inspect_raw_only_reads_semantically_selected_evidence() -> None:
 
     assert inspector.calls == ["images/cat.png", "images/chart.png"]
     assert filtered_result.steps[1].evidence_added == 2
-    assert sum(item.source == "INSPECT_RAW" for item in filtered_result.evidence) == 2
+    assert sum(item.source == "INSPECT_EVIDENCE_IMAGE" for item in filtered_result.evidence) == 2
 
     retrieved_inspector = FakeRawInspector()
     retrieved_result = ToolExecutor(
@@ -1015,7 +1015,7 @@ def test_inspect_raw_only_reads_semantically_selected_evidence() -> None:
     ).run(
         [
             {"tool": "RETRIEVE", "method": "bm25", "top_k": 1},
-            {"tool": "INSPECT_RAW"},
+            {"tool": "INSPECT_EVIDENCE_IMAGE"},
         ],
         query="tabby cat sofa",
         memory_store=store,
@@ -1023,7 +1023,7 @@ def test_inspect_raw_only_reads_semantically_selected_evidence() -> None:
 
     assert retrieved_inspector.calls == ["images/cat.png"]
     assert retrieved_result.steps[1].evidence_added == 1
-    assert any(item.source == "INSPECT_RAW" and "visual_observation" in item.fields for item in retrieved_result.evidence)
+    assert any(item.source == "INSPECT_EVIDENCE_IMAGE" and "visual_observation" in item.fields for item in retrieved_result.evidence)
 
 
 @dataclass
@@ -1100,7 +1100,7 @@ async def test_verl_native_opd_tools_share_hidden_state_and_hide_ids() -> None:
         messages=[{"role": "user", "content": "Read my latest user image."}],
         tools_kwargs={"opd_mm": {"query": "Read my latest user image.", "records": records}},
     )
-    filter_tool = OPDFilterTool(config={"type": "native"}, tool_schema=None)
+    filter_tool = OPDSearchMetadataTool(config={"type": "native"}, tool_schema=None)
 
     response, _, metrics = await filter_tool.execute(
         "instance",
@@ -1137,7 +1137,7 @@ async def test_verl_native_filter_always_merges_from_full_memory() -> None:
         messages=[{"role": "user", "content": "Find user memories."}],
         tools_kwargs={"opd_mm": {"query": "Find user memories.", "records": records}},
     )
-    filter_tool = OPDFilterTool(config={"type": "native"}, tool_schema=None)
+    filter_tool = OPDSearchMetadataTool(config={"type": "native"}, tool_schema=None)
 
     await filter_tool.execute(
         "instance",
@@ -1173,7 +1173,7 @@ async def test_distinct_stagnant_discovery_actions_mark_search_exhausted() -> No
             }
         },
     )
-    filter_tool = OPDFilterTool(config={"type": "native"}, tool_schema=None)
+    filter_tool = OPDSearchMetadataTool(config={"type": "native"}, tool_schema=None)
 
     first, _, _ = await filter_tool.execute(
         "instance", {"field": "status", "op": "eq", "value": "active"}, agent_data=agent_data
@@ -1283,7 +1283,7 @@ async def test_semantic_selector_failure_preserves_candidates_and_is_visible() -
             }
         },
     )
-    filter_tool = OPDFilterTool(config={"type": "native"}, tool_schema=None)
+    filter_tool = OPDSearchMetadataTool(config={"type": "native"}, tool_schema=None)
     response, _, metrics = await filter_tool.execute(
         "instance",
         {"field": "modality", "op": "eq", "value": "text"},
@@ -1377,7 +1377,7 @@ async def test_tool_observation_includes_complete_public_evidence() -> None:
         messages=[{"role": "user", "content": "Find all memories."}],
         tools_kwargs={"opd_mm": {"query": "Find all memories.", "records": records, "vector_store_dir": None}},
     )
-    filter_tool = OPDFilterTool(config={"type": "native"}, tool_schema=None)
+    filter_tool = OPDSearchMetadataTool(config={"type": "native"}, tool_schema=None)
 
     response, _, _ = await filter_tool.execute(
         "instance",
@@ -1423,7 +1423,7 @@ async def test_inspect_raw_can_use_async_teacher_service_callback() -> None:
     )
     agent_data.teacher_raw_inspector = teacher_inspect
     retrieve_tool = OPDRetrieveTool(config={"type": "native", "raw_inspector_backend": "teacher"}, tool_schema=None)
-    inspect_tool = OPDInspectRawTool(config={"type": "native", "raw_inspector_backend": "teacher"}, tool_schema=None)
+    inspect_tool = OPDInspectEvidenceImageTool(config={"type": "native", "raw_inspector_backend": "teacher"}, tool_schema=None)
 
     await retrieve_tool.execute(
         "instance",
@@ -1433,7 +1433,7 @@ async def test_inspect_raw_can_use_async_teacher_service_callback() -> None:
     response, _, metrics = await inspect_tool.execute(
         "instance",
         {
-            "target": "current_pool",
+            "target": "current_evidence_images",
             "instruction": "answer_query_related_visual_details",
         },
         agent_data=agent_data,
@@ -1762,7 +1762,7 @@ async def test_opd_tool_session_marks_forced_max_action_stop() -> None:
         tools_kwargs={"opd_mm": {"query": "Find the tabby cat.", "records": records}},
     )
     retrieve_tool = OPDRetrieveTool(config={"type": "native", "max_actions": 2}, tool_schema=None)
-    filter_tool = OPDFilterTool(config={"type": "native", "max_actions": 2}, tool_schema=None)
+    filter_tool = OPDSearchMetadataTool(config={"type": "native", "max_actions": 2}, tool_schema=None)
 
     await retrieve_tool.execute("instance", {"method": "bm25", "top_k": 2}, agent_data=agent_data)
     response, _, metrics = await filter_tool.execute(
@@ -1810,7 +1810,7 @@ async def test_raw_inspector_backend_environment_overrides_tool_config(monkeypat
         config={"type": "native", "raw_inspector_backend": "teacher"},
         tool_schema=None,
     )
-    inspect_tool = OPDInspectRawTool(
+    inspect_tool = OPDInspectEvidenceImageTool(
         config={"type": "native", "raw_inspector_backend": "teacher"},
         tool_schema=None,
     )
@@ -1823,7 +1823,7 @@ async def test_raw_inspector_backend_environment_overrides_tool_config(monkeypat
     response, _, metrics = await inspect_tool.execute(
         "instance",
         {
-            "target": "current_pool",
+            "target": "current_evidence_images",
             "instruction": "answer_query_related_visual_details",
         },
         agent_data=agent_data,
@@ -1875,13 +1875,13 @@ def test_tool_config_loads_verl_native_opd_tools() -> None:
         function_tool_path=None,
     )
     assert [tool.name for tool in tools] == [
-        "filter",
+        "search_metadata",
         "retrieve",
         "expand_neighbors",
-        "inspect_raw",
+        "inspect_evidence_image",
         "stop",
     ]
-    inspect_tool = next(tool for tool in tools if tool.name == "inspect_raw")
+    inspect_tool = next(tool for tool in tools if tool.name == "inspect_evidence_image")
     assert inspect_tool.config["raw_inspector_backend"] == "teacher"
     assert inspect_tool.config["max_actions"] == 10
     assert inspect_tool.config["max_pool_size"] == 24
@@ -1907,10 +1907,10 @@ def test_sft_converter_can_emit_native_tool_call_records() -> None:
 
     assert record["messages"][2]["tool_calls"][0]["function"]["name"] == "retrieve"
     assert [schema["function"]["name"] for schema in record["tools"]] == [
-        "filter",
+        "search_metadata",
         "retrieve",
         "expand_neighbors",
-        "inspect_raw",
+        "inspect_evidence_image",
         "stop",
     ]
 
@@ -1936,9 +1936,11 @@ def test_opd_sample_converts_to_on_policy_distillation_row() -> None:
         {"role": "user", "content": sample.query},
     ]
     system_prompt = row["prompt"][0]["content"]
-    assert "RETRIEVE and FILTER search the original hidden store" in system_prompt
+    assert "Discovery actions add deduplicated memories" in system_prompt
+    assert "SEARCH_METADATA" not in system_prompt
+    assert "FILTER" not in system_prompt
     assert "internal semantic selector" in system_prompt
-    assert "private candidate pool" in system_prompt
+    assert "private candidate" in system_prompt
     assert "do not repeat an unchanged action" in system_prompt
     assert "hidden memory IDs" in system_prompt
     assert "READ" not in row["prompt"][0]["content"]
@@ -2094,7 +2096,7 @@ class FakeStudent:
         return PolicyOutput(
             actions=[
                 ToolAction(
-                    "FILTER",
+                    "SEARCH_METADATA",
                     {
                         "field": "timestamp",
                         "op": "eq",
@@ -2305,7 +2307,7 @@ def test_teacher_xml_correction_recovers_unclosed_rewritten_retrieve_query() -> 
 def test_teacher_xml_correction_repairs_missing_parameter_closes_and_aliases() -> None:
     parsed = extract_canonical_tool_call_xml(
         "<tool_call>\n"
-        "<function=filter>\n"
+        "<function=search_metadata>\n"
         "<parameter=field>\n"
         "session_date\n"
         "<parameter=op>\n"
@@ -2319,7 +2321,7 @@ def test_teacher_xml_correction_repairs_missing_parameter_closes_and_aliases() -
 
     assert parsed is not None
     target_xml, action, _ = parsed
-    assert action.tool == "FILTER"
+    assert action.tool == "SEARCH_METADATA"
     assert action.arguments == {
         "field": "timestamp",
         "op": "eq",
@@ -2332,7 +2334,7 @@ def test_teacher_xml_correction_repairs_missing_parameter_closes_and_aliases() -
 def test_teacher_xml_correction_rejects_legacy_filter_scope() -> None:
     assert extract_canonical_tool_call_xml(
         "<tool_call>\n"
-        "<function=filter>\n"
+        "<function=search_metadata>\n"
         "<parameter=field>\nmodality\n</parameter>\n"
         "<parameter=op>\neq\n</parameter>\n"
         "<parameter=value>\nimage\n</parameter>\n"
@@ -2347,21 +2349,21 @@ def test_teacher_xml_correction_rejects_defaultable_empty_calls() -> None:
         "<tool_call>\n<function=retrieve>\n</function>\n</tool_call>"
     ) is None
     assert extract_canonical_tool_call_xml(
-        "<tool_call>\n<function=inspect_raw>\n</function>\n</tool_call>"
+        "<tool_call>\n<function=inspect_evidence_image>\n</function>\n</tool_call>"
     ) is None
 
 
 def test_online_xml_correction_drops_invalid_filter_value() -> None:
     correction = finalize_online_step_correction(
         {
-            "sample_id": "invalid-filter-value",
+            "sample_id": "invalid-search_metadata-value",
             "step_index": 2,
             "allow_inspect_raw": True,
             "tool_format": "qwen3_coder",
         },
         teacher_raw_response=(
             "<tool_call>\n"
-            "<function=filter>\n"
+            "<function=search_metadata>\n"
             "<parameter=field>\nsource_type\n</parameter>\n"
             "<parameter=op>\neq\n</parameter>\n"
             "<parameter=value>\nuser\n</parameter>\n"
@@ -2385,15 +2387,15 @@ def test_teacher_xml_correction_recovers_explicit_nonstandard_argument_lines() -
     )
     inspect = extract_canonical_tool_call_xml(
         "<tool_call>\n"
-        "<function=inspect_raw>\n"
-        'target="current_pool",\n'
+        "<function=inspect_evidence_image>\n"
+        'target="current_evidence_images",\n'
         'instruction="answer_query_related_visual_details"\n'
         "</function>\n"
         "</tool_call>"
     )
     mixed_filter = extract_canonical_tool_call_xml(
         "<tool_call>\n"
-        "<function=filter>\n"
+        "<function=search_metadata>\n"
         "<field=session_date>\n"
         "op=eq\n"
         "value=2024-09-28\n"
@@ -2409,7 +2411,7 @@ def test_teacher_xml_correction_recovers_explicit_nonstandard_argument_lines() -
     }
     assert inspect is not None
     assert inspect[1].arguments == {
-        "target": "current_pool",
+        "target": "current_evidence_images",
         "instruction": "answer_query_related_visual_details",
     }
     assert mixed_filter is not None
@@ -2589,10 +2591,10 @@ async def test_agent_loop_worker_generates_verifier_and_teacher_for_one_live_sta
     assert encoded_tools[0] is None
     teacher_tools = encoded_tools[1]
     assert [tool["function"]["name"] for tool in teacher_tools] == [
-        "filter",
+        "search_metadata",
         "retrieve",
         "expand_neighbors",
-        "inspect_raw",
+        "inspect_evidence_image",
         "stop",
     ]
     assert correction["step_index"] == 1
@@ -2854,7 +2856,7 @@ def test_online_xml_correction_requests_include_invalid_student_state() -> None:
     assert "retrieve(method=bm25|dense|vision|hybrid" not in requests[0]["verifier_prompt"]
     assert "source_type" not in requests[0]["verifier_prompt"]
     assert "expand_neighbors(window=1|2|3" not in requests[0]["verifier_prompt"]
-    assert "inspect_raw(target=current_pool" not in requests[0]["verifier_prompt"]
+    assert "inspect_evidence_image(target=current_evidence_images" not in requests[0]["verifier_prompt"]
     assert "SECRET_GOLD_ANSWER" in requests[0]["verifier_prompt"]
     assert "missing_factual_support" in requests[0]["verifier_prompt"]
     assert "Use incomplete_coverage only" in requests[0]["verifier_prompt"]
@@ -3088,7 +3090,7 @@ def test_online_xml_correction_drops_sufficient_teacher_non_stop() -> None:
         "query": "Which image matches the description?",
         "history": [{"tool": "RETRIEVE", "method": "vision", "top_k": 10}],
         "observation": {"evidence_count": 2, "pool_count": 2, "trace": [{"tool": "RETRIEVE"}]},
-        "student_raw_response": "<tool_call><function=inspect_raw></function></tool_call>",
+        "student_raw_response": "<tool_call><function=inspect_evidence_image></function></tool_call>",
         "student_prompt_ids": [7, 8, 9],
         "allow_inspect_raw": True,
         "tool_format": "qwen3_coder",
@@ -3104,8 +3106,8 @@ def test_online_xml_correction_drops_sufficient_teacher_non_stop() -> None:
         request,
         teacher_raw_response=(
             "<tool_call>\n"
-            "<function=inspect_raw>\n"
-            "<parameter=target>\ncurrent_pool</parameter>\n"
+            "<function=inspect_evidence_image>\n"
+            "<parameter=target>\ncurrent_evidence_images</parameter>\n"
             "<parameter=instruction>\nanswer_query_related_visual_details</parameter>\n"
             "</function>\n"
             "</tool_call>"
@@ -3262,7 +3264,7 @@ def test_helpers_build_hidden_store_from_dicts_and_schemas() -> None:
     assert len(store) == 1
     schemas = openai_tool_schemas(include_inspect_raw=False)
     assert [schema["function"]["name"] for schema in schemas] == [
-        "filter",
+        "search_metadata",
         "retrieve",
         "expand_neighbors",
         "stop",
@@ -3272,7 +3274,7 @@ def test_helpers_build_hidden_store_from_dicts_and_schemas() -> None:
     assert "scope" not in filter_properties
     assert filter_properties["field"]["enum"] == ["modality", "status", "timestamp"]
     assert "source_type" not in json.dumps(schemas[0], ensure_ascii=False)
-    assert "modality uses text or image" in filter_value_description
+    assert "text/image for modality" in filter_value_description
     assert "MEMORY/user/assistant" not in filter_value_description
     assert schemas[0]["function"]["parameters"]["required"] == ["field", "op", "value"]
     assert schemas[1]["function"]["parameters"]["required"] == ["method", "top_k"]

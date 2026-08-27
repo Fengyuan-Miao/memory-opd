@@ -838,7 +838,7 @@ class AgentLoopWorker:
     def _opd_mm_raw_inspector_config(self) -> dict[str, Any]:
         config: dict[str, Any] = {}
         for tool in self.tools:
-            if getattr(tool, "name", "") != "inspect_raw":
+            if getattr(tool, "name", "") != "inspect_evidence_image":
                 continue
             raw_config = getattr(tool, "config", {}) or {}
             if hasattr(raw_config, "items"):
@@ -852,7 +852,7 @@ class AgentLoopWorker:
     def _opd_mm_evidence_selector_config(self) -> dict[str, Any]:
         config: dict[str, Any] = {}
         for tool in self.tools:
-            if getattr(tool, "name", "") not in {"filter", "retrieve", "expand_neighbors"}:
+            if getattr(tool, "name", "") not in {"search_metadata", "retrieve", "expand_neighbors"}:
                 continue
             raw_config = getattr(tool, "config", {}) or {}
             if hasattr(raw_config, "items"):
@@ -922,7 +922,7 @@ class AgentLoopWorker:
         *,
         sample_kwargs: dict[str, Any],
     ) -> Optional[Any]:
-        """Create an async INSPECT_RAW callback routed to the frozen teacher."""
+        """Create an async INSPECT_EVIDENCE_IMAGE callback routed to the frozen teacher."""
         config = self._opd_mm_raw_inspector_config()
         if (
             not self.distillation_enabled
@@ -1786,7 +1786,7 @@ class AgentLoopWorker:
         Existing OPD runs default to correction SFT. ``opsd`` instead scores
         the student's sampled trajectory with privileged teacher logits, so it
         must bypass correction generation without disabling the OPD-MM teacher
-        routing used by INSPECT_RAW.
+        routing used by INSPECT_EVIDENCE_IMAGE.
         """
         mode = str(os.getenv("OPD_MM_ONLINE_SUPERVISION_MODE") or "correction_sft").strip().lower()
         if mode in {"opsd", "logits", "logit_distillation"}:

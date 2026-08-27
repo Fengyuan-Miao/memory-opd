@@ -115,7 +115,7 @@ def _parse_opd_mm_student_action(
     action = {"tool": tool_name.upper(), **arguments}
     if tool_name not in active_tools:
         return action, f"unknown_or_mis_cased_tool:{tool_name}"
-    if not _is_legal_opd_mm_action(action, allow_inspect_raw="inspect_raw" in active_tools):
+    if not _is_legal_opd_mm_action(action, allow_inspect_raw="inspect_evidence_image" in active_tools):
         return action, "invalid_tool_arguments"
     return action, ""
 

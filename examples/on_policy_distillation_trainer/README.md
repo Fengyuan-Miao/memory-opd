@@ -47,7 +47,7 @@ python3 examples/data_preprocess/build_mem_gallery_opd_mm_train_subset.py \
 ```
 
 The script reserves GPUs 0-3 for actor training, GPUs 4-5 for a Qwen3.5-9B
-privileged teacher, and GPUs 6-7 for a separate Qwen3.5-9B outcome/INSPECT_RAW
+privileged teacher, and GPUs 6-7 for a separate Qwen3.5-9B outcome/INSPECT_EVIDENCE_IMAGE
 service. Each query receives four rollouts by default. After a real `STOP`,
 the outcome VLM first answers from the final public evidence without seeing the
 gold answer, then judges that generated answer against the private gold answer.

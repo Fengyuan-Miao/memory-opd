@@ -140,8 +140,8 @@ def _canonical_action(action: ToolAction) -> dict[str, Any]:
     if action.tool == "RETRIEVE":
         arguments.setdefault("method", "hybrid")
         arguments.setdefault("top_k", 5)
-    elif action.tool == "INSPECT_RAW":
-        arguments.setdefault("target", "current_pool")
+    elif action.tool == "INSPECT_EVIDENCE_IMAGE":
+        arguments.setdefault("target", "current_evidence_images")
         arguments.setdefault("instruction", "answer_query_related_visual_details")
     for key, value in list(arguments.items()):
         if isinstance(value, str):

@@ -14,7 +14,7 @@
 
 """Raw image/media inspectors for OPD-MM.
 
-The agent-loop tool observations are text-only, so INSPECT_RAW converts raw
+The agent-loop tool observations are text-only, so INSPECT_EVIDENCE_IMAGE converts raw
 images into a concise visual observation by calling a remote OpenAI-compatible
 vLLM vision-language service.
 """

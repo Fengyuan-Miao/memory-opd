@@ -13,13 +13,13 @@ opd_mm_common_config: &opd_mm_common_config
   max_pool_size: 24
 
 tools:
-  - class_name: "verl.experimental.opd_mm.tools.OPDFilterTool"
+  - class_name: "verl.experimental.opd_mm.tools.OPDSearchMetadataTool"
     config: *opd_mm_common_config
   - class_name: "verl.experimental.opd_mm.tools.OPDRetrieveTool"
     config: *opd_mm_common_config
   - class_name: "verl.experimental.opd_mm.tools.OPDExpandNeighborsTool"
     config: *opd_mm_common_config
-  - class_name: "verl.experimental.opd_mm.tools.OPDInspectRawTool"
+  - class_name: "verl.experimental.opd_mm.tools.OPDInspectEvidenceImageTool"
     config: *opd_mm_common_config
   - class_name: "verl.experimental.opd_mm.tools.OPDStopTool"
     config: *opd_mm_common_config

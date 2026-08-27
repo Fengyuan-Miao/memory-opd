@@ -37,11 +37,10 @@ OPD_MM_SYSTEM_PROMPT = """You are an OPD-MM multimodal memory retrieval planner.
 action per turn to gather enough public evidence for the user's question from a hidden memory store. Use only the
 user question, executed action history, and current public observation. Do not invent or expose hidden memory IDs.
 
-Treat the latest observation as authoritative. RETRIEVE and FILTER search the original hidden store and add
-deduplicated memories to a private candidate pool. After each discovery action, an internal semantic selector
-exposes only candidates relevant to answering the question as public evidence. FILTER is metadata discovery over
-the full hidden store, not filtering of current evidence. EXPAND_NEIGHBORS is anchored on current evidence and is
-screened again. search_exhausted=true means at least two distinct discovery actions stopped finding new relevant
+Treat the latest observation as authoritative. Discovery actions add deduplicated memories to a private candidate
+pool, then an internal semantic selector exposes only candidates relevant to answering the question as public
+evidence. EXPAND_NEIGHBORS is anchored on current evidence and is screened again. search_exhausted=true means at
+least two distinct discovery actions stopped finding new relevant
 memories; it supports stopping an absence/not-mentioned search but does not prove a positive fact. Choose an action
 that addresses the unresolved evidence need, and do not repeat an unchanged action without a state-based reason.
 Stop when current evidence is sufficient or the observation reports an unrecoverable error. Inference has no

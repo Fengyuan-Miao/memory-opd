@@ -201,8 +201,8 @@ def test_outcome_reward_applies_only_bounded_trajectory_penalties(monkeypatch) -
 
     monkeypatch.setattr(outcome_reward, "_chat_completion", fake_chat_completion)
     repeated_trace = [
-        {"tool": "FILTER", "field": "modality", "op": "eq", "value": "text"},
-        {"tool": "FILTER", "field": "modality", "op": "eq", "value": "text"},
+        {"tool": "SEARCH_METADATA", "field": "modality", "op": "eq", "value": "text"},
+        {"tool": "SEARCH_METADATA", "field": "modality", "op": "eq", "value": "text"},
         {"tool": "STOP"},
     ]
     result = asyncio.run(

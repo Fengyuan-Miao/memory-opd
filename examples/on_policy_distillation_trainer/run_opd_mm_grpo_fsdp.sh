@@ -92,7 +92,7 @@ OPD_MM_STATE_OPSD_ENABLED=${OPD_MM_STATE_OPSD_ENABLED:-False}
 OPD_MM_STATE_OPSD_REWARD_GATED=${OPD_MM_STATE_OPSD_REWARD_GATED:-False}
 DISTILLATION_ENABLED=${DISTILLATION_ENABLED:-True}
 
-# One fixed VLM serves INSPECT_RAW, terminal answer generation, and the private
+# One fixed VLM serves INSPECT_EVIDENCE_IMAGE, terminal answer generation, and the private
 # correctness judge. Gold is sent only in the second, post-rollout judge call.
 START_OUTCOME_SERVER=${START_OUTCOME_SERVER:-1}
 OUTCOME_MODEL_PATH=${OUTCOME_MODEL_PATH:-/home/guojr/data/pretrained_models/Qwen/Qwen3.5-9B}

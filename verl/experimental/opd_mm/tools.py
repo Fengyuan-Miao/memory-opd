@@ -15,7 +15,7 @@
 """verl-native tool adapters for the OPD-MM hidden-memory executor.
 
 These tools keep per-trajectory state through the agent_data object supplied by
-ToolAgentLoop. FILTER, RETRIEVE, and EXPAND_NEIGHBORS build a bounded,
+ToolAgentLoop. SEARCH_METADATA, RETRIEVE, and EXPAND_NEIGHBORS build a bounded,
 high-recall candidate pool. A fixed model-based semantic layer then selects
 the smaller answer-evidence view exposed to the policy.
 """
@@ -38,10 +38,10 @@ from verl.experimental.opd_mm.semantic_selector import RemoteSemanticEvidenceSel
 from verl.experimental.opd_mm.schema import (
     DEFAULT_MAX_ACTIONS,
     EXPAND_NEIGHBOR_WINDOWS,
-    FILTER_FIELDS,
-    FILTER_OPS,
     INSPECT_INSTRUCTIONS,
     INSPECT_TARGETS,
+    METADATA_SEARCH_FIELDS,
+    METADATA_SEARCH_OPS,
     RETRIEVAL_METHODS,
     TrajectoryValidator,
 )
@@ -477,7 +477,7 @@ def hidden_store_from_records(
 def _sanitize_evidence(items: list[EvidenceItem]) -> list[dict[str, Any]]:
     """Expose one complete public record per memory.
 
-    A memory can have both a MEMORY item and an INSPECT_RAW item internally.
+    A memory can have both a MEMORY item and an INSPECT_EVIDENCE_IMAGE item internally.
     Merge those fields into the same public entry so the model never receives
     duplicate copies of one memory.
     """
@@ -546,8 +546,8 @@ class OPDToolSession:
                 self.max_actions_reached = True
                 action = ToolAction("STOP")
             self.executor.validator._validate_action(action, len(self.trace))
-            if action.tool == "FILTER":
-                filtered = self.executor._filter(
+            if action.tool == "SEARCH_METADATA":
+                filtered = self.executor._search_metadata(
                     self.memory_store.initial_pool(),
                     field=action.arguments["field"],
                     op=action.arguments["op"],
@@ -587,7 +587,7 @@ class OPDToolSession:
                     prioritize_incoming=False,
                 )
                 self.pool_has_candidates = True
-            elif action.tool == "INSPECT_RAW":
+            elif action.tool == "INSPECT_EVIDENCE_IMAGE":
                 remaining = max(0, self.executor.max_raw_inspections - self.raw_calls)
                 inspected = self.executor._inspect_raw(
                     self._evidence_pool(),
@@ -606,7 +606,7 @@ class OPDToolSession:
 
         if (
             not step_error
-            and action.tool in {"FILTER", "RETRIEVE", "EXPAND_NEIGHBORS"}
+            and action.tool in {"SEARCH_METADATA", "RETRIEVE", "EXPAND_NEIGHBORS"}
             and not defer_semantic_filter
         ):
             new_evidence = self._apply_semantic_selection(
@@ -619,7 +619,7 @@ class OPDToolSession:
         if (
             not step_error
             and not defer_semantic_filter
-            and action.tool in {"FILTER", "RETRIEVE", "EXPAND_NEIGHBORS"}
+            and action.tool in {"SEARCH_METADATA", "RETRIEVE", "EXPAND_NEIGHBORS"}
         ):
             self._record_discovery_progress(action, evidence_ids_before)
 
@@ -644,7 +644,7 @@ class OPDToolSession:
         if (
             observation.get("error")
             or observation.get("stopped")
-            or executed_action.tool not in {"FILTER", "RETRIEVE", "EXPAND_NEIGHBORS"}
+            or executed_action.tool not in {"SEARCH_METADATA", "RETRIEVE", "EXPAND_NEIGHBORS"}
         ):
             return observation
 
@@ -769,7 +769,7 @@ class OPDToolSession:
         )
 
     async def execute_inspect_raw_with_teacher(self, action: ToolAction, inspect_fn: Any) -> dict[str, Any]:
-        """Execute INSPECT_RAW using the async verl teacher service callback."""
+        """Execute INSPECT_EVIDENCE_IMAGE using the async verl teacher service callback."""
         before = len(self.pool)
         step_error = ""
         inspected: list[EvidenceItem] = []
@@ -828,7 +828,7 @@ class OPDToolSession:
                     EvidenceItem(
                         memory_id=item.memory.memory_id,
                         fields=fields,
-                        source="INSPECT_RAW",
+                        source="INSPECT_EVIDENCE_IMAGE",
                     )
                 )
             self.raw_calls += len(inspected)
@@ -1022,22 +1022,22 @@ class OPDBaseTool(BaseTool):
         return ""
 
 
-class OPDFilterTool(OPDBaseTool):
-    tool_name = "filter"
+class OPDSearchMetadataTool(OPDBaseTool):
+    tool_name = "search_metadata"
     description = (
-        "Select hidden memories from the original memory store by metadata and merge deduplicated matches into the "
+        "Search the complete hidden memory store by public metadata and merge deduplicated matches into the "
         "private candidate pool. An internal semantic selector then exposes only question-relevant answer evidence."
     )
     properties = {
         "field": _property(
             "string",
             "Metadata field. modality is only text/image; status is only active; timestamp is only a public ISO date.",
-            sorted(FILTER_FIELDS),
+            sorted(METADATA_SEARCH_FIELDS),
         ),
         "op": _property(
             "string",
             "Field-specific operator: modality uses eq/neq; status uses eq; timestamp uses eq/contains/before/after.",
-            sorted(FILTER_OPS),
+            sorted(METADATA_SEARCH_OPS),
         ),
         "value": _property(
             ["string", "number", "boolean"],
@@ -1094,15 +1094,14 @@ class OPDExpandNeighborsTool(OPDBaseTool):
     required = ["window"]
 
 
-class OPDInspectRawTool(OPDBaseTool):
-    tool_name = "inspect_raw"
+class OPDInspectEvidenceImageTool(OPDBaseTool):
+    tool_name = "inspect_evidence_image"
     description = (
-        "Opt-in raw visual inspection for images/media in current semantically selected answer evidence. "
-        "Use only after retrieve/filter has selected relevant images. This cannot inspect the user's "
-        "attached question image, cannot inspect an empty pool, and does not search the original full memory store."
+        "Inspect raw visual details only for images already present in current public answer evidence. "
+        "This action cannot search the hidden memory store or inspect the user's attached question image."
     )
     properties = {
-        "target": _property("string", "Inspection target.", sorted(INSPECT_TARGETS)),
+        "target": _property("string", "Images in current public answer evidence.", sorted(INSPECT_TARGETS)),
         "instruction": _property("string", "Inspection instruction.", sorted(INSPECT_INSTRUCTIONS)),
     }
     required = ["target", "instruction"]
@@ -1151,10 +1150,10 @@ class OPDStopTool(OPDBaseTool):
 
 
 OPD_TOOL_CLASSES = [
-    OPDFilterTool,
+    OPDSearchMetadataTool,
     OPDRetrieveTool,
     OPDExpandNeighborsTool,
-    OPDInspectRawTool,
+    OPDInspectEvidenceImageTool,
     OPDStopTool,
 ]
 
@@ -1166,7 +1165,7 @@ def openai_tool_schemas(
     classes = (
         OPD_TOOL_CLASSES
         if include_inspect_raw
-        else [cls for cls in OPD_TOOL_CLASSES if cls is not OPDInspectRawTool]
+        else [cls for cls in OPD_TOOL_CLASSES if cls is not OPDInspectEvidenceImageTool]
     )
     return [
         _schema(cls.tool_name, cls.description, cls.properties, cls.required).model_dump(
@@ -1179,8 +1178,8 @@ def openai_tool_schemas(
 __all__ = [
     "OPDBaseTool",
     "OPDExpandNeighborsTool",
-    "OPDFilterTool",
-    "OPDInspectRawTool",
+    "OPDSearchMetadataTool",
+    "OPDInspectEvidenceImageTool",
     "OPDRetrieveTool",
     "OPDStopTool",
     "OPDToolSession",

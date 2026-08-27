@@ -113,7 +113,7 @@ def _state(step: int, base: int) -> dict:
         "response_ids": [base + 2, base + 3],
         "response_logprobs": [-0.1, -0.2],
         "tool_call_mask": [1, 0],
-        "student_next_action": {"tool": "FILTER", "field": "modality", "op": "eq", "value": "text"},
+        "student_next_action": {"tool": "SEARCH_METADATA", "field": "modality", "op": "eq", "value": "text"},
     }
 
 

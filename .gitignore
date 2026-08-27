@@ -138,4 +138,5 @@ verl/experimental/*
 verl/experimental/opd_mm/*
 !verl/experimental/opd_mm/semantic_selector.py
 /logs_old
-/auth.json
+auth.json
+opd_mm_project_summary.md

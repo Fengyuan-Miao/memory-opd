@@ -36,8 +36,8 @@ export OPD_MM_VAL_FILES="['$MMEM_VAL_PARQUET','$MEMGALLERY_VAL_PARQUET']"
 export OPD_MM_VECTOR_STORE_DIR="$STORE_DIR"
 
 # GPUs 0-5 host the student and colocated query encoders. GPUs 6-7 host the
-# frozen 4B teacher. Verifier, answer, judge, and INSPECT_RAW all use the
-# external 9B vLLM; INSPECT_RAW sends complete images as base64 data URLs.
+# frozen 4B teacher. Verifier, answer, judge, and INSPECT_EVIDENCE_IMAGE all use the
+# external 9B vLLM; INSPECT_EVIDENCE_IMAGE sends complete images as base64 data URLs.
 export TRAIN_GPUS=${TRAIN_GPUS:-0,1,2,3,4,5,6,7}
 export NGPUS_PER_NODE=${NGPUS_PER_NODE:-6}
 export TEACHER_NGPUS_PER_NODE=${TEACHER_NGPUS_PER_NODE:-2}

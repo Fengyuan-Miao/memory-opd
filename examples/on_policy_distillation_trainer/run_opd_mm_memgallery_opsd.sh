@@ -4,7 +4,7 @@
 # Portable 6-GPU layout:
 #   GPUs 0-2: 4B student and query encoders
 #   GPU 3: frozen 4B teacher
-#   GPUs 4-5: local 9B verifier / selector / answer / judge / INSPECT_RAW
+#   GPUs 4-5: local 9B verifier / selector / answer / judge / INSPECT_EVIDENCE_IMAGE
 
 set -euo pipefail
 

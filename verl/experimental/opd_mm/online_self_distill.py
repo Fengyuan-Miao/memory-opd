@@ -49,10 +49,10 @@ QWEN3_KEY_VALUE_ARG_RE = re.compile(
     re.DOTALL,
 )
 _TOOL_CALL_NAME_BY_ACTION = {
-    "FILTER": "filter",
+    "SEARCH_METADATA": "search_metadata",
     "RETRIEVE": "retrieve",
     "EXPAND_NEIGHBORS": "expand_neighbors",
-    "INSPECT_RAW": "inspect_raw",
+    "INSPECT_EVIDENCE_IMAGE": "inspect_evidence_image",
     "STOP": "stop",
 }
 _VERIFIER_MISSING_EVIDENCE_TYPES = {
@@ -212,7 +212,7 @@ def _normalize_missing_evidence_type(value: Any) -> str | None:
         "metadata_constraint": "missing_metadata_constraint",
         "metadata_filter": "missing_metadata_constraint",
         "needs_metadata_filter": "missing_metadata_constraint",
-        "filter": "missing_metadata_constraint",
+        "search_metadata": "missing_metadata_constraint",
         "too_broad": "irrelevant_evidence",
         "broad": "irrelevant_evidence",
         "narrow": "irrelevant_evidence",
@@ -230,7 +230,7 @@ def _normalize_missing_evidence_type(value: Any) -> str | None:
         "visual_detail": "missing_raw_visual_detail",
         "raw_visual": "missing_raw_visual_detail",
         "needs_raw_visual_detail": "missing_raw_visual_detail",
-        "inspect_raw": "missing_raw_visual_detail",
+        "inspect_evidence_image": "missing_raw_visual_detail",
         "factual_support": "missing_factual_support",
         "missing_fact": "missing_factual_support",
         "missing_specific_fact": "missing_factual_support",
@@ -285,11 +285,11 @@ def _observation_has_candidate_context(observation: dict[str, Any]) -> bool:
             return str(value.get("tool") or value.get("name") or "").upper()
         return str(value or "").upper()
 
-    if tool_name(observation.get("tool")) in {"RETRIEVE", "FILTER"}:
+    if tool_name(observation.get("tool")) in {"RETRIEVE", "SEARCH_METADATA"}:
         return True
     trace = observation.get("trace")
     if isinstance(trace, list):
-        return any(tool_name(action) in {"RETRIEVE", "FILTER"} for action in trace)
+        return any(tool_name(action) in {"RETRIEVE", "SEARCH_METADATA"} for action in trace)
     return False
 
 
@@ -632,7 +632,7 @@ def _normalize_teacher_tool_action(action: ToolAction) -> ToolAction:
         # RETRIEVE always searches the original memory store. Tolerate and
         # remove legacy scope output before canonical SFT export.
         args.pop("scope", None)
-    elif tool == "FILTER":
+    elif tool == "SEARCH_METADATA":
         field = str(args.get("field") or "").strip().lower()
         field_aliases = {
             "date": "timestamp",
@@ -646,7 +646,7 @@ def _normalize_teacher_tool_action(action: ToolAction) -> ToolAction:
         op_aliases = {"=": "eq", "==": "eq", "equals": "eq", "equal": "eq", "not_equal": "neq", "!=": "neq"}
         if op:
             args["op"] = op_aliases.get(op, op)
-    elif tool == "INSPECT_RAW":
+    elif tool == "INSPECT_EVIDENCE_IMAGE":
         if "target" in args:
             args["target"] = str(args["target"]).strip().lower()
         if "instruction" in args:
@@ -660,7 +660,7 @@ def _has_explicit_teacher_sft_arguments(action: ToolAction) -> bool:
     args = action.arguments
     if tool == "RETRIEVE":
         return "method" in args and "top_k" in args
-    if tool == "INSPECT_RAW":
+    if tool == "INSPECT_EVIDENCE_IMAGE":
         return "target" in args and "instruction" in args
     return True
 
@@ -944,8 +944,7 @@ Student output to correct:
 """
     return f"""You are the OPD-MM action teacher for one student-visible state. Produce exactly one tool action.
 Apply this gate before considering the question modality or any tool description:
-- evidence_sufficient=true and no observation error: output STOP immediately. Every other tool, including
-  INSPECT_RAW for a visual question, is invalid.
+- evidence_sufficient=true and no observation error: output STOP immediately. Every non-STOP tool is invalid.
 - evidence_sufficient=false: choose one non-STOP tool that addresses the diagnosed gap.
 
 You are not answering the question and do not see the gold answer. Verifier feedback is a private diagnostic, not
@@ -954,12 +953,8 @@ observation. Do not copy verifier.reason or private content into an argument. A 
 question/history/observation text.
 
 Choose the schema-described tool whose effect addresses the gap and whose preconditions hold. Do not repeat an
-identical action when the latest observation is unchanged. FILTER searches the complete hidden memory store and
-merges matching records into a private candidate pool; it is not limited to currently visible evidence. Use FILTER
-only when the question or public state provides a defensible modality, timestamp, or status condition. Never invent
-such a value. RETRIEVE and FILTER results are automatically screened for answer relevance before becoming public
-evidence. EXPAND_NEIGHBORS is anchored on current evidence and is screened again. If no metadata condition is
-supported and a semantic fact is missing, use RETRIEVE.
+identical action when the latest observation is unchanged, and never invent an argument not supported by public
+state. Discovery results are automatically screened for answer relevance before becoming public evidence.
 Emit exactly one function call with no reasoning, markdown, JSON, hidden memory IDs, or unknown arguments. The chat
 template supplies the tool descriptions and serialization.
 

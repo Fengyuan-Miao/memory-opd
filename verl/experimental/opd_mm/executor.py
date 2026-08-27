@@ -93,8 +93,8 @@ class ToolExecutor:
             step_error = ""
             evidence_added = 0
             try:
-                if action.tool == "FILTER":
-                    filtered = self._filter(
+                if action.tool == "SEARCH_METADATA":
+                    filtered = self._search_metadata(
                         memory_store.initial_pool(),
                         field=action.arguments["field"],
                         op=action.arguments["op"],
@@ -103,7 +103,9 @@ class ToolExecutor:
                     pool, _ = self._merge_discovery_pool(pool, filtered, pool_has_candidates)
                     pool_has_candidates = True
                     selected = self._select_evidence_pool_sync(pool, query)
-                    evidence_added = len(self._refresh_evidence_from_pool(evidence, selected, source="FILTER"))
+                    evidence_added = len(
+                        self._refresh_evidence_from_pool(evidence, selected, source="SEARCH_METADATA")
+                    )
                 elif action.tool == "RETRIEVE":
                     retrieve_query = action.arguments.get("query") or query
                     retrieved = self.retriever.retrieve(
@@ -139,7 +141,7 @@ class ToolExecutor:
                     evidence_added = len(
                         self._refresh_evidence_from_pool(evidence, selected, source="EXPAND_NEIGHBORS")
                     )
-                elif action.tool == "INSPECT_RAW":
+                elif action.tool == "INSPECT_EVIDENCE_IMAGE":
                     remaining = max(0, self.max_raw_inspections - raw_calls)
                     evidence_memory_ids = {item.memory_id for item in evidence}
                     inspected = self._inspect_raw(
@@ -183,8 +185,8 @@ class ToolExecutor:
         """Merge candidate pools by hidden memory id while preserving stable order.
 
         If an incoming item already exists, keep its position but refresh score
-        and retrieved status so later INSPECT_RAW can inspect records that were
-        first introduced by FILTER and then selected by RETRIEVE.
+        and retrieved status so later INSPECT_EVIDENCE_IMAGE can inspect records
+        first introduced by SEARCH_METADATA and then selected by RETRIEVE.
         """
         merged = list(existing)
         positions = {item.memory.memory_id: index for index, item in enumerate(merged)}
@@ -389,7 +391,7 @@ class ToolExecutor:
         return None
 
     @staticmethod
-    def _filter(
+    def _search_metadata(
         pool: List[PoolItem],
         field: str,
         op: str,
@@ -571,7 +573,7 @@ class ToolExecutor:
         preserved_raw = [
             item
             for item in evidence
-            if item.source == "INSPECT_RAW" and item.memory_id in pool_ids
+            if item.source == "INSPECT_EVIDENCE_IMAGE" and item.memory_id in pool_ids
         ]
         old_signatures = {
             (item.memory_id, item.source, tuple(sorted(item.fields.items())))
@@ -634,7 +636,7 @@ class ToolExecutor:
                 EvidenceItem(
                     memory_id=item.memory.memory_id,
                     fields=fields,
-                    source="INSPECT_RAW",
+                    source="INSPECT_EVIDENCE_IMAGE",
                 )
             )
         return evidence

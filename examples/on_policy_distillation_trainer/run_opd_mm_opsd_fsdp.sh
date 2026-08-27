@@ -222,12 +222,12 @@ case "${START_OUTCOME_SERVER,,}" in
         ;;
 esac
 
-# Exercise the exact INSPECT_RAW path before Ray starts. RemoteVLLMRawInspector
+# Exercise the exact INSPECT_EVIDENCE_IMAGE path before Ray starts. RemoteVLLMRawInspector
 # reads the complete local file and sends it as a data:<mime>;base64 URL, so
 # this catches remote multimodal worker/proxy failures that /v1/models cannot.
 if [[ -n "${OPD_MM_RAW_INSPECTOR_HEALTHCHECK_IMAGE:-}" ]]; then
     if [[ ! -s "$OPD_MM_RAW_INSPECTOR_HEALTHCHECK_IMAGE" ]]; then
-        echo "Missing INSPECT_RAW health-check image: $OPD_MM_RAW_INSPECTOR_HEALTHCHECK_IMAGE" >&2
+        echo "Missing INSPECT_EVIDENCE_IMAGE health-check image: $OPD_MM_RAW_INSPECTOR_HEALTHCHECK_IMAGE" >&2
         exit 1
     fi
     raw_inspector_health=$(
@@ -251,10 +251,10 @@ if result.startswith("RAW_INSPECT_ERROR:"):
 print(result.replace("\n", " ")[:240])
 PY
     ) || {
-        echo "External INSPECT_RAW base64 health check failed; training was not started." >&2
+        echo "External INSPECT_EVIDENCE_IMAGE base64 health check failed; training was not started." >&2
         exit 1
     }
-    echo "INSPECT_RAW_BASE64_HEALTHCHECK=${raw_inspector_health}"
+    echo "INSPECT_EVIDENCE_IMAGE_BASE64_HEALTHCHECK=${raw_inspector_health}"
 fi
 
 verifier_models_url=${OPD_MM_VERIFIER_BASE_URL%/}
