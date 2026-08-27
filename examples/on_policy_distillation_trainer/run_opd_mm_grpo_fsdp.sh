@@ -11,7 +11,6 @@ RUN_TIMESTAMP=${RUN_TIMESTAMP:-$(date +%Y%m%d_%H%M%S)}
 
 WANDB_MODE=${WANDB_MODE:-online}
 WANDB_DISABLE_STATS=${WANDB_DISABLE_STATS:-True}
-WANDB_GPU_MEMORY_METRICS=${WANDB_GPU_MEMORY_METRICS:-False}
 WANDB_VAL_CASES=${WANDB_VAL_CASES:-4}
 export WANDB_CONSOLE=${WANDB_CONSOLE:-off}
 export WANDB_DISABLE_CODE=${WANDB_DISABLE_CODE:-true}
@@ -32,8 +31,7 @@ fi
 export WANDB_MODE
 WANDB_TRAINER_ARGS=(
     +trainer.wandb_disable_stats=${WANDB_DISABLE_STATS}
-    +trainer.wandb_gpu_memory_metrics=${WANDB_GPU_MEMORY_METRICS}
-    '+trainer.wandb_metric_include_patterns=["^(actor|critic|distillation)/.*loss$","^val-aux/.*/opd_mm/(answer_correct|evidence_answerable|evidence_count|action_count|repeated_actions|max_actions_reached|empty_evidence|trajectory_error|answer_request_failed|judge_request_failed|evidence_judge_request_failed)/mean@.*$","^training/(global_step|epoch)$","^gpu_memory/.*$"]'
+    '+trainer.wandb_metric_include_patterns=["^(actor|critic|distillation)/.*loss$","^val-aux/.*/opd_mm/(answer_correct|evidence_answerable|evidence_count|action_count|repeated_actions|max_actions_reached|empty_evidence|trajectory_error|answer_request_failed|judge_request_failed|evidence_judge_request_failed)/mean@.*$","^training/(global_step|epoch)$"]'
 )
 if [[ -n "$WANDB_PROXY" ]]; then
     WANDB_TRAINER_ARGS+=(+trainer.wandb_proxy="$WANDB_PROXY")
@@ -298,7 +296,7 @@ echo "OPD_MM_OUTCOME_REWARD_DUMP_DIR=${OPD_MM_OUTCOME_REWARD_DUMP_DIR}"
 echo "WANDB_MODE=${WANDB_MODE}"
 echo "WANDB_PROXY=${WANDB_PROXY:-direct}"
 echo "WANDB_DISABLE_STATS=${WANDB_DISABLE_STATS}"
-echo "WANDB_GPU_MEMORY_METRICS=${WANDB_GPU_MEMORY_METRICS}"
+echo "WANDB_CONSOLE=${WANDB_CONSOLE}"
 
 max_num_tokens=$(( max_prompt_length + max_response_length + 1 ))
 

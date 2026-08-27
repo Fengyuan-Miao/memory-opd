@@ -141,7 +141,9 @@ export WANDB_MODE=${WANDB_MODE:-online}
 export WANDB_API_KEY=${WANDB_API_KEY:-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}
 export WANDB_ENTITY=${WANDB_ENTITY:-mmem}
 export WANDB_VAL_CASES=${WANDB_VAL_CASES:-0}
-export WANDB_DISABLE_STATS=${WANDB_DISABLE_STATS:-True}
-export WANDB_GPU_MEMORY_METRICS=${WANDB_GPU_MEMORY_METRICS:-True}
+# Enable W&B's native GPU telemetry on the remote machine.
+export WANDB_DISABLE_STATS=${WANDB_DISABLE_STATS:-False}
+# Capture the trainer/Ray console stream in the W&B Logs tab.
+export WANDB_CONSOLE=${WANDB_CONSOLE:-wrap}
 
 exec bash "$SCRIPT_DIR/run_opd_mm_grpo_fsdp.sh" "$@"
