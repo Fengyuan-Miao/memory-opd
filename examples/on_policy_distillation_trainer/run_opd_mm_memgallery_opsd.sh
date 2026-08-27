@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 # Mem-Gallery (~757 train + fixed 100 held-out) | pure online privileged distillation.
 #
-# Portable 8-GPU layout:
-#   GPUs 0-3: 4B student and query encoders
-#   GPUs 4-5: frozen 4B teacher
-#   GPUs 6-7: local 9B verifier / selector / answer / judge / INSPECT_RAW
+# Portable 6-GPU layout:
+#   GPUs 0-2: 4B student and query encoders
+#   GPU 3: frozen 4B teacher
+#   GPUs 4-5: local 9B verifier / selector / answer / judge / INSPECT_RAW
 
 set -euo pipefail
 
@@ -114,16 +114,18 @@ export OPD_MM_HELDOUT_QAS="$SPLIT_DIR/heldout_qas.jsonl"
 export OPD_MM_VAL_PARQUET="$SPLIT_DIR/heldout_opsd_eval.parquet"
 export OPD_MM_VAL_FILES="['$OPD_MM_VAL_PARQUET']"
 
-# Match the established portable 8x80G OPSD experiment layout.
-export TRAIN_GPUS=${TRAIN_GPUS:-0,1,2,3,4,5}
-export NGPUS_PER_NODE=${NGPUS_PER_NODE:-4}
-export TEACHER_NGPUS_PER_NODE=${TEACHER_NGPUS_PER_NODE:-2}
-export TEACHER_TP=${TEACHER_TP:-2}
-export VERL_AGENT_LOOP_WORKER_CUDA_DEVICES=${VERL_AGENT_LOOP_WORKER_CUDA_DEVICES:-0,1,2,3}
-export ACTOR_SP_SIZE=${ACTOR_SP_SIZE:-2}
+# Ray sees GPUs 0-3: three student workers and one frozen-teacher worker.
+# The local 9B service is launched separately on physical GPUs 4-5.
+export TRAIN_GPUS=${TRAIN_GPUS:-0,1,2,3}
+export NGPUS_PER_NODE=${NGPUS_PER_NODE:-3}
+export TEACHER_NGPUS_PER_NODE=${TEACHER_NGPUS_PER_NODE:-1}
+export TEACHER_TP=${TEACHER_TP:-1}
+export VERL_AGENT_LOOP_WORKER_CUDA_DEVICES=${VERL_AGENT_LOOP_WORKER_CUDA_DEVICES:-0,1,2}
+export ACTOR_SP_SIZE=${ACTOR_SP_SIZE:-3}
+export ROLLOUT_TP=${ROLLOUT_TP:-1}
 
 export START_OUTCOME_SERVER=${START_OUTCOME_SERVER:-1}
-export OUTCOME_SERVER_GPUS=${OUTCOME_SERVER_GPUS:-6,7}
+export OUTCOME_SERVER_GPUS=${OUTCOME_SERVER_GPUS:-4,5}
 export OUTCOME_MODEL_PATH=${OUTCOME_MODEL_PATH:-$MODEL_9B_PATH}
 export OUTCOME_SERVED_MODEL=${OUTCOME_SERVED_MODEL:-Qwen3.5-9B}
 export OUTCOME_SERVER_HOST=${OUTCOME_SERVER_HOST:-127.0.0.1}
@@ -145,7 +147,7 @@ export PPO_MINI_BATCH_SIZE=${PPO_MINI_BATCH_SIZE:-24}
 export VAL_BATCH_SIZE=${VAL_BATCH_SIZE:-10}
 export VAL_BEFORE_TRAIN=${VAL_BEFORE_TRAIN:-True}
 export VAL_ROLLOUT_DO_SAMPLE=${VAL_ROLLOUT_DO_SAMPLE:-False}
-export AGENT_LOOP_NUM_WORKERS=${AGENT_LOOP_NUM_WORKERS:-12}
+export AGENT_LOOP_NUM_WORKERS=${AGENT_LOOP_NUM_WORKERS:-9}
 export REWARD_WORKERS=${REWARD_WORKERS:-8}
 export ROLLOUT_GPU_MEM_UTIL=${ROLLOUT_GPU_MEM_UTIL:-0.50}
 export ROLLOUT_MAX_NUM_BATCHED_TOKENS=${ROLLOUT_MAX_NUM_BATCHED_TOKENS:-8192}
