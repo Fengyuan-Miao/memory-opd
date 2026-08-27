@@ -121,7 +121,10 @@ export NGPUS_PER_NODE=${NGPUS_PER_NODE:-3}
 export TEACHER_NGPUS_PER_NODE=${TEACHER_NGPUS_PER_NODE:-1}
 export TEACHER_TP=${TEACHER_TP:-1}
 export VERL_AGENT_LOOP_WORKER_CUDA_DEVICES=${VERL_AGENT_LOOP_WORKER_CUDA_DEVICES:-0,1,2}
-export ACTOR_SP_SIZE=${ACTOR_SP_SIZE:-3}
+# Qwen3.5-4B has 16 attention heads. Ulysses SP must divide 16, so a
+# three-worker student pool cannot use SP=3; retain FSDP data parallelism and
+# keep sequence parallelism disabled.
+export ACTOR_SP_SIZE=${ACTOR_SP_SIZE:-1}
 export ROLLOUT_TP=${ROLLOUT_TP:-1}
 
 export START_OUTCOME_SERVER=${START_OUTCOME_SERVER:-1}
