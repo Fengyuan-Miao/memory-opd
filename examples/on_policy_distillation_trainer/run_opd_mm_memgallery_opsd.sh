@@ -150,7 +150,9 @@ export PPO_MINI_BATCH_SIZE=${PPO_MINI_BATCH_SIZE:-24}
 export VAL_BATCH_SIZE=${VAL_BATCH_SIZE:-10}
 export VAL_BEFORE_TRAIN=${VAL_BEFORE_TRAIN:-True}
 export VAL_ROLLOUT_DO_SAMPLE=${VAL_ROLLOUT_DO_SAMPLE:-False}
-export AGENT_LOOP_NUM_WORKERS=${AGENT_LOOP_NUM_WORKERS:-9}
+# DataProto currently requires equal worker chunks. Six workers divide the
+# global train batch of 24 exactly and map evenly to the three student GPUs.
+export AGENT_LOOP_NUM_WORKERS=${AGENT_LOOP_NUM_WORKERS:-6}
 export REWARD_WORKERS=${REWARD_WORKERS:-8}
 export ROLLOUT_GPU_MEM_UTIL=${ROLLOUT_GPU_MEM_UTIL:-0.50}
 export ROLLOUT_MAX_NUM_BATCHED_TOKENS=${ROLLOUT_MAX_NUM_BATCHED_TOKENS:-8192}
@@ -173,5 +175,10 @@ export WANDB_VAL_ACTIONS_ONLY=${WANDB_VAL_ACTIONS_ONLY:-True}
 export PROJECT_NAME=${PROJECT_NAME:-verl_opsd_opd_mm_memgallery}
 export EXPERIMENT_NAME=${EXPERIMENT_NAME:-opd_mm_qwen35_4b_memgallery_cap5_pure_opsd_$(date +%Y%m%d_%H%M%S)}
 export RAY_TMP_ROOT=${RAY_TMP_ROOT:-/tmp/verl_ray_$(id -u)}
+
+if (( TRAIN_BATCH_SIZE % AGENT_LOOP_NUM_WORKERS != 0 )); then
+    echo "TRAIN_BATCH_SIZE=$TRAIN_BATCH_SIZE must be divisible by AGENT_LOOP_NUM_WORKERS=$AGENT_LOOP_NUM_WORKERS" >&2
+    exit 1
+fi
 
 exec bash "$SCRIPT_DIR/run_opd_mm_opsd_fsdp.sh" "$@"
