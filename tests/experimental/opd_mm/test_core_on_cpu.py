@@ -517,6 +517,53 @@ def _neighbor_records() -> list[MemoryRecord]:
     ]
 
 
+def _event_records() -> list[MemoryRecord]:
+    common = {"scenario": "event_scenario", "session_id": "D1"}
+    return [
+        MemoryRecord(
+            memory_id="event_prev_text",
+            turn_id="event_scenario:D1:1",
+            timestamp="2026-04-01T0001",
+            author="dialogue",
+            modality="text",
+            source_type="dialogue_turn",
+            content="User: setup before the target\nAssistant: setup acknowledged",
+            metadata={**common, "turn_index": 1},
+        ),
+        MemoryRecord(
+            memory_id="event_target_text",
+            turn_id="event_scenario:D1:2",
+            timestamp="2026-04-01T0002",
+            author="dialogue",
+            modality="text",
+            source_type="dialogue_turn",
+            content="User: the unique event clue is beside the red bicycle\nAssistant: noted",
+            metadata={**common, "turn_index": 2},
+        ),
+        MemoryRecord(
+            memory_id="event_target_image",
+            turn_id="event_scenario:D1:2",
+            timestamp="2026-04-01T0002",
+            author="user",
+            modality="image",
+            source_type="dialogue_image",
+            summary="A red bicycle beside a doorway.",
+            raw_pointer="images/red_bicycle.jpg",
+            metadata={**common, "turn_index": 2, "image_id": "D1:IMG_001"},
+        ),
+        MemoryRecord(
+            memory_id="event_next_text",
+            turn_id="event_scenario:D1:3",
+            timestamp="2026-04-01T0003",
+            author="dialogue",
+            modality="text",
+            source_type="dialogue_turn",
+            content="User: follow-up after the target\nAssistant: follow-up acknowledged",
+            metadata={**common, "turn_index": 3},
+        ),
+    ]
+
+
 def test_public_evidence_resolves_mem_gallery_profile_speaker() -> None:
     record = MemoryRecord(
         memory_id="julian_turn",
@@ -735,6 +782,10 @@ def test_validator_rejects_memory_ids_and_accepts_rewritten_retrieve_query() -> 
         validator.validate(
             [{"tool": "SEARCH_METADATA", "field": "timestamp", "op": "contains", "value": "dinner"}]
         )
+    public_turn_timestamp = validator.validate(
+        [{"tool": "SEARCH_METADATA", "field": "timestamp", "op": "before", "value": "2024-08-09T0003"}]
+    )
+    assert public_turn_timestamp[0].arguments["value"] == "2024-08-09T0003"
 
     validated = validator.validate([{"tool": "RETRIEVE", "query": "custom query", "top_k": 3}])
     assert validated[0].arguments["query"] == "custom query"
@@ -1110,9 +1161,10 @@ async def test_verl_native_opd_tools_share_hidden_state_and_hide_ids() -> None:
 
     observation = json.loads(response.text)
     assert observation["pool_count"] == 1
-    assert observation["evidence"][0]["content"] == "A tabby cat sitting on a sofa."
-    assert observation["evidence"][0]["image_id"] == "D1:IMG_001"
-    assert "evidence_id" not in observation["evidence"][0]
+    assert observation["evidence"][0]["content"] == ""
+    assert observation["evidence"][0]["images"][0]["description"] == "A tabby cat sitting on a sofa."
+    assert observation["evidence"][0]["images"][0]["image_id"] == "D1:IMG_001"
+    assert observation["evidence"][0]["evidence_id"] == "E1"
     assert "raw_pointer" not in observation["evidence"][0]
     assert "summary" not in observation["evidence"][0]
     assert "source_type" not in observation["evidence"][0]
@@ -1124,10 +1176,84 @@ async def test_verl_native_opd_tools_share_hidden_state_and_hide_ids() -> None:
     assert "memory_id" not in json.dumps(observation)
     assert agent_data.extra_fields["opd_mm"]["pool_count"] == 1
     assert agent_data.extra_fields["opd_mm"]["evidence_count"] == 1
-    assert agent_data.extra_fields["opd_mm"]["evidence"][0]["image_id"] == "D1:IMG_001"
+    assert agent_data.extra_fields["opd_mm"]["evidence"][0]["images"][0]["image_id"] == "D1:IMG_001"
     assert "source" not in agent_data.extra_fields["opd_mm"]["evidence"][0]
     assert "author" not in agent_data.extra_fields["opd_mm"]["evidence"][0]
     assert "memory_id" not in json.dumps(agent_data.extra_fields["opd_mm"])
+
+
+@pytest.mark.asyncio
+async def test_metadata_hit_hydrates_complete_event_and_capacity_counts_events() -> None:
+    records = [record.to_dict() for record in _event_records()]
+    agent_data = FakeAgentData(
+        messages=[{"role": "user", "content": "Which image shows the red bicycle?"}],
+        tools_kwargs={
+            "opd_mm": {
+                "query": "Which image shows the red bicycle?",
+                "records": records,
+                "vector_store_dir": None,
+                "max_pool_size": 1,
+            }
+        },
+    )
+    search_tool = OPDSearchMetadataTool(config={"type": "native"}, tool_schema=None)
+
+    response, _, metrics = await search_tool.execute(
+        "instance",
+        {"field": "modality", "op": "eq", "value": "image"},
+        agent_data=agent_data,
+    )
+
+    observation = json.loads(response.text)
+    assert observation["pool_count"] == 1
+    assert observation["evidence_event_count"] == 1
+    assert observation["evidence_record_count"] == 2
+    assert metrics["opd_mm_evidence_event_count"] == 1
+    assert metrics["opd_mm_evidence_record_count"] == 2
+    event = observation["evidence"][0]
+    assert event["evidence_id"] == "E1"
+    assert event["session_alias"] == "S1"
+    assert event["turn_index"] == 2
+    assert event["modalities"] == ["text", "image"]
+    assert "unique event clue" in event["content"]
+    assert event["images"] == [
+        {
+            "visual_observation": None,
+            "image_id": "D1:IMG_001",
+            "description": "A red bicycle beside a doorway.",
+        }
+    ]
+    serialized = json.dumps(observation)
+    assert "event_target_text" not in serialized
+    assert "event_target_image" not in serialized
+
+
+def test_dynamic_tool_schemas_match_current_state_availability() -> None:
+    initial = openai_tool_schemas(
+        available_tool_names={"search_metadata", "retrieve", "stop"}
+    )
+    with_evidence = openai_tool_schemas(
+        available_tool_names={
+            "search_metadata",
+            "retrieve",
+            "expand_neighbors",
+            "inspect_evidence_image",
+            "stop",
+        }
+    )
+
+    assert [item["function"]["name"] for item in initial] == [
+        "search_metadata",
+        "retrieve",
+        "stop",
+    ]
+    assert [item["function"]["name"] for item in with_evidence] == [
+        "search_metadata",
+        "retrieve",
+        "expand_neighbors",
+        "inspect_evidence_image",
+        "stop",
+    ]
 
 
 @pytest.mark.asyncio
@@ -1158,11 +1284,11 @@ async def test_verl_native_filter_always_merges_from_full_memory() -> None:
     observation = json.loads(response.text)
     assert observation["pool_count"] == 4
     assert observation["evidence_count"] == 4
-    assert all("evidence_id" not in item for item in observation["evidence"])
+    assert {item["evidence_id"] for item in observation["evidence"]} == {"E1", "E2", "E3", "E4"}
 
 
 @pytest.mark.asyncio
-async def test_distinct_stagnant_discovery_actions_mark_search_exhausted() -> None:
+async def test_distinct_stagnant_discovery_actions_mark_search_stalled() -> None:
     agent_data = FakeAgentData(
         messages=[{"role": "user", "content": "Was a dessert mentioned?"}],
         tools_kwargs={
@@ -1185,12 +1311,63 @@ async def test_distinct_stagnant_discovery_actions_mark_search_exhausted() -> No
         "instance", {"field": "timestamp", "op": "after", "value": "2020"}, agent_data=agent_data
     )
 
-    assert json.loads(first.text)["search_exhausted"] is False
-    assert json.loads(second.text)["search_exhausted"] is False
+    assert json.loads(first.text)["search_progress"]["state"] == "progressing"
+    assert json.loads(second.text)["search_progress"]["state"] == "progressing"
     final_observation = json.loads(third.text)
-    assert final_observation["search_exhausted"] is True
-    assert final_observation["distinct_search_count"] == 3
-    assert final_observation["stagnant_search_count"] == 2
+    assert final_observation["search_progress"]["state"] == "stalled"
+    assert final_observation["search_progress"]["distinct_discovery_count"] == 3
+    assert final_observation["search_progress"]["consecutive_no_gain_count"] == 2
+
+
+@pytest.mark.asyncio
+async def test_search_progress_recovers_after_a_new_event_and_blocks_exact_no_gain_repeat() -> None:
+    agent_data = FakeAgentData(
+        messages=[{"role": "user", "content": "Find multiple memories."}],
+        tools_kwargs={
+            "opd_mm": {
+                "query": "Find multiple memories.",
+                "records": [record.to_dict() for record in _records()],
+                "retriever": QuerySwitchRetriever(),
+                "vector_store_dir": None,
+            }
+        },
+    )
+    retrieve_tool = OPDRetrieveTool(config={"type": "native"}, tool_schema=None)
+
+    await retrieve_tool.execute(
+        "instance", {"method": "hybrid", "top_k": 1, "query": "cat"}, agent_data=agent_data
+    )
+    await retrieve_tool.execute(
+        "instance", {"method": "hybrid", "top_k": 1, "query": "cat paraphrase"}, agent_data=agent_data
+    )
+    stalled, _, _ = await retrieve_tool.execute(
+        "instance", {"method": "hybrid", "top_k": 1, "query": "cat broader"}, agent_data=agent_data
+    )
+    assert json.loads(stalled.text)["search_progress"]["state"] == "stalled"
+
+    recovered, _, _ = await retrieve_tool.execute(
+        "instance", {"method": "hybrid", "top_k": 1, "query": "assistant"}, agent_data=agent_data
+    )
+    recovered_observation = json.loads(recovered.text)
+    assert recovered_observation["search_progress"]["state"] == "progressing"
+    assert recovered_observation["search_progress"]["consecutive_no_gain_count"] == 0
+    assert recovered_observation["pool_count"] == 2
+
+    await retrieve_tool.execute(
+        "instance", {"method": "hybrid", "top_k": 1, "query": "assistant no gain"}, agent_data=agent_data
+    )
+    blocked, _, metrics = await retrieve_tool.execute(
+        "instance", {"method": "hybrid", "top_k": 1, "query": "assistant no gain"}, agent_data=agent_data
+    )
+    blocked_observation = json.loads(blocked.text)
+    assert blocked_observation["last_action_status"] == "blocked"
+    assert blocked_observation["blocked_action_reason"] == "unchanged_no_gain_action"
+    assert blocked_observation["terminated"] is False
+    assert blocked_observation["search_progress"]["discovery_attempt_count"] == 5
+    assert blocked_observation["search_progress"]["consecutive_no_gain_count"] >= 2
+    assert blocked_observation["search_progress"]["state"] == "stalled"
+    assert metrics["opd_mm_blocked_action_count"] == 1
+    assert agent_data.extra_fields["opd_mm"]["steps"][-1]["status"] == "blocked"
 
 
 @pytest.mark.asyncio
@@ -1215,15 +1392,15 @@ async def test_retrieve_tool_adds_public_evidence_before_inspect_raw() -> None:
     assert "new_evidence_ids" not in observation
     assert observation["evidence_revision"] == 1
     assert observation["semantic_filter_status"] == "fallback_all_unconfigured"
-    assert all("evidence_id" not in item for item in observation["evidence"])
+    assert {item["evidence_id"] for item in observation["evidence"]} == {"E1", "E2"}
     assert all("source" not in item and "author" not in item for item in observation["evidence"])
-    assert {item["modality"] for item in observation["evidence"]} == {"text", "image"}
+    assert {tuple(item["modalities"]) for item in observation["evidence"]} == {("text",), ("image",)}
     assert any("tabby cat" in item["content"] for item in observation["evidence"])
-    image_evidence = [item for item in observation["evidence"] if item["modality"] == "image"]
-    text_evidence = [item for item in observation["evidence"] if item["modality"] == "text"]
-    assert image_evidence[0]["image_id"] == "D1:IMG_001"
-    assert "image_id" not in text_evidence[0]
-    assert all("visual_observation" not in item for item in observation["evidence"])
+    image_evidence = next(item for item in observation["evidence"] if item["images"])
+    text_evidence = next(item for item in observation["evidence"] if item["content"])
+    assert image_evidence["images"][0]["image_id"] == "D1:IMG_001"
+    assert text_evidence["images"] == []
+    assert image_evidence["images"][0]["visual_observation"] is None
     assert "memory_id" not in json.dumps(observation)
     assert "last_action" not in observation
     prompt_state = agent_data.extra_fields["opd_mm_prompt_state"]
@@ -1326,10 +1503,19 @@ async def test_bounded_merge_prioritizes_latest_discovery_results() -> None:
     assert observation["pool_overflow_count"] == 1
     assert observation["evidence"] == [
         {
-            "content": "An assistant-generated chart.",
-            "image_id": "D1:IMG_002",
+            "evidence_id": "E2",
+            "session_alias": "",
+            "turn_index": None,
             "timestamp": "2026-01-01T11:00:00",
-            "modality": "image",
+            "modalities": ["image"],
+            "content": "",
+            "images": [
+                {
+                    "visual_observation": None,
+                    "image_id": "D1:IMG_002",
+                    "description": "An assistant-generated chart.",
+                }
+            ],
         }
     ]
 
@@ -1391,7 +1577,7 @@ async def test_tool_observation_includes_complete_public_evidence() -> None:
     assert observation["pool_overflow_count"] == 6
     assert observation["evidence_count"] == 24
     assert len(observation["evidence"]) == 24
-    assert all("evidence_id" not in item for item in observation["evidence"])
+    assert [item["evidence_id"] for item in observation["evidence"]] == [f"E{index}" for index in range(1, 25)]
     assert all(len(item["content"]) > 1000 for item in observation["evidence"])
     assert "pool_preview" not in observation
     assert "evidence_preview" not in observation
@@ -1446,12 +1632,89 @@ async def test_inspect_raw_can_use_async_teacher_service_callback() -> None:
     assert observation["error"] == ""
     assert observation["new_evidence_count"] == 1
     assert observation["evidence_revision"] == 2
-    assert all("evidence_id" not in item for item in observation["evidence"])
-    inspected = next(item for item in observation["evidence"] if item.get("image_id") == "D1:IMG_001")
+    inspected = next(item for item in observation["evidence"] if item["images"])
     assert "source" not in inspected
     assert "author" not in inspected
-    assert inspected["visual_observation"] == "Teacher sees a tabby cat sitting on a sofa."
+    assert inspected["images"][0]["visual_observation"] == "Teacher sees a tabby cat sitting on a sofa."
     assert metrics["agent_loop_terminate"] is False
+
+
+@pytest.mark.asyncio
+async def test_event_level_retrieve_expand_inspect_stop_keeps_one_complete_copy_per_turn() -> None:
+    calls: list[dict[str, Any]] = []
+
+    async def teacher_inspect(payload: dict[str, Any]) -> str:
+        calls.append(payload)
+        return "The inspected event image contains a red bicycle."
+
+    agent_data = FakeAgentData(
+        messages=[{"role": "user", "content": "Which image shows the unique event clue?"}],
+        tools_kwargs={
+            "opd_mm": {
+                "query": "Which image shows the unique event clue?",
+                "records": [record.to_dict() for record in _event_records()],
+                "vector_store_dir": None,
+                "raw_inspector_backend": "teacher",
+            }
+        },
+    )
+    agent_data.teacher_raw_inspector = teacher_inspect
+    retrieve_tool = OPDRetrieveTool(config={"type": "native"}, tool_schema=None)
+    expand_tool = OPDExpandNeighborsTool(config={"type": "native"}, tool_schema=None)
+    inspect_tool = OPDInspectEvidenceImageTool(
+        config={"type": "native", "raw_inspector_backend": "teacher"}, tool_schema=None
+    )
+    stop_tool = OPDStopTool(config={"type": "native"}, tool_schema=None)
+
+    retrieved, _, _ = await retrieve_tool.execute(
+        "instance",
+        {"method": "bm25", "top_k": 1, "query": "unique event clue red bicycle"},
+        agent_data=agent_data,
+    )
+    retrieved_observation = json.loads(retrieved.text)
+    assert retrieved_observation["evidence_event_count"] == 1
+    assert retrieved_observation["evidence_record_count"] == 2
+    assert retrieved_observation["available_tools"] == [
+        "search_metadata",
+        "retrieve",
+        "expand_neighbors",
+        "inspect_evidence_image",
+        "stop",
+    ]
+
+    expanded, _, _ = await expand_tool.execute("instance", {"window": 1}, agent_data=agent_data)
+    expanded_observation = json.loads(expanded.text)
+    assert expanded_observation["evidence_event_count"] == 3
+    assert expanded_observation["evidence_record_count"] == 4
+    assert len({item["evidence_id"] for item in expanded_observation["evidence"]}) == 3
+    assert len({(item["session_alias"], item["turn_index"]) for item in expanded_observation["evidence"]}) == 3
+
+    inspected, _, _ = await inspect_tool.execute(
+        "instance",
+        {
+            "target": "current_evidence_images",
+            "instruction": "answer_query_related_visual_details",
+        },
+        agent_data=agent_data,
+    )
+    inspected_observation = json.loads(inspected.text)
+    assert len(calls) == 1
+    assert inspected_observation["evidence_event_count"] == 3
+    assert inspected_observation["evidence_record_count"] == 4
+    image_events = [item for item in inspected_observation["evidence"] if item["images"]]
+    assert len(image_events) == 1
+    assert image_events[0]["images"][0]["visual_observation"] == (
+        "The inspected event image contains a red bicycle."
+    )
+    assert "inspect_evidence_image" not in inspected_observation["available_tools"]
+
+    stopped, _, metrics = await stop_tool.execute("instance", {}, agent_data=agent_data)
+    stopped_observation = json.loads(stopped.text)
+    assert stopped_observation["terminated"] is True
+    assert stopped_observation["termination_reason"] == "policy_stop"
+    assert stopped_observation["policy_stopped"] is True
+    assert stopped_observation["max_actions_reached"] is False
+    assert metrics["agent_loop_terminate"] is True
 
 
 @pytest.mark.asyncio
@@ -1493,7 +1756,7 @@ async def test_verl_native_expand_neighbors_observation_is_visible_next_step() -
 
 
 @pytest.mark.asyncio
-async def test_verl_native_expand_neighbors_without_candidates_errors_and_terminates() -> None:
+async def test_verl_native_expand_neighbors_without_evidence_is_blocked_nonterminal() -> None:
     records = [record.to_dict() for record in _neighbor_records()]
     agent_data = FakeAgentData(
         messages=[{"role": "user", "content": "Expand immediately."}],
@@ -1504,13 +1767,17 @@ async def test_verl_native_expand_neighbors_without_candidates_errors_and_termin
     response, _, metrics = await expand_tool.execute("instance", {"window": 1}, agent_data=agent_data)
 
     observation = json.loads(response.text)
-    assert "EXPAND_NEIGHBORS requires existing answer evidence" in observation["error"]
+    assert observation["error"] == ""
     assert observation["evidence_count"] == 0
-    assert metrics["agent_loop_terminate"] is True
+    assert observation["last_action_status"] == "blocked"
+    assert observation["blocked_action_reason"] == "requires_current_evidence"
+    assert observation["blocked_action_count"] == 1
+    assert observation["terminated"] is False
+    assert metrics["agent_loop_terminate"] is False
 
 
 @pytest.mark.asyncio
-async def test_verl_native_max_action_forces_stop() -> None:
+async def test_verl_native_max_action_preserves_last_action_and_marks_budget_exhausted() -> None:
     records = [record.to_dict() for record in _records()]
     agent_data = FakeAgentData(
         messages=[{"role": "user", "content": "Find the tabby cat on the sofa."}],
@@ -1534,12 +1801,15 @@ async def test_verl_native_max_action_forces_stop() -> None:
         agent_data=agent_data,
     )
     observation = json.loads(response.text)
-    assert observation["tool"] == "STOP"
-    assert observation["stopped"] is True
+    assert observation["tool"] == "RETRIEVE"
+    assert observation["terminated"] is True
+    assert observation["termination_reason"] == "budget_exhausted"
+    assert observation["policy_stopped"] is False
+    assert observation["stopped"] is False
     assert observation["error"] == ""
     assert metrics["agent_loop_terminate"] is True
     assert len(agent_data.extra_fields["opd_mm"]["trace"]) == 10
-    assert agent_data.extra_fields["opd_mm"]["trace"][-1]["tool"] == "STOP"
+    assert agent_data.extra_fields["opd_mm"]["trace"][-1]["tool"] == "RETRIEVE"
 
 
 @pytest.mark.asyncio
@@ -1755,7 +2025,7 @@ async def test_opd_stop_tool_requests_agent_loop_termination() -> None:
 
 
 @pytest.mark.asyncio
-async def test_opd_tool_session_marks_forced_max_action_stop() -> None:
+async def test_opd_tool_session_marks_budget_exhaustion_without_forced_stop() -> None:
     records = [record.to_dict() for record in _records()]
     agent_data = FakeAgentData(
         messages=[{"role": "user", "content": "Find the tabby cat."}],
@@ -1771,8 +2041,10 @@ async def test_opd_tool_session_marks_forced_max_action_stop() -> None:
 
     observation = json.loads(response.text)
     state = agent_data.extra_fields["opd_mm"]
-    assert observation["tool"] == "STOP"
-    assert state["trace"][-1] == {"tool": "STOP"}
+    assert observation["tool"] == "SEARCH_METADATA"
+    assert state["trace"][-1] == {"tool": "SEARCH_METADATA", "field": "status", "op": "eq", "value": "active"}
+    assert state["termination_reason"] == "budget_exhausted"
+    assert state["policy_stopped"] is False
     assert state["max_actions_reached"] is True
     assert metrics["agent_loop_terminate"] is True
 
@@ -1837,7 +2109,8 @@ async def test_raw_inspector_backend_environment_overrides_tool_config(monkeypat
     assert remote_calls == ["images/cat.png"]
     assert teacher_calls == []
     assert observation["error"] == ""
-    assert observation["evidence"][-1]["visual_observation"] == "Remote vLLM sees a tabby cat sitting on a sofa."
+    inspected = next(item for item in observation["evidence"] if item["images"])
+    assert inspected["images"][0]["visual_observation"] == "Remote vLLM sees a tabby cat sitting on a sofa."
     assert metrics["agent_loop_terminate"] is False
 
 
@@ -1941,7 +2214,7 @@ def test_opd_sample_converts_to_on_policy_distillation_row() -> None:
     assert "FILTER" not in system_prompt
     assert "internal semantic selector" in system_prompt
     assert "private candidate" in system_prompt
-    assert "do not repeat an unchanged action" in system_prompt
+    assert "search_progress reports only" in system_prompt
     assert "hidden memory IDs" in system_prompt
     assert "READ" not in row["prompt"][0]["content"]
     assert row["extra_info"]["need_tools_kwargs"] is True
@@ -2966,11 +3239,20 @@ def test_state_verifier_feedback_accepts_missing_factual_support() -> None:
     assert feedback["parse_error"] == ""
 
 
-def test_state_verifier_accepts_exhausted_empty_search_for_absence_answer() -> None:
+def test_state_verifier_accepts_stalled_complementary_empty_search_for_absence_answer() -> None:
     feedback = parse_state_verifier_feedback(
         '{"evidence_sufficient": true, "reason": "The query-focused search is exhausted.", '
         '"missing_evidence_type": "none"}',
-        {"evidence_count": 0, "search_exhausted": True},
+        {
+            "evidence_count": 0,
+            "search_progress": {
+                "state": "stalled",
+                "distinct_discovery_count": 2,
+                "consecutive_no_gain_count": 2,
+                "retrieval_methods_tried": ["bm25", "dense"],
+                "modalities_searched": ["text"],
+            },
+        },
         gold_answer="Not mentioned.",
         query="What dessert was served?",
     )

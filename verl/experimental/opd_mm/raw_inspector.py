@@ -138,7 +138,8 @@ class RemoteVLLMRawInspector:
                         "content": (
                             "You are an OPD-MM raw visual inspector. "
                             "Inspect the provided image directly and return only concise, "
-                            "query-relevant visual facts. Do not invent hidden memory IDs."
+                            "query-relevant visual facts. Do not answer the question, decide whether statements "
+                            "conflict, assess correctness, or output a Yes/No verdict. Do not invent hidden memory IDs."
                         ),
                     },
                     {"role": "user", "content": content},
@@ -163,7 +164,8 @@ class RemoteVLLMRawInspector:
             "Inspect the raw memory image for the OPD-MM retrieval trajectory.\n"
             f"User question: {query}\n"
             f"Linked text context from the same turn: {context or '(none)'}\n\n"
-            "Return a compact observation that helps answer the user question. "
+            "Return a compact observation of directly visible facts only. Do not answer the question, decide whether "
+            "statements conflict, assess correctness, or output a Yes/No verdict. "
             "Mention visible objects, text, people, clothing, scene, layout, colors, "
             "or identity cues only when they are visible or supported by the linked context."
         )

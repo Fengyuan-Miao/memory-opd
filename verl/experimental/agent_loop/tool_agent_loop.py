@@ -136,8 +136,33 @@ def _mark_opd_mm_invalid_termination(agent_data: "AgentData", reason: str) -> No
         }
     else:
         observation = dict(observation)
+    observation["terminated"] = True
+    observation["termination_reason"] = "invalid_action"
+    observation["policy_stopped"] = False
     observation["stopped"] = False
     observation["error"] = f"invalid_student_action:{reason}"
+    agent_data.extra_fields["opd_mm"] = observation
+
+
+def _mark_opd_mm_response_budget_termination(agent_data: "AgentData") -> None:
+    """Record agent-loop generation exhaustion without synthesizing STOP."""
+    runtime = (agent_data.tools_kwargs or {}).get("opd_mm") or {}
+    observation = agent_data.extra_fields.get("opd_mm")
+    if not isinstance(observation, dict):
+        observation = {
+            "query": str(runtime.get("query") or ""),
+            "pool_count": 0,
+            "evidence_count": 0,
+            "evidence": [],
+            "trace": [],
+        }
+    else:
+        observation = dict(observation)
+    observation["terminated"] = True
+    observation["termination_reason"] = "response_budget_exhausted"
+    observation["policy_stopped"] = False
+    observation["stopped"] = False
+    observation.setdefault("error", "")
     agent_data.extra_fields["opd_mm"] = observation
 
 
@@ -399,13 +424,14 @@ class ToolAgentLoop(AgentLoopBase):
         tool_selection = extra_info.get("tool_selection")
         if tool_selection and self.tools:
             selected = {name: self.tools[name] for name in tool_selection if name in self.tools}
-            agent_data._active_tools = selected
-            agent_data._active_tool_schemas = [
-                t.tool_schema.model_dump(exclude_unset=True, exclude_none=True) for t in selected.values()
-            ]
         else:
-            agent_data._active_tools = self.tools
-            agent_data._active_tool_schemas = self.tool_schemas
+            selected = self.tools
+        agent_data._base_active_tools = selected
+        agent_data._active_tools = selected
+        agent_data._active_tool_schemas = [
+            t.tool_schema.model_dump(exclude_unset=True, exclude_none=True) for t in selected.values()
+        ]
+        self._refresh_opd_mm_active_tools(agent_data)
 
         # State machine loop
         state = AgentState.PENDING
@@ -458,6 +484,7 @@ class ToolAgentLoop(AgentLoopBase):
 
     async def _handle_pending_state(self, agent_data: AgentData, sampling_params: dict[str, Any]) -> AgentState:
         """Handle the pending state: prepare the prompt and start generation."""
+        self._refresh_opd_mm_active_tools(agent_data)
         schemas = getattr(agent_data, "_active_tool_schemas", self.tool_schemas)
         if self.enable_continuous_token:
             prompt_ids = await self.ct_build_initial_tokens(agent_data.messages, tools=schemas)
@@ -474,6 +501,24 @@ class ToolAgentLoop(AgentLoopBase):
         if not agent_data.full_prompt_ids:
             agent_data.full_prompt_ids = list(prompt_ids)
         return AgentState.GENERATING
+
+    @staticmethod
+    def _refresh_opd_mm_active_tools(agent_data: AgentData) -> None:
+        """Expose only tools whose state preconditions currently hold."""
+        runtime = (agent_data.tools_kwargs or {}).get("opd_mm")
+        if not isinstance(runtime, dict):
+            return
+        base_tools = getattr(agent_data, "_base_active_tools", getattr(agent_data, "_active_tools", {}))
+        observation = agent_data.extra_fields.get("opd_mm")
+        if isinstance(observation, dict) and isinstance(observation.get("available_tools"), list):
+            available = {str(name) for name in observation["available_tools"]}
+        else:
+            available = {"search_metadata", "retrieve", "stop"}
+        selected = {name: tool for name, tool in base_tools.items() if name in available}
+        agent_data._active_tools = selected
+        agent_data._active_tool_schemas = [
+            tool.tool_schema.model_dump(exclude_unset=True, exclude_none=True) for tool in selected.values()
+        ]
 
     async def _handle_generating_state(
         self, agent_data: AgentData, sampling_params: dict[str, Any], ignore_termination: bool = False
@@ -596,6 +641,8 @@ class ToolAgentLoop(AgentLoopBase):
         if is_opd_mm and not legal_student_action:
             return AgentState.TERMINATED
         if terminate_after_generation:
+            if is_opd_mm:
+                _mark_opd_mm_response_budget_termination(agent_data)
             return AgentState.TERMINATED
         if agent_data.tool_calls:
             return AgentState.PROCESSING_TOOLS
@@ -653,9 +700,13 @@ class ToolAgentLoop(AgentLoopBase):
                 "evidence_count": 0,
                 "evidence": [],
                 "trace": [],
+                "terminated": False,
+                "termination_reason": "",
+                "policy_stopped": False,
                 "stopped": False,
                 "error": "",
                 "raw_inspection_calls": 0,
+                "available_tools": ["search_metadata", "retrieve", "stop"],
             }
         else:
             observation = dict(observation)
@@ -796,6 +847,7 @@ class ToolAgentLoop(AgentLoopBase):
                 opd_prompt_state.get("action_history") or [],
                 opd_prompt_state.get("observation") or {},
             )
+            self._refresh_opd_mm_active_tools(agent_data)
             schemas = getattr(agent_data, "_active_tool_schemas", self.tool_schemas)
             agent_data.messages = state_messages
             agent_data.prompt_ids = await self.apply_chat_template(

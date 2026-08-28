@@ -31,7 +31,15 @@ from pathlib import Path
 from typing import Any, Optional
 
 from verl.experimental.opd_mm.executor import DEFAULT_MAX_POOL_SIZE, ToolExecutor
-from verl.experimental.opd_mm.models import EvidenceItem, ExecutionStep, MemoryRecord, PoolItem, ToolAction
+from verl.experimental.opd_mm.models import (
+    EventCandidate,
+    EventEvidence,
+    EvidenceItem,
+    ExecutionStep,
+    MemoryRecord,
+    PoolItem,
+    ToolAction,
+)
 from verl.experimental.opd_mm.raw_inspector import DEFAULT_RAW_INSPECTOR_URL, RemoteVLLMRawInspector
 from verl.experimental.opd_mm.retrieval import HiddenMemoryStore, TurnAwareHybridRetriever
 from verl.experimental.opd_mm.semantic_selector import RemoteSemanticEvidenceSelector, SemanticSelection
@@ -507,121 +515,108 @@ class OPDToolSession:
     query: str
     question_image: Optional[str] = None
     evidence_selector: Any = None
-    pool: list[PoolItem] = field(default_factory=list)
-    evidence: list[EvidenceItem] = field(default_factory=list)
+    pool: list[EventCandidate] = field(default_factory=list)
+    evidence: list[EventEvidence] = field(default_factory=list)
     steps: list[ExecutionStep] = field(default_factory=list)
     trace: list[ToolAction] = field(default_factory=list)
     raw_calls: int = 0
+    terminated: bool = False
+    policy_stopped: bool = False
     stopped: bool = False
+    termination_reason: str = ""
     error: str = ""
     pool_has_candidates: bool = False
     max_actions_reached: bool = False
     evidence_revision: int = 0
+    pool_revision: int = 0
     pool_overflow_count: int = 0
     semantic_filter_status: str = "not_run"
     semantic_filter_error: str = ""
     semantic_filter_candidate_count: int = 0
     semantic_filter_selected_count: int = 0
     discovery_signatures: set[str] = field(default_factory=set)
-    stagnant_discovery_signatures: set[str] = field(default_factory=set)
-    search_exhausted: bool = False
-
-    def __post_init__(self) -> None:
-        if not self.pool:
-            self.pool = self.memory_store.initial_pool()
+    discovery_attempt_count: int = 0
+    retrieval_methods_tried: set[str] = field(default_factory=set)
+    rewritten_queries: set[str] = field(default_factory=set)
+    metadata_fields_tried: set[str] = field(default_factory=set)
+    modalities_searched: set[str] = field(default_factory=set)
+    neighbor_windows_tried: set[int] = field(default_factory=set)
+    consecutive_no_gain_count: int = 0
+    blocked_action_count: int = 0
+    last_action_status: str = "not_run"
+    blocked_action_reason: str = ""
+    inspected_image_memory_ids: set[str] = field(default_factory=set)
+    inspected_image_ids: set[str] = field(default_factory=set)
+    visual_observations: dict[str, str] = field(default_factory=dict)
+    candidate_ids: dict[str, str] = field(default_factory=dict)
+    evidence_ids: dict[str, str] = field(default_factory=dict)
+    session_aliases: dict[str, str] = field(default_factory=dict)
+    image_aliases: dict[str, str] = field(default_factory=dict)
+    no_gain_action_revisions: dict[str, tuple[int, int]] = field(default_factory=dict)
 
     def execute(self, action: ToolAction, *, defer_semantic_filter: bool = False) -> dict[str, Any]:
-        """Execute one validated action against the current hidden pool."""
+        """Execute one action against the event-level private working pool."""
         before = len(self.pool)
-        evidence_ids_before = {item.memory_id for item in self.evidence}
+        pool_keys_before = {item.event_key for item in self.pool}
+        pool_signature_before = self._pool_signature()
+        evidence_signature_before = self._evidence_signature()
         step_error = ""
-        new_evidence: list[EvidenceItem] = []
+        changed_evidence: list[EventEvidence] = []
         self.pool_overflow_count = 0
+        self.last_action_status = "executed"
+        self.blocked_action_reason = ""
 
-        if self.stopped:
-            return self._observation(action, [], "trajectory already stopped")
+        if self.terminated:
+            return self._observation(action, [], "trajectory already terminated")
+        if len(self.trace) >= self.executor.validator.max_actions:
+            self._terminate("budget_exhausted")
+            return self._observation(action, [], "")
 
         try:
-            if len(self.trace) >= self.executor.validator.max_actions - 1 and action.tool != "STOP":
-                self.max_actions_reached = True
-                action = ToolAction("STOP")
             self.executor.validator._validate_action(action, len(self.trace))
-            if action.tool == "SEARCH_METADATA":
-                filtered = self.executor._search_metadata(
-                    self.memory_store.initial_pool(),
-                    field=action.arguments["field"],
-                    op=action.arguments["op"],
-                    value=action.arguments["value"],
-                )
-                self.pool, self.pool_overflow_count = self.executor._merge_discovery_pool(
-                    self.pool, filtered, self.pool_has_candidates
-                )
-                self.pool_has_candidates = True
-            elif action.tool == "RETRIEVE":
-                retrieve_query = action.arguments.get("query") or self.query
-                retrieved = self.executor.retriever.retrieve(
-                    self.memory_store.initial_pool(),
-                    query=retrieve_query,
-                    store=self.memory_store,
-                    method=action.arguments.get("method", "hybrid"),
-                    top_k=action.arguments.get("top_k", 5),
-                    question_image=self.question_image,
-                )
-                self.pool, self.pool_overflow_count = self.executor._merge_discovery_pool(
-                    self.pool, retrieved, self.pool_has_candidates
-                )
-                self.pool_has_candidates = True
-            elif action.tool == "EXPAND_NEIGHBORS":
-                relevant_pool = self._evidence_pool()
-                if not relevant_pool:
-                    raise ValueError("EXPAND_NEIGHBORS requires existing answer evidence")
-                expanded = self.executor._expand_neighbors(
-                    relevant_pool,
-                    self.memory_store,
-                    action.arguments["window"],
-                )
-                self.pool, self.pool_overflow_count = self.executor._merge_discovery_pool(
+            blocked_reason = self._guardrail_reason(action)
+            if blocked_reason:
+                self._record_blocked_action(action, before, blocked_reason)
+                return self._finalize_action_observation(action, [], "")
+
+            if action.tool in {"SEARCH_METADATA", "RETRIEVE", "EXPAND_NEIGHBORS"}:
+                incoming = self._discover_events(action)
+                self.discovery_attempt_count += 1
+                self._record_search_dimensions(action, incoming)
+                self.pool, self.pool_overflow_count = self._merge_event_pool(
                     self.pool,
-                    expanded,
+                    incoming,
                     self.pool_has_candidates,
-                    prioritize_incoming=False,
+                    prioritize_incoming=action.tool != "EXPAND_NEIGHBORS",
                 )
                 self.pool_has_candidates = True
+                if self._pool_signature() != pool_signature_before:
+                    self.pool_revision += 1
             elif action.tool == "INSPECT_EVIDENCE_IMAGE":
-                remaining = max(0, self.executor.max_raw_inspections - self.raw_calls)
-                inspected = self.executor._inspect_raw(
-                    self._evidence_pool(),
-                    self.query,
-                    remaining,
-                    question_image=self.question_image,
-                )
-                self.raw_calls += len(inspected)
-                self.evidence.extend(inspected)
-                new_evidence = inspected
+                changed_evidence = self._inspect_evidence_images_sync()
             elif action.tool == "STOP":
-                self.stopped = True
+                self._terminate("policy_stop")
         except Exception as exc:
             step_error = str(exc)
             self.error = step_error
+            self._terminate("tool_error")
 
         if (
             not step_error
             and action.tool in {"SEARCH_METADATA", "RETRIEVE", "EXPAND_NEIGHBORS"}
             and not defer_semantic_filter
         ):
-            new_evidence = self._apply_semantic_selection(
-                [f"C{index}" for index in range(1, len(self.pool) + 1)],
+            changed_evidence = self._apply_semantic_selection(
+                [self._candidate_id(item.event_key) for item in self.pool],
                 status="fallback_all_unconfigured",
                 error="semantic selector was not invoked by this synchronous caller",
             )
-        if new_evidence:
-            self.evidence_revision += 1
         if (
             not step_error
             and not defer_semantic_filter
             and action.tool in {"SEARCH_METADATA", "RETRIEVE", "EXPAND_NEIGHBORS"}
         ):
-            self._record_discovery_progress(action, evidence_ids_before)
+            self._record_discovery_progress(action, pool_keys_before, evidence_signature_before)
 
         self.trace.append(action)
         self.steps.append(
@@ -630,20 +625,21 @@ class OPDToolSession:
                 action=action,
                 pool_before=before,
                 pool_after=len(self.pool),
-                evidence_added=len(new_evidence),
+                evidence_added=len(changed_evidence),
                 error=step_error,
             )
         )
-        return self._observation(action, new_evidence, step_error)
+        return self._finalize_action_observation(action, changed_evidence, step_error)
 
     async def execute_with_semantic_filter(self, action: ToolAction) -> dict[str, Any]:
         """Execute one action and screen discovery results before exposing evidence."""
-        evidence_ids_before = {item.memory_id for item in self.evidence}
+        pool_keys_before = {item.event_key for item in self.pool}
+        evidence_signature_before = self._evidence_signature()
         observation = self.execute(action, defer_semantic_filter=True)
         executed_action = self.trace[-1] if self.trace else action
         if (
             observation.get("error")
-            or observation.get("stopped")
+            or self.last_action_status == "blocked"
             or executed_action.tool not in {"SEARCH_METADATA", "RETRIEVE", "EXPAND_NEIGHBORS"}
         ):
             return observation
@@ -685,11 +681,11 @@ class OPDToolSession:
                 )
 
         if not selection.selected_candidate_ids and self.evidence:
-            previous_memory_ids = {item.memory_id for item in self.evidence}
+            previous_event_keys = {item.event_key for item in self.evidence}
             preserved_ids = [
-                f"C{index}"
-                for index, item in enumerate(self.pool, start=1)
-                if item.memory.memory_id in previous_memory_ids
+                self._candidate_id(item.event_key)
+                for item in self.pool
+                if item.event_key in previous_event_keys
             ]
             if preserved_ids:
                 selection = SemanticSelection(
@@ -698,35 +694,186 @@ class OPDToolSession:
                     error="selector returned no candidates; preserved prior evidence",
                 )
 
-        new_evidence = self._apply_semantic_selection(
+        changed_evidence = self._apply_semantic_selection(
             selection.selected_candidate_ids,
             status=selection.status,
             error=selection.error,
         )
-        if new_evidence:
-            self.evidence_revision += 1
         if self.steps:
-            self.steps[-1].evidence_added = len(new_evidence)
-        self._record_discovery_progress(executed_action, evidence_ids_before)
-        return self._observation(executed_action, new_evidence, "")
+            self.steps[-1].evidence_added = len(changed_evidence)
+        self._record_discovery_progress(executed_action, pool_keys_before, evidence_signature_before)
+        return self._observation(executed_action, changed_evidence, "")
 
-    def _record_discovery_progress(self, action: ToolAction, evidence_ids_before: set[str]) -> None:
-        """Track when distinct searches stop surfacing new relevant memories."""
-        signature = f"{action.tool}:{json.dumps(action.arguments, ensure_ascii=False, sort_keys=True, default=str)}"
+    def _discover_events(self, action: ToolAction) -> list[EventCandidate]:
+        if action.tool == "SEARCH_METADATA":
+            records = self.executor._search_metadata(
+                self.memory_store.initial_pool(),
+                field=action.arguments["field"],
+                op=action.arguments["op"],
+                value=action.arguments["value"],
+            )
+            return self.executor.group_event_candidates(records, self.memory_store, hydrate_turn=True)
+        if action.tool == "RETRIEVE":
+            records = self.executor.retriever.retrieve(
+                self.memory_store.initial_pool(),
+                query=action.arguments.get("query") or self.query,
+                store=self.memory_store,
+                method=action.arguments.get("method", "hybrid"),
+                top_k=action.arguments.get("top_k", 5),
+                question_image=self.question_image,
+            )
+            return self.executor.group_event_candidates(records, self.memory_store, hydrate_turn=True)
+        return self.executor.expand_neighbor_events(self._evidence_pool(), self.memory_store, action.arguments["window"])
+
+    def _merge_event_pool(
+        self,
+        existing: list[EventCandidate],
+        incoming: list[EventCandidate],
+        has_existing_candidates: bool,
+        *,
+        prioritize_incoming: bool,
+    ) -> tuple[list[EventCandidate], int]:
+        if not has_existing_candidates:
+            return list(incoming[: self.executor.max_pool_size]), max(0, len(incoming) - self.executor.max_pool_size)
+        by_key = {item.event_key: item for item in existing}
+        for event in incoming:
+            previous = by_key.get(event.event_key)
+            if previous is None:
+                by_key[event.event_key] = event
+                continue
+            records = {item.memory.memory_id: item for item in previous.records}
+            records.update({item.memory.memory_id: item for item in event.records})
+            previous.records = sorted(records.values(), key=lambda item: (item.memory.timestamp, item.memory.memory_id))
+            previous.score = event.score or previous.score
+            previous.retrieved = previous.retrieved or event.retrieved
+
+        existing_ranks = {item.event_key: rank for rank, item in enumerate(existing, start=1)}
+        incoming_ranks = {item.event_key: rank for rank, item in enumerate(incoming, start=1)}
+        stable_order = {
+            key: index
+            for index, key in enumerate(dict.fromkeys([item.event_key for item in existing + incoming]))
+        }
+
+        def fusion_key(key: str) -> tuple[float, int, int, int]:
+            ranks = [rank for rank in (existing_ranks.get(key), incoming_ranks.get(key)) if rank is not None]
+            preferred = incoming_ranks if prioritize_incoming else existing_ranks
+            return (-sum(1.0 / (60.0 + rank) for rank in ranks), 0 if key in preferred else 1, min(ranks), stable_order[key])
+
+        ranked = [by_key[key] for key in sorted(by_key, key=fusion_key)]
+        return ranked[: self.executor.max_pool_size], max(0, len(ranked) - self.executor.max_pool_size)
+
+    def _record_discovery_progress(
+        self,
+        action: ToolAction,
+        pool_keys_before: set[str],
+        evidence_signature_before: tuple[Any, ...],
+    ) -> None:
+        """Track objective search attempts without claiming answer absence."""
+        signature = self._action_signature(action)
         self.discovery_signatures.add(signature)
-        evidence_ids_after = {item.memory_id for item in self.evidence}
-        if evidence_ids_after - evidence_ids_before:
-            self.stagnant_discovery_signatures.clear()
-            self.search_exhausted = False
-            return
-        self.stagnant_discovery_signatures.add(signature)
-        self.search_exhausted = len(self.stagnant_discovery_signatures) >= 2
+        # Private retrieval hits that the semantic selector rejects are not
+        # answer-level progress.  Count gain only when the public evidence
+        # obtains a new event or an existing event is materially updated.
+        # This prevents endless broad-pool churn from making absence searches
+        # look as if they are still progressing.
+        gained = self._evidence_signature() != evidence_signature_before
+        if gained:
+            self.consecutive_no_gain_count = 0
+            self.no_gain_action_revisions.pop(signature, None)
+        else:
+            self.consecutive_no_gain_count += 1
+            self.no_gain_action_revisions[signature] = (self.pool_revision, self.evidence_revision)
+
+    def _record_search_dimensions(
+        self,
+        action: ToolAction,
+        incoming: list[EventCandidate],
+    ) -> None:
+        if action.tool == "RETRIEVE":
+            method = str(action.arguments.get("method") or "hybrid").lower()
+            self.retrieval_methods_tried.add(method)
+            self.modalities_searched.update({"text", "image"} if method == "hybrid" else ({"image"} if method == "vision" else {"text"}))
+            rewritten = " ".join(str(action.arguments.get("query") or "").lower().split())
+            original = " ".join(self.query.lower().split())
+            if rewritten and rewritten != original:
+                self.rewritten_queries.add(rewritten)
+        elif action.tool == "SEARCH_METADATA":
+            field_name = str(action.arguments.get("field") or "")
+            self.metadata_fields_tried.add(field_name)
+            if field_name == "modality":
+                self.modalities_searched.add(str(action.arguments.get("value") or "").lower())
+            else:
+                self.modalities_searched.update({"text", "image"})
+        elif action.tool == "EXPAND_NEIGHBORS":
+            self.neighbor_windows_tried.add(int(action.arguments["window"]))
+            self.modalities_searched.update(
+                record.memory.modality
+                for event in incoming
+                for record in event.records
+                if record.memory.modality in {"text", "image"}
+            )
+
+    def _search_progress(self) -> dict[str, Any]:
+        state = "unsearched" if self.discovery_attempt_count == 0 else (
+            "stalled" if self.consecutive_no_gain_count >= 2 else "progressing"
+        )
+        return {
+            "discovery_attempt_count": self.discovery_attempt_count,
+            "distinct_discovery_count": len(self.discovery_signatures),
+            "retrieval_methods_tried": sorted(self.retrieval_methods_tried),
+            "rewritten_query_count": len(self.rewritten_queries),
+            "metadata_fields_tried": sorted(self.metadata_fields_tried),
+            "modalities_searched": sorted(self.modalities_searched),
+            "neighbor_windows_tried": sorted(self.neighbor_windows_tried),
+            "inspected_evidence_image_count": len(self.inspected_image_ids),
+            "consecutive_no_gain_count": self.consecutive_no_gain_count,
+            "state": state,
+        }
+
+    @staticmethod
+    def _action_signature(action: ToolAction) -> str:
+        return f"{action.tool}:{json.dumps(action.arguments, ensure_ascii=False, sort_keys=True, default=str)}"
+
+    def _guardrail_reason(self, action: ToolAction) -> str:
+        if action.tool == "EXPAND_NEIGHBORS" and not self.evidence:
+            return "requires_current_evidence"
+        if action.tool == "INSPECT_EVIDENCE_IMAGE" and not self._uninspected_image_records():
+            return "requires_uninspected_evidence_image"
+        if action.tool in {"SEARCH_METADATA", "RETRIEVE", "EXPAND_NEIGHBORS"}:
+            revisions = self.no_gain_action_revisions.get(self._action_signature(action))
+            if revisions == (self.pool_revision, self.evidence_revision):
+                return "unchanged_no_gain_action"
+        return ""
+
+    def _record_blocked_action(self, action: ToolAction, pool_before: int, reason: str) -> None:
+        self.blocked_action_count += 1
+        self.last_action_status = "blocked"
+        self.blocked_action_reason = reason
+        if action.tool in {"SEARCH_METADATA", "RETRIEVE", "EXPAND_NEIGHBORS"}:
+            # A blocked duplicate is objectively another consecutive step
+            # without candidate/evidence gain.  It must not count as a new or
+            # distinct search route, but it should allow search_progress to
+            # report that the already explored frontier has stalled.
+            self.consecutive_no_gain_count += 1
+        self.trace.append(action)
+        self.steps.append(
+            ExecutionStep(
+                index=len(self.steps),
+                action=action,
+                pool_before=pool_before,
+                pool_after=len(self.pool),
+                evidence_added=0,
+                status="blocked",
+                blocked_reason=reason,
+                error="",
+            )
+        )
 
     def _selector_candidates(self) -> list[dict[str, Any]]:
         candidates = []
-        for index, item in enumerate(self.pool, start=1):
-            fields = self.executor._pool_evidence([item], source="CANDIDATE")[0].fields
-            candidates.append({"candidate_id": f"C{index}", **fields})
+        for event in self.pool:
+            public = self._event_evidence(event, allocate_evidence_id=False).to_public_dict()
+            candidates.append({"candidate_id": self._candidate_id(event.event_key), **public})
         return candidates
 
     def _apply_semantic_selection(
@@ -735,8 +882,8 @@ class OPDToolSession:
         *,
         status: str,
         error: str,
-    ) -> list[EvidenceItem]:
-        candidate_by_id = {f"C{index}": item for index, item in enumerate(self.pool, start=1)}
+    ) -> list[EventEvidence]:
+        candidate_by_id = {self._candidate_id(item.event_key): item for item in self.pool}
         selected_ids = list(dict.fromkeys(str(value).strip() for value in selected_candidate_ids))
         unknown = [value for value in selected_ids if value not in candidate_by_id]
         if unknown:
@@ -745,169 +892,300 @@ class OPDToolSession:
             error = f"selector returned unknown candidate IDs: {unknown[:8]}"
         selected_pool = [candidate_by_id[value] for value in selected_ids]
         before_signature = self._evidence_signature()
-        new_evidence = self.executor._refresh_evidence_from_pool(
-            self.evidence,
-            selected_pool,
-            source="SEMANTIC_SELECTION",
-        )
+        before_by_key = {item.event_key: item.to_public_dict() for item in self.evidence}
+        self.evidence = [self._event_evidence(event) for event in selected_pool]
         self.semantic_filter_status = str(status or "ok")
         self.semantic_filter_error = str(error or "")
         self.semantic_filter_candidate_count = len(self.pool)
         self.semantic_filter_selected_count = len(selected_pool)
-        if self._evidence_signature() != before_signature and not new_evidence:
+        changed = [
+            item for item in self.evidence if before_by_key.get(item.event_key) != item.to_public_dict()
+        ]
+        if self._evidence_signature() != before_signature:
             self.evidence_revision += 1
-        return new_evidence
+        return changed
 
-    def _evidence_pool(self) -> list[PoolItem]:
-        memory_ids = {item.memory_id for item in self.evidence}
-        return [item for item in self.pool if item.memory.memory_id in memory_ids]
+    def _evidence_pool(self) -> list[EventCandidate]:
+        event_keys = {item.event_key for item in self.evidence}
+        return [item for item in self.pool if item.event_key in event_keys]
 
     def _evidence_signature(self) -> tuple[Any, ...]:
+        # Selector output order is not evidence gain.  Only a new event or a
+        # content/inspection update should advance the public evidence state.
         return tuple(
-            (item.memory_id, item.source, json.dumps(item.fields, ensure_ascii=False, sort_keys=True, default=str))
-            for item in self.evidence
+            sorted(
+                (
+                    item.event_key,
+                    json.dumps(item.to_public_dict(), ensure_ascii=False, sort_keys=True, default=str),
+                )
+                for item in self.evidence
+            )
         )
+
+    def _pool_signature(self) -> tuple[Any, ...]:
+        return tuple((item.event_key, tuple(item.memory_ids), float(item.score)) for item in self.pool)
+
+    def _candidate_id(self, event_key: str) -> str:
+        if event_key not in self.candidate_ids:
+            self.candidate_ids[event_key] = f"C{len(self.candidate_ids) + 1}"
+        return self.candidate_ids[event_key]
+
+    def _evidence_id(self, event_key: str) -> str:
+        if event_key not in self.evidence_ids:
+            self.evidence_ids[event_key] = f"E{len(self.evidence_ids) + 1}"
+        return self.evidence_ids[event_key]
+
+    def _event_evidence(
+        self,
+        event: EventCandidate,
+        *,
+        allocate_evidence_id: bool = True,
+    ) -> EventEvidence:
+        contents: list[str] = []
+        modalities: set[str] = set()
+        images: list[dict[str, Any]] = []
+        image_memory_ids: list[str] = []
+        timestamp = ""
+        session_alias = ""
+        turn_index: int | None = None
+        for item in event.records:
+            memory = item.memory
+            modality = str(memory.modality or "").lower()
+            if modality:
+                modalities.add(modality)
+            if not timestamp or memory.timestamp < timestamp:
+                timestamp = memory.timestamp
+            session_turn = self.executor._memory_session_turn_key(memory)
+            if session_turn is not None:
+                session_key, turn_index = session_turn
+                if session_key not in self.session_aliases:
+                    self.session_aliases[session_key] = f"S{len(self.session_aliases) + 1}"
+                session_alias = self.session_aliases[session_key]
+            content = self.executor._public_content(memory)
+            if modality == "image":
+                image_memory_ids.append(memory.memory_id)
+                image: dict[str, Any] = {
+                    "image_id": self._public_image_key(memory),
+                    "visual_observation": self.visual_observations.get(memory.memory_id),
+                }
+                if content:
+                    image["description"] = content
+                images.append(image)
+            elif content and content not in contents:
+                contents.append(content)
+        return EventEvidence(
+            event_key=event.event_key,
+            evidence_id=(self._evidence_id(event.event_key) if allocate_evidence_id else ""),
+            session_alias=session_alias,
+            turn_index=turn_index,
+            timestamp=timestamp,
+            modalities=sorted(modalities, key=lambda value: ({"text": 0, "image": 1}.get(value, 2), value)),
+            content="\n".join(contents),
+            images=images,
+            member_memory_ids=event.memory_ids,
+            image_memory_ids=image_memory_ids,
+        )
+
+    def _uninspected_image_records(self) -> list[PoolItem]:
+        if self.raw_calls >= self.executor.max_raw_inspections:
+            return []
+        records: list[PoolItem] = []
+        for event in self._evidence_pool():
+            for item in event.records:
+                if (
+                    str(item.memory.modality).lower() == "image"
+                    and item.memory.raw_pointer
+                    and self._public_image_key(item.memory) not in self.inspected_image_ids
+                ):
+                    records.append(item)
+        return records
+
+    def _inspect_evidence_images_sync(self) -> list[EventEvidence]:
+        if self.executor.raw_inspector is None:
+            raise ValueError("INSPECT_EVIDENCE_IMAGE requires a configured inspector")
+        before = self._evidence_signature()
+        before_by_key = {item.event_key: item.to_public_dict() for item in self.evidence}
+        remaining = self.executor.max_raw_inspections - self.raw_calls
+        for item in self._uninspected_image_records()[:remaining]:
+            event = next(event for event in self.evidence if item.memory.memory_id in event.image_memory_ids)
+            result = self.executor.raw_inspector.inspect(
+                item.memory.raw_pointer or "",
+                self.query,
+                question_image=self.question_image,
+                text_context=event.content,
+            )
+            self.visual_observations[item.memory.memory_id] = str(result or "")
+            self.inspected_image_memory_ids.add(item.memory.memory_id)
+            self.inspected_image_ids.add(self._public_image_key(item.memory))
+            self.raw_calls += 1
+        self.evidence = [self._event_evidence(event) for event in self._evidence_pool()]
+        if self._evidence_signature() != before:
+            self.evidence_revision += 1
+            return [
+                item
+                for item in self.evidence
+                if before_by_key.get(item.event_key) != item.to_public_dict()
+            ]
+        return []
 
     async def execute_inspect_raw_with_teacher(self, action: ToolAction, inspect_fn: Any) -> dict[str, Any]:
         """Execute INSPECT_EVIDENCE_IMAGE using the async verl teacher service callback."""
         before = len(self.pool)
-        step_error = ""
-        inspected: list[EvidenceItem] = []
-
-        if self.stopped:
-            return self._observation(action, [], "trajectory already stopped")
-
-        if len(self.trace) >= self.executor.validator.max_actions - 1 and action.tool != "STOP":
-            self.max_actions_reached = True
-            action = ToolAction("STOP")
-            self.stopped = True
-            self.trace.append(action)
-            self.steps.append(
-                ExecutionStep(
-                    index=len(self.steps),
-                    action=action,
-                    pool_before=before,
-                    pool_after=len(self.pool),
-                    evidence_added=0,
-                    error="",
-                )
-            )
+        if self.terminated:
+            return self._observation(action, [], "trajectory already terminated")
+        if len(self.trace) >= self.executor.validator.max_actions:
+            self._terminate("budget_exhausted")
             return self._observation(action, [], "")
-
+        step_error = ""
+        before_signature = self._evidence_signature()
+        before_by_key = {item.event_key: item.to_public_dict() for item in self.evidence}
         try:
             self.executor.validator._validate_action(action, len(self.trace))
-            remaining = max(0, self.executor.max_raw_inspections - self.raw_calls)
-            inspect_pool = self._evidence_pool()
-            text_by_turn = self.executor._text_context_by_turn(inspect_pool)
-            for item in inspect_pool:
-                if len(inspected) >= remaining:
-                    break
-                pointer = item.memory.raw_pointer
-                if not pointer:
-                    continue
-                context = text_by_turn.get(item.memory.turn_id, "")
+            blocked_reason = self._guardrail_reason(action)
+            if blocked_reason:
+                self._record_blocked_action(action, before, blocked_reason)
+                return self._finalize_action_observation(action, [], "")
+            remaining = self.executor.max_raw_inspections - self.raw_calls
+            for item in self._uninspected_image_records()[:remaining]:
+                event = next(event for event in self.evidence if item.memory.memory_id in event.image_memory_ids)
                 visual_observation = await inspect_fn(
                     {
-                        "raw_pointer": pointer,
+                        "raw_pointer": item.memory.raw_pointer,
                         "query": self.query,
                         "question_image": self.question_image,
-                        "text_context": context,
+                        "text_context": event.content,
                     }
                 )
-                fields = {
-                    "visual_observation": str(visual_observation or ""),
-                    "linked_text_context": context,
-                    "image_label": f"context={context[:220]}",
-                    "session_date": item.memory.metadata.get("session_date"),
-                    "timestamp": item.memory.timestamp,
-                }
-                image_id = item.memory.public_image_id()
-                if image_id:
-                    fields["image_id"] = image_id
-                inspected.append(
-                    EvidenceItem(
-                        memory_id=item.memory.memory_id,
-                        fields=fields,
-                        source="INSPECT_EVIDENCE_IMAGE",
-                    )
-                )
-            self.raw_calls += len(inspected)
-            self.evidence.extend(inspected)
-            if inspected:
+                self.visual_observations[item.memory.memory_id] = str(visual_observation or "")
+                self.inspected_image_memory_ids.add(item.memory.memory_id)
+                self.inspected_image_ids.add(self._public_image_key(item.memory))
+                self.raw_calls += 1
+            self.evidence = [self._event_evidence(event) for event in self._evidence_pool()]
+            if self._evidence_signature() != before_signature:
                 self.evidence_revision += 1
         except Exception as exc:
             step_error = str(exc)
             self.error = step_error
+            self._terminate("tool_error")
 
         self.trace.append(action)
+        changed = [
+            item
+            for item in self.evidence
+            if before_by_key.get(item.event_key) != item.to_public_dict()
+        ]
         self.steps.append(
             ExecutionStep(
                 index=len(self.steps),
                 action=action,
                 pool_before=before,
                 pool_after=len(self.pool),
-                evidence_added=len(inspected),
+                evidence_added=len(changed),
                 error=step_error,
             )
         )
-        return self._observation(action, inspected, step_error)
+        return self._finalize_action_observation(action, changed, step_error)
 
-    def _observation(self, action: ToolAction, new_evidence: list[EvidenceItem], error: str) -> dict[str, Any]:
-        """Return the current accumulated state with one entry per memory.
+    def _public_image_key(self, memory: MemoryRecord) -> str:
+        public_id = str(memory.public_image_id() or "").strip()
+        if public_id:
+            return public_id
+        if memory.memory_id not in self.image_aliases:
+            self.image_aliases[memory.memory_id] = f"IMG{len(self.image_aliases) + 1}"
+        return self.image_aliases[memory.memory_id]
 
-        ToolAgentLoop already keeps the assistant tool call in message history,
-        so repeating its full arguments here only grows the prompt. The pool's
-        capacity bounds this complete evidence list without text truncation.
-        """
-        visible_pool = self.pool if self.pool_has_candidates else []
-        new_evidence_count = len({item.memory_id for item in new_evidence})
-        public_evidence = _sanitize_evidence(self.evidence)
+    def _terminate(self, reason: str) -> None:
+        self.terminated = True
+        self.termination_reason = reason
+        self.policy_stopped = reason == "policy_stop"
+        self.stopped = self.policy_stopped
+        self.max_actions_reached = reason == "budget_exhausted"
+
+    def _finalize_action_observation(
+        self,
+        action: ToolAction,
+        changed_evidence: list[EventEvidence],
+        error: str,
+    ) -> dict[str, Any]:
+        if len(self.trace) >= self.executor.validator.max_actions and not self.terminated:
+            self._terminate("budget_exhausted")
+        return self._observation(action, changed_evidence, error)
+
+    def available_tool_names(self) -> list[str]:
+        names = ["search_metadata", "retrieve"]
+        if self.evidence:
+            names.append("expand_neighbors")
+        if self._uninspected_image_records():
+            names.append("inspect_evidence_image")
+        names.append("stop")
+        return names
+
+    def _observation(self, action: ToolAction, changed_evidence: list[EventEvidence], error: str) -> dict[str, Any]:
+        """Return one authoritative accumulated event-level observation."""
+        public_evidence = [item.to_public_dict() for item in self.evidence]
+        record_count = sum(len(item.member_memory_ids) for item in self.evidence)
         observation = {
             "refresh_state": False,
             "tool": action.tool,
-            "pool_count": len(visible_pool),
+            "pool_count": len(self.pool),
             "pool_capacity": self.executor.max_pool_size,
             "pool_overflow_count": self.pool_overflow_count,
             "evidence_count": len(public_evidence),
-            "evidence_memory_count": len(public_evidence),
-            "new_evidence_count": new_evidence_count,
+            "evidence_event_count": len(public_evidence),
+            "evidence_record_count": record_count,
+            "evidence_memory_count": record_count,
+            "new_evidence_count": len(changed_evidence),
             "evidence_revision": self.evidence_revision,
             "semantic_filter_status": self.semantic_filter_status,
             "semantic_filter_candidate_count": self.semantic_filter_candidate_count,
             "semantic_filter_selected_count": self.semantic_filter_selected_count,
             "semantic_filter_error": _clip_text(self.semantic_filter_error),
-            "distinct_search_count": len(self.discovery_signatures),
-            "stagnant_search_count": len(self.stagnant_discovery_signatures),
-            "search_exhausted": self.search_exhausted,
-            # The pool remains private. This is the sole model-visible,
-            # semantically screened answer-evidence representation.
+            "search_progress": self._search_progress(),
+            "question_image_attached": bool(self.question_image),
+            "available_tools": self.available_tool_names(),
+            "last_action_status": self.last_action_status,
+            "blocked_action_reason": self.blocked_action_reason,
+            "blocked_action_count": self.blocked_action_count,
             "evidence": public_evidence,
+            "terminated": self.terminated,
+            "termination_reason": self.termination_reason,
+            "policy_stopped": self.policy_stopped,
             "stopped": self.stopped,
+            "max_actions_reached": self.max_actions_reached,
             "error": _clip_text(error),
         }
         return observation
 
     def public_state(self) -> dict[str, Any]:
         """Return serializable public state for AgentLoopOutput.extra_fields."""
-        visible_pool = self.pool if self.pool_has_candidates else []
-        public_evidence = _sanitize_evidence(self.evidence)
+        public_evidence = [item.to_public_dict() for item in self.evidence]
+        record_count = sum(len(item.member_memory_ids) for item in self.evidence)
         return {
             "query": self.query,
-            "pool_count": len(visible_pool),
+            "pool_count": len(self.pool),
             "pool_capacity": self.executor.max_pool_size,
             "pool_overflow_count": self.pool_overflow_count,
             "evidence_count": len(public_evidence),
-            "evidence_memory_count": len(public_evidence),
+            "evidence_event_count": len(public_evidence),
+            "evidence_record_count": record_count,
+            "evidence_memory_count": record_count,
             "evidence": public_evidence,
             "evidence_revision": self.evidence_revision,
             "semantic_filter_status": self.semantic_filter_status,
             "semantic_filter_candidate_count": self.semantic_filter_candidate_count,
             "semantic_filter_selected_count": self.semantic_filter_selected_count,
             "semantic_filter_error": self.semantic_filter_error,
-            "distinct_search_count": len(self.discovery_signatures),
-            "stagnant_search_count": len(self.stagnant_discovery_signatures),
-            "search_exhausted": self.search_exhausted,
+            "search_progress": self._search_progress(),
+            "question_image_attached": bool(self.question_image),
+            "available_tools": self.available_tool_names(),
+            "last_action_status": self.last_action_status,
+            "blocked_action_reason": self.blocked_action_reason,
+            "blocked_action_count": self.blocked_action_count,
             "trace": [action.to_dict() for action in self.trace],
+            "steps": [step.to_dict() for step in self.steps],
+            "terminated": self.terminated,
+            "termination_reason": self.termination_reason,
+            "policy_stopped": self.policy_stopped,
             "stopped": self.stopped,
             "error": self.error,
             "raw_inspection_calls": self.raw_calls,
@@ -940,10 +1218,13 @@ class OPDBaseTool(BaseTool):
                 "action_history": [item.to_dict() for item in session.trace],
                 "observation": observation,
             }
-        terminate_agent_loop = bool(observation["stopped"] or observation["error"])
+        terminate_agent_loop = bool(observation["terminated"] or observation["error"])
         return ToolResponse(text=json.dumps(observation, ensure_ascii=False)), 0.0, {
             "opd_mm_pool_count": observation["pool_count"],
             "opd_mm_evidence_count": observation["evidence_count"],
+            "opd_mm_evidence_event_count": observation["evidence_event_count"],
+            "opd_mm_evidence_record_count": observation["evidence_record_count"],
+            "opd_mm_blocked_action_count": observation["blocked_action_count"],
             "opd_mm_semantic_filter_fallback": float(
                 str(observation["semantic_filter_status"]).startswith("fallback_all")
             ),
@@ -1031,7 +1312,7 @@ class OPDSearchMetadataTool(OPDBaseTool):
     properties = {
         "field": _property(
             "string",
-            "Metadata field. modality is only text/image; status is only active; timestamp is only a public ISO date.",
+            "Metadata field. modality is only text/image; status is only active; timestamp uses public time values.",
             sorted(METADATA_SEARCH_FIELDS),
         ),
         "op": _property(
@@ -1042,7 +1323,8 @@ class OPDSearchMetadataTool(OPDBaseTool):
         "value": _property(
             ["string", "number", "boolean"],
             "Literal metadata value only: text/image for modality, active for status, or a public YYYY, YYYY-MM, "
-            "YYYY-MM-DD, or ISO timestamp. Never put a topic, entity, event, or memory ID here; use RETRIEVE for those.",
+            "YYYY-MM-DD, ISO timestamp, or exact timestamp shown in evidence. Never put a topic, entity, event, "
+            "or memory ID here; use RETRIEVE for those.",
         ),
     }
     required = ["field", "op", "value"]
@@ -1082,7 +1364,7 @@ class OPDExpandNeighborsTool(OPDBaseTool):
     description = (
         "Expand the current candidate pool with neighboring turns from the same session. "
         "Expansion is anchored on current answer evidence, and the expanded pool is semantically screened again. "
-        "Use only after retrieval/filtering has produced relevant evidence."
+        "Use only after a discovery action has produced relevant evidence."
     )
     properties = {
         "window": _property(
@@ -1130,10 +1412,13 @@ class OPDInspectEvidenceImageTool(OPDBaseTool):
                 "action_history": [item.to_dict() for item in session.trace],
                 "observation": observation,
             }
-        terminate_agent_loop = bool(observation["stopped"] or observation["error"])
+        terminate_agent_loop = bool(observation["terminated"] or observation["error"])
         return ToolResponse(text=json.dumps(observation, ensure_ascii=False)), 0.0, {
             "opd_mm_pool_count": observation["pool_count"],
             "opd_mm_evidence_count": observation["evidence_count"],
+            "opd_mm_evidence_event_count": observation["evidence_event_count"],
+            "opd_mm_evidence_record_count": observation["evidence_record_count"],
+            "opd_mm_blocked_action_count": observation["blocked_action_count"],
             "opd_mm_semantic_filter_fallback": float(
                 str(observation["semantic_filter_status"]).startswith("fallback_all")
             ),
@@ -1160,6 +1445,7 @@ OPD_TOOL_CLASSES = [
 
 def openai_tool_schemas(
     include_inspect_raw: bool = True,
+    available_tool_names: Optional[list[str] | set[str]] = None,
 ) -> list[dict[str, Any]]:
     """Return OpenAI tool schemas for OPD-MM tools."""
     classes = (
@@ -1167,11 +1453,13 @@ def openai_tool_schemas(
         if include_inspect_raw
         else [cls for cls in OPD_TOOL_CLASSES if cls is not OPDInspectEvidenceImageTool]
     )
+    allowed = set(available_tool_names) if available_tool_names is not None else None
     return [
         _schema(cls.tool_name, cls.description, cls.properties, cls.required).model_dump(
             exclude_unset=True, exclude_none=True
         )
         for cls in classes
+        if allowed is None or cls.tool_name in allowed
     ]
 
 

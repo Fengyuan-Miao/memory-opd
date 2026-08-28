@@ -86,6 +86,7 @@ def test_outcome_reward_generates_answer_before_gold_aware_judge(tmp_path, monke
     assert "No requires an explicit negative statement" in answer_prompt
     assert "a nearby action is not a cause" in answer_prompt
     assert "person, conversation, dialogue, or record mentioned" in answer_prompt
+    assert "explicit incompatible alternative" in answer_prompt
     assert "It was red." in judge_prompt
     assert "The bicycle was red." in judge_prompt
     dumped = list(tmp_path.glob("outcome_reward_*.jsonl"))
@@ -93,6 +94,86 @@ def test_outcome_reward_generates_answer_before_gold_aware_judge(tmp_path, monke
     row = json.loads(dumped[0].read_text(encoding="utf-8"))
     assert row["correct"] is True
     assert row["candidate_answer"] == "The bicycle was red."
+
+
+def test_structured_conflict_relations_map_to_benchmark_verdicts() -> None:
+    query = "Does this claim conflict with the dialogue memory?"
+    assert outcome_reward._normalize_answer_output(query, '{"comparison":"INCOMPATIBLE_VALUE"}') == "Yes"
+    assert outcome_reward._normalize_answer_output(query, '{"comparison":"NONE"}') == "No"
+    assert (
+        outcome_reward._normalize_answer_output(query, '{"comparison":"MISSING_COMPARISON"}')
+        == "INSUFFICIENT_EVIDENCE"
+    )
+
+    claim_query = "Would it be accurate to say Evelyn always worked late?"
+    assert outcome_reward._normalize_answer_output(
+        claim_query,
+        '{"comparison":"INCOMPATIBLE_ATTRIBUTE"}',
+        "CD",
+    ) == "No"
+    assert outcome_reward._normalize_answer_output(
+        claim_query,
+        '{"comparison":"NONE"}',
+        "CD",
+    ) == "Yes"
+    with pytest.raises(ValueError):
+        outcome_reward._normalize_answer_output(query, "Yes")
+
+    internal_query = "Does the conversation contain conflicting statements about the product?"
+    assert outcome_reward._normalize_answer_output(
+        internal_query,
+        '{"comparison":"NONE","conflicting_pair_found":false}',
+        "CD",
+    ) == "No"
+    assert outcome_reward._normalize_answer_output(
+        internal_query,
+        '{"comparison":"INCOMPATIBLE_IDENTITY","conflicting_pair_found":true}',
+        "CD",
+    ) == "Yes"
+
+
+def test_cd_verdict_comparison_ignores_explanation_and_uses_normalized_label() -> None:
+    assert outcome_reward._cd_verdict_matches_gold("No", "No.") is True
+    assert outcome_reward._cd_verdict_matches_gold("Yes", "No.") is False
+    assert outcome_reward._cd_verdict_matches_gold("INSUFFICIENT_EVIDENCE", "No.") is None
+
+
+def test_cd_outcome_uses_structured_relation_without_a_second_model_judge(monkeypatch) -> None:
+    calls: list[str] = []
+
+    async def fake_chat_completion(**kwargs: Any) -> str:
+        kind = _request_kind(kwargs)
+        calls.append(kind)
+        if kind == "answer":
+            return (
+                '{"question_proposition":"the image is Canton Tower",'
+                '"memory_proposition":"the image is Oriental Pearl Tower",'
+                '"comparison":"INCOMPATIBLE_IDENTITY","evidence_ids":["E1"]}'
+            )
+        if kind == "evidence":
+            return '{"answerable":true,"reason":"explicit incompatible identity"}'
+        raise AssertionError("structured CD verdict must not be reinterpreted by a free-text judge")
+
+    monkeypatch.setattr(outcome_reward, "_chat_completion", fake_chat_completion)
+    result = asyncio.run(
+        outcome_reward.compute_outcome_score(
+            data_source="opd_mm",
+            solution_str="",
+            ground_truth="Yes.",
+            extra_info={
+                "point": "CD",
+                "gold_answer": "Yes.",
+                "opd_mm": _state(
+                    query="Does the tower identity conflict with the dialogue memory?",
+                    evidence=[{"evidence_id": "E1", "content": "The dialogue names the Canton Tower."}],
+                ),
+            },
+        )
+    )
+
+    assert calls == ["answer", "evidence"]
+    assert result["opd_mm/answer_correct"] == 1.0
+    assert result["opd_mm/outcome_evaluated"] == 1.0
 
 
 @pytest.mark.parametrize("data_source", ["opd_mm_mmem_val", "opd_mm_memgallery_val"])
@@ -118,7 +199,7 @@ def test_outcome_reward_accepts_named_opd_mm_validation_sources(data_source, mon
     assert result["opd_mm/answer_correct"] == 1.0
 
 
-def test_answer_judge_does_not_use_missing_evidence_to_excuse_a_refusal() -> None:
+def test_answer_judge_uses_evidence_only_to_validate_extra_details() -> None:
     messages = outcome_reward._judge_messages(
         query="Which conference was recommended?",
         gold_answer="AAAI.",
@@ -129,8 +210,9 @@ def test_answer_judge_does_not_use_missing_evidence_to_excuse_a_refusal() -> Non
 
     assert "sole correctness reference" in prompt
     assert "INSUFFICIENT_EVIDENCE is incorrect" in prompt
+    assert "cannot replace a missing required answer" in prompt
     assert "AAAI." in prompt
-    assert "Unrelated public evidence." not in prompt
+    assert "Unrelated public evidence." in prompt
 
 
 def test_answer_judge_distinguishes_unstated_events_from_explicit_negatives() -> None:
@@ -155,8 +237,57 @@ def test_evidence_judge_requires_relevant_context_for_absence_answers() -> None:
     )
     prompt = json.dumps(messages, ensure_ascii=False)
 
-    assert "covers the referenced person or event" in prompt
-    assert "unrelated or merely partial evidence is insufficient" in prompt
+    assert "question-visible subject and modality" in prompt
+    assert "Unrelated or partial evidence is INSUFFICIENT" in prompt
+
+
+def test_question_image_is_forwarded_to_answer_and_evidence_models(tmp_path) -> None:
+    image = tmp_path / "question.jpg"
+    image.write_bytes(b"jpeg-bytes")
+
+    answer_messages = outcome_reward._answer_messages(
+        "Which stored image matches this picture?",
+        [{"evidence_id": "E1", "images": [{"image_id": "IMG1"}]}],
+        question_image=str(image),
+    )
+    evidence_messages = outcome_reward._evidence_answerable_messages(
+        "Which stored image matches this picture?",
+        "IMG1",
+        [{"evidence_id": "E1", "images": [{"image_id": "IMG1"}]}],
+        question_image=str(image),
+    )
+
+    for messages in (answer_messages, evidence_messages):
+        content = messages[-1]["content"]
+        assert isinstance(content, list)
+        assert content[-1]["image_url"]["url"].startswith("data:image/jpeg;base64,")
+
+
+def test_structured_evidence_support_classes_have_deterministic_polarity() -> None:
+    assert outcome_reward._parse_answerable_with_recovery('{"support":"DIRECT"}')[0] is True
+    assert outcome_reward._parse_answerable_with_recovery('{"support":"ABSENCE_WITH_COVERAGE"}')[0] is True
+    assert outcome_reward._parse_answerable_with_recovery('{"support":"INSUFFICIENT"}')[0] is False
+    assert outcome_reward._parse_answerable_with_recovery('{"support":"CONTRADICTED"}')[0] is False
+
+    stalled = {
+        "state": "stalled",
+        "distinct_discovery_count": 2,
+        "consecutive_no_gain_count": 2,
+        "retrieval_methods_tried": ["bm25", "dense"],
+        "modalities_searched": ["text"],
+    }
+    assert outcome_reward._parse_answerable_with_recovery(
+        '{"support":"ABSENCE_WITH_COVERAGE"}',
+        query="What brand was mentioned?",
+        gold_answer="Not mentioned.",
+        search_progress=stalled,
+    )[0] is True
+    assert outcome_reward._parse_answerable_with_recovery(
+        '{"support":"ABSENCE_WITH_COVERAGE"}',
+        query="What brand was mentioned?",
+        gold_answer="Acme",
+        search_progress=stalled,
+    )[0] is False
 
 
 def test_outcome_reward_does_not_call_models_for_nonterminal_or_empty_evidence(monkeypatch) -> None:
@@ -188,6 +319,54 @@ def test_outcome_reward_does_not_call_models_for_nonterminal_or_empty_evidence(m
     assert empty["score"] == pytest.approx(-0.1)
     assert empty["opd_mm/outcome_evaluated"] == 0.0
     assert empty["opd_mm/outcome_infrastructure_failure"] == 0.0
+
+
+def test_outcome_reward_evaluates_stalled_empty_absence_state(monkeypatch) -> None:
+    calls: list[str] = []
+
+    async def fake_chat_completion(**kwargs: Any) -> str:
+        kind = _request_kind(kwargs)
+        calls.append(kind)
+        if kind == "answer":
+            return "Not mentioned"
+        if kind == "evidence":
+            return '{"answerable":true,"reason":"Complementary searches stalled."}'
+        return '{"correct":true,"reason":"Matches the absence answer."}'
+
+    monkeypatch.setattr(outcome_reward, "_chat_completion", fake_chat_completion)
+    result = asyncio.run(
+        outcome_reward.compute_outcome_score(
+            data_source="opd_mm",
+            solution_str="",
+            ground_truth="Not mentioned.",
+            extra_info={
+                "gold_answer": "Not mentioned.",
+                "opd_mm": _state(
+                    query="What dessert was mentioned?",
+                    evidence=[],
+                    terminated=True,
+                    policy_stopped=True,
+                    termination_reason="policy_stop",
+                    search_progress={
+                        "state": "stalled",
+                        "distinct_discovery_count": 2,
+                        "consecutive_no_gain_count": 2,
+                        "retrieval_methods_tried": ["bm25", "dense"],
+                        "rewritten_query_count": 0,
+                        "metadata_fields_tried": [],
+                        "neighbor_windows_tried": [],
+                        "modalities_searched": ["text"],
+                    },
+                ),
+            },
+        )
+    )
+
+    assert sorted(calls) == ["answer", "evidence", "judge"]
+    assert result["opd_mm/answer_correct"] == 1.0
+    assert result["opd_mm/evidence_answerable"] == 1.0
+    assert result["opd_mm/empty_evidence"] == 1.0
+    assert result["opd_mm/search_stalled_rate"] == 1.0
 
 
 def test_outcome_reward_applies_only_bounded_trajectory_penalties(monkeypatch) -> None:

@@ -39,10 +39,10 @@ user question, executed action history, and current public observation. Do not i
 
 Treat the latest observation as authoritative. Discovery actions add deduplicated memories to a private candidate
 pool, then an internal semantic selector exposes only candidates relevant to answering the question as public
-evidence. EXPAND_NEIGHBORS is anchored on current evidence and is screened again. search_exhausted=true means at
-least two distinct discovery actions stopped finding new relevant
-memories; it supports stopping an absence/not-mentioned search but does not prove a positive fact. Choose an action
-that addresses the unresolved evidence need, and do not repeat an unchanged action without a state-based reason.
+event evidence. EXPAND_NEIGHBORS is anchored on current evidence and is screened again. search_progress reports only
+which searches were attempted and whether recent distinct attempts added anything; it never proves a positive fact
+or automatically proves absence. Choose an action that addresses the unresolved evidence need, and do not repeat an
+unchanged action without a state-based reason.
 Stop when current evidence is sufficient or the observation reports an unrecoverable error. Inference has no
 gold-aware validator. A public image_id may be used when the question asks for an image or image ID.
 """

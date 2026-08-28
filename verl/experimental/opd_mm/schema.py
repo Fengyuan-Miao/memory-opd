@@ -44,7 +44,7 @@ METADATA_SEARCH_VALUE_ENUMS = {
 }
 METADATA_SEARCH_TIMESTAMP_PATTERN = re.compile(
     r"^\d{4}(?:-\d{2})?(?:-\d{2})?"
-    r"(?:T\d{2}:\d{2}(?::\d{2}(?:\.\d+)?)?(?:Z|[+-]\d{2}:\d{2})?)?$"
+    r"(?:T(?:\d{4}|\d{2}:\d{2}(?::\d{2}(?:\.\d+)?)?(?:Z|[+-]\d{2}:\d{2})?))?$"
 )
 RETRIEVAL_METHODS = {"bm25", "dense", "vision", "hybrid"}
 EXPAND_NEIGHBOR_WINDOWS = {1, 2, 3}
@@ -201,7 +201,8 @@ class TrajectoryValidator:
             or not METADATA_SEARCH_TIMESTAMP_PATTERN.fullmatch(args["value"].strip())
         ):
             raise TrajectoryValidationError(
-                f"action {index}: invalid SEARCH_METADATA timestamp value; expected YYYY, YYYY-MM, YYYY-MM-DD, or ISO timestamp"
+                f"action {index}: invalid SEARCH_METADATA timestamp value; expected a public turn timestamp, "
+                "YYYY, YYYY-MM, YYYY-MM-DD, or ISO timestamp"
             )
 
     def _validate_retrieve(self, args: Dict[str, Any], index: int) -> None:

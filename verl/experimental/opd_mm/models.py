@@ -108,6 +108,54 @@ class PoolItem:
 
 
 @dataclass
+class EventCandidate:
+    """One dialogue turn in the private, request-local candidate pool."""
+
+    event_key: str
+    records: List[PoolItem] = field(default_factory=list)
+    score: float = 0.0
+    retrieved: bool = False
+
+    @property
+    def memory_ids(self) -> List[str]:
+        return [item.memory.memory_id for item in self.records]
+
+
+@dataclass
+class EventEvidence:
+    """One semantically selected dialogue event.
+
+    ``member_memory_ids`` and ``image_memory_ids`` remain private bookkeeping;
+    :meth:`to_public_dict` exposes only request-local provenance.
+    """
+
+    event_key: str
+    evidence_id: str
+    session_alias: str = ""
+    turn_index: Optional[int] = None
+    timestamp: str = ""
+    modalities: List[str] = field(default_factory=list)
+    content: str = ""
+    images: List[Dict[str, Any]] = field(default_factory=list)
+    member_memory_ids: List[str] = field(default_factory=list)
+    image_memory_ids: List[str] = field(default_factory=list)
+
+    def to_public_dict(self) -> Dict[str, Any]:
+        data: Dict[str, Any] = {
+            "evidence_id": self.evidence_id,
+            "session_alias": self.session_alias,
+            "turn_index": self.turn_index,
+            "timestamp": self.timestamp,
+            "modalities": list(self.modalities),
+            "content": self.content,
+            "images": [dict(image) for image in self.images],
+        }
+        if not self.evidence_id:
+            data.pop("evidence_id")
+        return data
+
+
+@dataclass
 class EvidenceItem:
     memory_id: str
     fields: Dict[str, Any] = field(default_factory=dict)
@@ -128,6 +176,8 @@ class ExecutionStep:
     pool_before: int
     pool_after: int
     evidence_added: int = 0
+    status: str = "executed"
+    blocked_reason: str = ""
     error: str = ""
 
     def to_dict(self) -> Dict[str, Any]:
@@ -137,6 +187,8 @@ class ExecutionStep:
             "pool_before": self.pool_before,
             "pool_after": self.pool_after,
             "evidence_added": self.evidence_added,
+            "status": self.status,
+            "blocked_reason": self.blocked_reason,
             "error": self.error,
         }
 

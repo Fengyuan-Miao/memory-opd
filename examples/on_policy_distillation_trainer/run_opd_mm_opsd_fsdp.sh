@@ -33,7 +33,7 @@ export WANDB_MODE
 WANDB_TRAINER_ARGS=(
     +trainer.wandb_disable_stats=${WANDB_DISABLE_STATS}
     +trainer.wandb_val_actions_only=${WANDB_VAL_ACTIONS_ONLY}
-    '+trainer.wandb_metric_include_patterns=["^(actor|critic|distillation)/.*loss$","^val-aux/.*/opd_mm/(answer_correct|evidence_answerable|evidence_count|action_count|repeated_actions|max_actions_reached|empty_evidence|trajectory_error|answer_request_failed|judge_request_failed|evidence_judge_request_failed)/mean@.*$","^training/(global_step|epoch)$"]'
+    '+trainer.wandb_metric_include_patterns=["^(actor|critic|distillation)/.*loss$","^val-aux/.*/opd_mm/(answer_correct|evidence_answerable|evidence_count|evidence_event_count|evidence_record_count|action_count|repeated_actions|blocked_action_count|policy_stop_rate|budget_exhausted_rate|search_stalled_rate|max_actions_reached|empty_evidence|trajectory_error|answer_request_failed|judge_request_failed|evidence_judge_request_failed)/mean@.*$","^training/(global_step|epoch)$"]'
 )
 if [[ -n "$WANDB_PROXY" ]]; then
     WANDB_TRAINER_ARGS+=(+trainer.wandb_proxy="$WANDB_PROXY")

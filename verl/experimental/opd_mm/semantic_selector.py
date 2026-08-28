@@ -38,8 +38,11 @@ def build_semantic_selector_prompt(
         "Select every memory candidate that may help answer the question. Favor recall: when relevance is uncertain, "
         "retain the candidate. Keep direct support, necessary context, temporal or relational links, and images that "
         "may match the attached question image even when captions are incomplete. Use the current action as retrieval "
-        "intent, but judge usefulness against the original question. Exclude only clearly unrelated candidates or "
-        "exactly redundant copies. Return an empty list only when every candidate is clearly irrelevant. "
+        "intent, but judge usefulness against the original question. For conflict questions, retain evidence about "
+        "the same entity/event that establishes a compatible or incompatible alternative even if it omits a disputed "
+        "claim word. A shared topic or capability is not enough when the candidate concerns a different entity, "
+        "object type, or event. Exclude clearly unrelated candidates or exactly redundant copies. Return an empty "
+        "list only when every candidate is clearly irrelevant. "
         "Use only the supplied candidate_id values. Return exactly one JSON object with key "
         "selected_candidate_ids and no other text.\n\n"
         + json.dumps(

@@ -138,7 +138,7 @@ class StepCorrectionCollector:
         corrections: list[StepCorrection] = []
         actions = list(student_actions)[: self.max_steps]
         for step_index, student_action in enumerate(actions):
-            if session.stopped:
+            if session.terminated:
                 break
             history = list(session.trace)
             observation = session.public_state()

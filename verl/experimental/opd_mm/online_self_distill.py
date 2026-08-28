@@ -146,6 +146,15 @@ def _as_dict(value: Any) -> dict[str, Any]:
     return value if isinstance(value, dict) else {}
 
 
+def _as_list(value: Any) -> list[Any]:
+    value = to_plain(value)
+    if isinstance(value, list):
+        return value
+    if isinstance(value, tuple):
+        return list(value)
+    return []
+
+
 def _action_dicts(history: list[Any]) -> list[dict[str, Any]]:
     actions: list[dict[str, Any]] = []
     for action in history:
@@ -770,14 +779,19 @@ def build_state_verifier_prompt(
 answer to the question. Compare against the private answer silently; never reveal or paraphrase gold-only content.
 A paraphrase or a fact embedded in a longer sentence is sufficient when it entails the answer. Do not require an
 exact answer string, quotation, isolated sentence, repeated speaker name, or special answer formatting.
-For a yes/no question, evidence that proves or contradicts the claim is sufficient. Treat paired dialogue/image
-records and their public timestamp/image_id as one event. A matching public image description plus image_id is
+For a conflict/contradiction question, the statement in the question is the candidate claim: an explicit
+incompatible value, identity, attribute, or action for the same entity/event supports a Yes (conflict), while
+compatible evidence supports a No. Do not treat an explicit alternative as merely an unmentioned claim, and do not
+infer conflict from absence alone. Treat paired dialogue/image records and their public timestamp/image_id as one
+event. A matching public image description plus image_id is
 sufficient for identification; require raw visual detail only when the queried attribute remains undescribed or
 ambiguous.
 For a private answer that means absent, unknown, or not mentioned, direct positive evidence is not expected.
-search_exhausted=true means at least two distinct, query-grounded discovery actions stopped adding relevant
-memories. When that condition holds and no public evidence contradicts the absence answer, treat the evidence state
-as sufficient. Do not use search_exhausted to make a positive factual answer sufficient.
+Use search_progress only as a factual search record. An absence answer can be supported only when progress is
+stalled after at least two distinct, complementary, query-grounded discovery attempts and those attempts cover the
+modality explicitly required by the question. Never use search progress to make a positive factual answer sufficient.
+When all of those conditions hold and the requested detail remains absent, mark the evidence sufficient; do not
+require an explicit public sentence stating that the detail is absent.
 
 Your output is shown to the teacher. Write the reason using only query-visible concepts, public-evidence content,
 and generic terms such as "requested fact", "relevant event", or "required list coverage". State what structural
@@ -803,9 +817,9 @@ Choose exactly one evidence type:
 {visual_decision_line}
 - missing_factual_support: an identifiable query-required entity, relation, attribute, event, or list item is absent.
 - incomplete_coverage: relevant items are present, but evidence cannot establish that a requested list/count is exhaustive.
-- insufficient_absence_support: an absence/not-mentioned answer is expected but search_exhausted is false, or the
-  executed searches do not cover the query-visible subject. Conflict questions still require evidence that proves
-  or contradicts the stated claim.
+- insufficient_absence_support: an absence/not-mentioned answer is expected but search_progress is not stalled after
+  at least two complementary attempts, or the attempts do not cover the query-visible subject and modality. Conflict
+  questions still require evidence that proves or contradicts the stated claim.
 
 Selection rules: choose the most specific applicable type before missing_factual_support. In particular, use
 missing_raw_visual_detail for an unresolved visual attribute of a retrieved image, missing_neighbor_context for a
@@ -852,7 +866,9 @@ def parse_state_verifier_feedback(
         observation = _as_dict(observation)
         evidence_count = _observation_evidence_count(observation)
         has_candidate_context = _observation_has_candidate_context(observation)
-        exhausted_absence_search = bool(observation.get("search_exhausted")) and _gold_is_absence_answer(gold_answer)
+        supported_absence_search = _search_progress_supports_absence(observation, query) and _gold_is_absence_answer(
+            gold_answer
+        )
         evidence_sufficient = _coerce_bool(payload.get("evidence_sufficient"))
         reason = str(payload.get("reason") or "").strip()
         missing_type = _normalize_missing_evidence_type(
@@ -870,10 +886,15 @@ def parse_state_verifier_feedback(
                 "no_public_evidence" if evidence_count <= 0 else "missing_factual_support"
             )
 
-        if evidence_count <= 0 and not exhausted_absence_search:
+        if evidence_count <= 0 and not supported_absence_search:
             evidence_sufficient = False
             missing_type = "no_public_evidence"
             reason = reason or "Need public evidence before answering."
+        elif evidence_count <= 0 and supported_absence_search:
+            if evidence_sufficient:
+                missing_type = "none"
+            elif missing_type == "no_public_evidence":
+                missing_type = "insufficient_absence_support"
         elif missing_type == "no_public_evidence":
             # With a non-empty public state, distinguish an unusable result from
             # an empty retrieval so the teacher does not try metadata filtering
@@ -910,6 +931,36 @@ def parse_state_verifier_feedback(
         }
     except Exception as error:
         return _verifier_parse_fallback(error)
+
+
+def _search_progress_supports_absence(observation: dict[str, Any], query: str = "") -> bool:
+    """Conservatively recognize complementary, stalled absence search."""
+    progress = _as_dict(_as_dict(observation).get("search_progress"))
+    if str(progress.get("state") or "") != "stalled":
+        return False
+    if int(progress.get("distinct_discovery_count") or 0) < 2:
+        return False
+    if int(progress.get("consecutive_no_gain_count") or 0) < 2:
+        return False
+    methods = {str(value) for value in _as_list(progress.get("retrieval_methods_tried"))}
+    metadata_fields = {str(value) for value in _as_list(progress.get("metadata_fields_tried"))}
+    neighbor_windows = {int(value) for value in _as_list(progress.get("neighbor_windows_tried"))}
+    complementary = (
+        len(methods) >= 2
+        or int(progress.get("rewritten_query_count") or 0) >= 1
+        or len(metadata_fields) >= 2
+        or (bool(metadata_fields) and bool(methods or neighbor_windows))
+        or (bool(neighbor_windows) and bool(methods))
+    )
+    if not complementary:
+        return False
+    modalities = {str(value) for value in _as_list(progress.get("modalities_searched"))}
+    query_text = str(query or "").lower()
+    requires_image = bool(observation.get("question_image_attached")) or any(
+        marker in query_text
+        for marker in ("image", "photo", "picture", "visual", "图像", "图片", "照片")
+    )
+    return "image" in modalities if requires_image else "text" in modalities
 
 
 def build_teacher_correction_prompt(
@@ -1108,7 +1159,7 @@ def build_online_step_correction_requests(
 
     requests: list[dict[str, Any]] = []
     for step_index, snapshot in enumerate(snapshots[: max(1, max_steps)]):
-        if session.stopped:
+        if session.terminated:
             break
         history = list(session.trace)
         observation = session.public_state()
@@ -1147,7 +1198,7 @@ def build_online_step_correction_requests(
         if not parsed_actions:
             break
         for action in parsed_actions:
-            if session.stopped:
+            if session.terminated:
                 break
             session.execute(action)
     return requests

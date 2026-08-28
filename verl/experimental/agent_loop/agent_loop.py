@@ -982,7 +982,9 @@ class AgentLoopWorker:
                     "role": "system",
                     "content": (
                         "You are an OPD-MM raw visual inspector. Inspect the provided image directly and "
-                        "return only concise, query-relevant visual facts. Do not invent hidden memory IDs."
+                        "return only concise, query-relevant visual facts. Do not answer the question, decide whether "
+                        "statements conflict, assess correctness, or output a Yes/No verdict. "
+                        "Do not invent hidden memory IDs."
                     ),
                 },
                 {"role": "user", "content": content},
@@ -1170,6 +1172,7 @@ class AgentLoopWorker:
         )
         teacher_tool_schemas = openai_tool_schemas(
             include_inspect_raw=bool(request.get("allow_inspect_raw", True)),
+            available_tool_names=(request.get("observation") or {}).get("available_tools"),
         )
         teacher_prompt_ids = self._encode_opd_mm_teacher_prompt(
             request["teacher_prompt"], tools=teacher_tool_schemas

@@ -20,6 +20,7 @@ import re
 from typing import Any, List, Optional, Protocol
 
 from .models import (
+    EventCandidate,
     EvidenceItem,
     ExecutionResult,
     ExecutionStep,
@@ -270,6 +271,101 @@ class ToolExecutor:
             [merged_by_id[memory_id] for memory_id in fused_ids[: self.max_pool_size]],
             overflow,
         )
+
+    def group_event_candidates(
+        self,
+        records: List[PoolItem],
+        memory_store: HiddenMemoryStore,
+        *,
+        hydrate_turn: bool = True,
+    ) -> List[EventCandidate]:
+        """Group record retrieval results into complete dialogue events.
+
+        Retrieval and indexes remain record based. Once any record from a
+        structured turn is discovered, all records from that same turn are
+        hydrated so text and images cannot be separated by pool truncation or
+        semantic selection.
+        """
+        if not records:
+            return []
+
+        def event_key(item: PoolItem) -> str:
+            key = self._memory_session_turn_key(item.memory)
+            if key is None:
+                return f"record:{item.memory.memory_id}"
+            return f"turn:{key[0]}:{key[1]}"
+
+        hits: dict[str, List[PoolItem]] = {}
+        ordered_keys: list[str] = []
+        for item in records:
+            key = event_key(item)
+            if key not in hits:
+                hits[key] = []
+                ordered_keys.append(key)
+            hits[key].append(item)
+
+        hydrated: dict[str, List[PoolItem]] = {}
+        if hydrate_turn:
+            for item in memory_store.initial_pool():
+                key = event_key(item)
+                if key in hits and not key.startswith("record:"):
+                    hydrated.setdefault(key, []).append(item)
+
+        events: list[EventCandidate] = []
+        for key in ordered_keys:
+            hit_items = hits[key]
+            hit_ids = {hit.memory.memory_id for hit in hit_items}
+            score = max((float(item.score) for item in hit_items), default=0.0)
+            retrieved = any(item.retrieved for item in hit_items)
+            source_items = hydrated.get(key) or hit_items
+            records_by_id = {item.memory.memory_id: item for item in source_items}
+            event_records = [
+                PoolItem(
+                    memory=item.memory,
+                    score=(float(item.score) if item.memory.memory_id in hit_ids else score),
+                    retrieved=(item.retrieved or retrieved),
+                )
+                for item in records_by_id.values()
+            ]
+            event_records.sort(key=lambda value: (value.memory.timestamp, value.memory.memory_id))
+            events.append(EventCandidate(key, event_records, score=score, retrieved=retrieved))
+        return events
+
+    def expand_neighbor_events(
+        self,
+        events: List[EventCandidate],
+        memory_store: HiddenMemoryStore,
+        window: int,
+    ) -> List[EventCandidate]:
+        """Return complete events neighboring the supplied evidence events."""
+        selected_keys: set[tuple[str, int]] = set()
+        score_by_key: dict[tuple[str, int], float] = {}
+        for event in events:
+            for item in event.records:
+                key = self._memory_session_turn_key(item.memory)
+                if key is not None:
+                    selected_keys.add(key)
+                    score_by_key[key] = max(score_by_key.get(key, 0.0), event.score)
+                    break
+        expanded_keys = set(selected_keys)
+        for session_id, turn_index in selected_keys:
+            for distance in range(1, int(window) + 1):
+                expanded_keys.add((session_id, turn_index - distance))
+                expanded_keys.add((session_id, turn_index + distance))
+
+        records: list[PoolItem] = []
+        for item in memory_store.initial_pool():
+            key = self._memory_session_turn_key(item.memory)
+            if key not in expanded_keys:
+                continue
+            records.append(
+                PoolItem(
+                    item.memory,
+                    score=score_by_key.get(key, 0.0),
+                    retrieved=item.retrieved,
+                )
+            )
+        return self.group_event_candidates(records, memory_store, hydrate_turn=True)
 
     def _select_evidence_pool_sync(self, pool: List[PoolItem], query: str) -> List[PoolItem]:
         """Apply an optional synchronous selector in legacy executor paths.
