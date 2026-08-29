@@ -147,3 +147,79 @@ def compute_forward_kl_topk(
         "overlap_count": overlap_count,
         "overlap_token_advantage": overlap_token_advantage,
     }
+
+
+def compute_reverse_kl_topk(
+    student_logits: torch.Tensor,
+    teacher_topk_log_probs: torch.Tensor,
+    teacher_topk_ids: torch.Tensor,
+    config: DistillationConfig,
+    data_format: str,
+) -> dict[str, torch.Tensor]:
+    """Compute reverse KL over teacher top-k tokens plus one tail bucket.
+
+    The teacher API exposes probabilities only for its top-k tokens. Grouping
+    every other vocabulary item into a single tail bucket preserves a proper
+    probability distribution and makes ``KL(student || teacher)`` computable
+    without inventing per-token teacher probabilities outside the top-k set.
+    """
+    assert teacher_topk_log_probs.is_nested and teacher_topk_ids.is_nested
+    teacher_topk_log_probs = teacher_topk_log_probs.values().unsqueeze(0)
+    teacher_topk_ids = teacher_topk_ids.values().unsqueeze(0)
+
+    if get_ulysses_sequence_parallel_world_size() > 1:
+        teacher_topk_log_probs = slice_input_tensor(teacher_topk_log_probs, dim=1)
+        teacher_topk_ids = slice_input_tensor(teacher_topk_ids, dim=1)
+    assert teacher_topk_log_probs.shape[:2] == teacher_topk_ids.shape[:2] == student_logits.shape[:2]
+
+    loss_config: DistillationLossConfig = config.distillation_loss
+    use_chunked_topk = getattr(loss_config, "use_chunked_topk", False)
+    if use_chunked_topk:
+        student_topk_ids = torch.topk(student_logits, k=teacher_topk_ids.shape[-1], dim=-1).indices
+        student_topk_log_probs = _chunked_topk_log_probs(
+            student_logits,
+            teacher_topk_ids,
+            chunk_size=getattr(loss_config, "chunked_topk_chunk_size", 4096),
+        )
+    else:
+        student_log_probs = F.log_softmax(student_logits, dim=-1)
+        student_topk_ids = torch.topk(student_log_probs, k=teacher_topk_ids.shape[-1], dim=-1).indices
+        student_topk_log_probs = torch.gather(student_log_probs, dim=-1, index=teacher_topk_ids)
+
+    student_topk_log_probs = student_topk_log_probs.float()
+    teacher_topk_log_probs = teacher_topk_log_probs.float()
+    student_topk_probs = student_topk_log_probs.exp()
+    teacher_topk_probs = teacher_topk_log_probs.exp()
+    student_mass = student_topk_probs.sum(dim=-1)
+    teacher_mass = teacher_topk_probs.sum(dim=-1)
+
+    student_log_probs_for_loss = student_topk_log_probs
+    teacher_log_probs_for_loss = teacher_topk_log_probs
+    if loss_config.log_prob_min_clamp is not None:
+        student_log_probs_for_loss = student_log_probs_for_loss.clamp_min(loss_config.log_prob_min_clamp)
+        teacher_log_probs_for_loss = teacher_log_probs_for_loss.clamp_min(loss_config.log_prob_min_clamp)
+
+    # The remaining probability mass is the only teacher information
+    # available outside its top-k set, so represent it as one tail outcome.
+    eps = torch.finfo(torch.float32).eps
+    student_tail = (1.0 - student_mass).clamp_min(eps)
+    teacher_tail = (1.0 - teacher_mass).clamp_min(eps)
+    topk_kl = student_topk_probs * (student_log_probs_for_loss - teacher_log_probs_for_loss)
+    tail_kl = student_tail * (student_tail.log() - teacher_tail.log())
+    distillation_losses = topk_kl.sum(dim=-1) + tail_kl
+
+    overlap_mask = (teacher_topk_ids.unsqueeze(-1) == student_topk_ids.unsqueeze(-2)).any(dim=-1)
+    overlap_count = overlap_mask.sum(dim=-1)
+    overlap_token_advantage_sum = (-topk_kl * overlap_mask).sum(dim=-1)
+    overlap_token_advantage = overlap_token_advantage_sum / overlap_count.clamp_min(1)
+    overlap_token_advantage = torch.where(
+        overlap_count > 0, overlap_token_advantage, torch.zeros_like(overlap_token_advantage)
+    )
+
+    return {
+        "distillation_losses": distillation_losses,
+        "student_mass": student_mass,
+        "teacher_mass": teacher_mass,
+        "overlap_count": overlap_count,
+        "overlap_token_advantage": overlap_token_advantage,
+    }

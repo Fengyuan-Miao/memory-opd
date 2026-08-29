@@ -207,10 +207,15 @@ def compute_topk_loss(
         case "fsdp" | "veomni":
             import verl.trainer.distillation.fsdp.losses as fsdp_losses
 
-            distillation_loss_fn = fsdp_losses.compute_forward_kl_topk
+            if distillation_config.distillation_loss.loss_mode == "reverse_kl_topk":
+                distillation_loss_fn = fsdp_losses.compute_reverse_kl_topk
+            else:
+                distillation_loss_fn = fsdp_losses.compute_forward_kl_topk
         case "megatron":
             import verl.trainer.distillation.megatron.losses as megatron_losses
 
+            if distillation_config.distillation_loss.loss_mode == "reverse_kl_topk":
+                raise NotImplementedError("reverse_kl_topk is currently supported by FSDP/VeOmni only")
             distillation_loss_fn = megatron_losses.compute_forward_kl_topk
         case _:
             raise NotImplementedError(f"Unsupported strategy: {config.strategy=}")
@@ -447,7 +452,9 @@ def distillation_loss(
     return distillation_loss, distillation_metrics
 
 
-@register_distillation_loss(DistillationLossSettings(names=["forward_kl_topk"], use_topk=True))  # type: ignore[arg-type]
+@register_distillation_loss(
+    DistillationLossSettings(names=["forward_kl_topk", "reverse_kl_topk"], use_topk=True)
+)  # type: ignore[arg-type]
 def compute_forward_kl_topk(
     config: ActorConfig,
     distillation_config: DistillationConfig,

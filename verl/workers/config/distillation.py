@@ -49,7 +49,8 @@ class DistillationLossConfig(BaseConfig):
         Whether to incorporate distillation loss as a reward, as done
         by https://thinkingmachines.ai/blog/on-policy-distillation/. Recommended to use loss_mode=k1.
         Otherwise, distillation loss is directly backpropagated as a supervised loss,
-        as in https://arxiv.org/abs/2306.13649. Recommended to use loss_mode=k3 or forward_kl_topk.
+        as in https://arxiv.org/abs/2306.13649. Recommended to use loss_mode=k3,
+        forward_kl_topk, or reverse_kl_topk.
     policy_loss_mode (str):
         Name of the policy loss to use when use_policy_gradient is true.
     clip_ratio (float):
@@ -70,7 +71,7 @@ class DistillationLossConfig(BaseConfig):
     log_prob_min_clamp: Optional[float] = -10.0
 
     # Chunked top-K log-probs (opt-in, avoids [B, T, V] log_softmax buffer
-    # at long context). Only consumed by ``loss_mode='forward_kl_topk'``.
+    # at long context). Consumed by the top-k KL loss modes.
     # Default ``False`` to preserve short-context performance (chunked path
     # has ~6x time overhead at N=14K, V=152K). Set ``True`` when hitting OOM
     # at long context (>=64K tokens, V=152K) where the baseline path OOMs.
@@ -109,9 +110,9 @@ class DistillationLossConfig(BaseConfig):
                 f"but got {self.policy_loss_mode}."
             )
 
-        if self.use_policy_gradient and self.loss_mode == "forward_kl_topk":
+        if self.use_policy_gradient and self.loss_mode in {"forward_kl_topk", "reverse_kl_topk"}:
             print(
-                "WARNING: forward_kl_topk is most effective as a supervised distillation loss "
+                f"WARNING: {self.loss_mode} is most effective as a supervised distillation loss "
                 "(use_policy_gradient=False). With policy gradient, the update uses only the sampled"
                 " token's logprob ∇logπ(a), so the top-k distributional signal (how non-sampled logits "
                 "should move) is largely unused."
