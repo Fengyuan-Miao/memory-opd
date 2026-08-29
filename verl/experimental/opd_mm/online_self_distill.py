@@ -401,8 +401,10 @@ def _generic_verifier_reason(*, evidence_sufficient: bool, missing_type: str, ev
         return "Current public evidence appears off-target; collect a more relevant candidate set."
     if missing_type == "missing_factual_support":
         return "Current public evidence is on topic but does not establish the query's requested fact."
+    if missing_type == "incomplete_coverage":
+        return "Current public evidence does not establish complete list or count coverage."
     if missing_type == "insufficient_absence_support":
-        return "Current public evidence needs broader support for absence, conflict, or contradiction."
+        return "Current public evidence needs broader query-grounded search before concluding absence."
     return "Current public evidence is insufficient; retrieve more relevant evidence."
 
 
@@ -775,77 +777,60 @@ def build_state_verifier_prompt(
         if allow_inspect_raw
         else ""
     )
-    return f"""You are the OPD-MM state verifier. Decide whether the public evidence logically supports a correct
-answer to the question. Compare against the private answer silently; never reveal or paraphrase gold-only content.
-A paraphrase or a fact embedded in a longer sentence is sufficient when it entails the answer. Do not require an
-exact answer string, quotation, isolated sentence, repeated speaker name, or special answer formatting.
-For a conflict/contradiction question, the statement in the question is the candidate claim: an explicit
-incompatible value, identity, attribute, or action for the same entity/event supports a Yes (conflict), while
-compatible evidence supports a No. Do not treat an explicit alternative as merely an unmentioned claim, and do not
-infer conflict from absence alone. Treat paired dialogue/image records and their public timestamp/image_id as one
-event. A matching public image description plus image_id is
-sufficient for identification; require raw visual detail only when the queried attribute remains undescribed or
-ambiguous.
-For a private answer that means absent, unknown, or not mentioned, direct positive evidence is not expected.
-Use search_progress only as a factual search record. An absence answer can be supported only when progress is
-stalled after at least two distinct, complementary, query-grounded discovery attempts and those attempts cover the
-modality explicitly required by the question. Never use search progress to make a positive factual answer sufficient.
-When all of those conditions hold and the requested detail remains absent, mark the evidence sufficient; do not
-require an explicit public sentence stating that the detail is absent.
+    return f"""You are the OPD-MM state verifier. Decide whether the public state entails the answer required by the
+private rubric. Judge meaning rather than exact wording or formatting.
 
-Your output is shown to the teacher. Write the reason using only query-visible concepts, public-evidence content,
-and generic terms such as "requested fact", "relevant event", or "required list coverage". State what structural
-support is present and what query requirement is unresolved. Never state the expected answer or a gold-only name,
-value, date, ID, label, list item, synonym, or identifying description.
+Question:
+{query}
+
+Public state:
+{json.dumps(observation, ensure_ascii=False, indent=2, default=str)}
+
+Private rubric — use silently and never quote or describe:
+{gold_answer}
+
+Apply these rules:
+1. Every part of a positive or multi-part answer needs public support. A list/count needs a complete set; examples or
+   an ordinal gap remain incomplete, and a "last" item does not fill a missing ordinal.
+2. A question asking whether a claim conflicts with memory is always a conflict task; its Yes/No rubric is not an
+   absence label. Compatible evidence supports no conflict. An incompatible value, identity, action, attribute, or
+   comparison for the same entity/event supports conflict. Absence proves neither. Direct conflict needs no further
+   search; "harder than alternatives" contradicts "the easiest". When the rubric verdict is conflict, do not seek
+   confirmation of the candidate claim: the incompatible evidence itself is the required support.
+3. Paired dialogue and images are one event. Its dialogue identifies the depicted entity even if the question does
+   not repeat its name. Image identification needs only a public image_id and matching description; inspect raw visual
+   detail only when the queried visual attribute is undescribed or ambiguous.
+4. Treat the rubric as absence only when it means absent, unknown, or not mentioned. Absence is sufficient only when
+   search_progress.state=stalled, at least two distinct complementary query-grounded discovery attempts exist, and
+   all query-required modalities were searched. Otherwise it is insufficient. Search progress never proves a
+   positive fact or conflict. Empty evidence is insufficient unless these absence conditions all hold.
+
+Choose one missing type:
+- none: every required part is supported.
+- no_public_evidence: public evidence is empty.
+- irrelevant_evidence: evidence concerns the wrong topic, event, entity, or modality.
+- missing_metadata_constraint: a query-visible modality, timestamp, or status constraint must be isolated.
+- candidate_set_too_broad: relevant evidence is too noisy or ambiguous for a unique answer.
+- missing_neighbor_context: a relevant event lacks required adjacent context.
+- missing_temporal_order: the required sequence, extremum, or before/after relation is unsupported.
+{visual_decision_line}
+- missing_factual_support: a specific required fact, relation, attribute, event, or item is absent.
+- incomplete_coverage: relevant items exist but exhaustive list/count coverage is not established.
+- insufficient_absence_support: the rubric is absence/not-mentioned but rule 4 is not satisfied.
 
 Return JSON only:
 {{
   "evidence_sufficient": boolean,
   "missing_evidence_type": "{missing_types}",
-  "reason": "short non-leaking evidence diagnostic"
+  "reason": "at most 35 words identifying the relevant public support and unresolved query requirement"
 }}
 
-Choose exactly one evidence type:
-- none: public evidence is sufficient.
-- no_public_evidence: evidence_count is zero.
-- irrelevant_evidence: evidence concerns the wrong answer topic, event, or modality. Never use this type merely
-  because sanitized dialogue says "User" instead of repeating a person name already supplied by the question.
-- missing_metadata_constraint: a query-visible modality, timestamp, or status constraint is not isolated.
-- candidate_set_too_broad: evidence is relevant but too broad/noisy to answer confidently.
-- missing_neighbor_context: a relevant turn appears present but adjacent dialogue/event context is missing.
-- missing_temporal_order: latest/earliest/before/after/order/ranking relation is not supported.
-{visual_decision_line}
-- missing_factual_support: an identifiable query-required entity, relation, attribute, event, or list item is absent.
-- incomplete_coverage: relevant items are present, but evidence cannot establish that a requested list/count is exhaustive.
-- insufficient_absence_support: an absence/not-mentioned answer is expected but search_progress is not stalled after
-  at least two complementary attempts, or the attempts do not cover the query-visible subject and modality. Conflict
-  questions still require evidence that proves or contradicts the stated claim.
-
-Selection rules: choose the most specific applicable type before missing_factual_support. In particular, use
-missing_raw_visual_detail for an unresolved visual attribute of a retrieved image, missing_neighbor_context for a
-missing adjacent turn, and missing_temporal_order for an unresolved sequence or extremum. Use
-missing_metadata_constraint when the question or public state supplies a usable modality, timestamp, or status
-constraint and the complete memory store must be searched for matching records; this remains valid even when the
-matching records are not currently visible. Use candidate_set_too_broad when relevant records are already present
-but the current set is too noisy or broad to answer. Do not use missing_factual_support for either case merely
-because matching records are absent from the current evidence.
-missing_factual_support when a specific required fact or item is absent, including one item in a multi-part answer.
-Use incomplete_coverage only when the unresolved gap is exhaustive list/count coverage rather than an identifiable
-missing item. evidence_count=0 means no_public_evidence. Use irrelevant_evidence when no evidence is on topic. Use
-candidate_set_too_broad only when relevant evidence is present but noise or ambiguity actually prevents a unique
-answer. A true verdict requires type=none; false requires non-none.
-
-User question:
-{query}
-
-Private answer rubric:
-{gold_answer}
-
-Current public evidence state and observations:
-{json.dumps(observation, ensure_ascii=False, indent=2, default=str)}
-
-Final check: query-to-memory speaker attribution is guaranteed by dataset construction. Evaluate factual support,
-not whether sanitized "User" repeats a query-provided name.
+true requires type=none; false requires a non-none type. For an unsupported absence, use no_public_evidence when
+evidence is empty and insufficient_absence_support otherwise; never use that type for another task. Ground the reason
+in the question and public state. Do not mention the private rubric or introduce a missing name, value, date, image ID,
+label, synonym, or description that is absent from the public input; refer to it generically instead. Speaker
+attribution is guaranteed. Final consistency check: direct public contradiction plus a conflict verdict requires
+true/none; a not-mentioned or unknown answer that fails rule 4 requires false with the prescribed absence type.
 """
 
 
@@ -994,6 +979,20 @@ Student output to correct:
 {student_raw_response}
 """
     return f"""You are the OPD-MM action teacher for one student-visible state. Produce exactly one tool action.
+
+Question:
+{query}
+
+Verifier diagnostic:
+{json.dumps(verifier_feedback, ensure_ascii=False, indent=2, default=str)}
+
+Public action history:
+{json.dumps(_action_dicts(history), ensure_ascii=False, indent=2, default=str)}
+
+Current public observation:
+{json.dumps(observation, ensure_ascii=False, indent=2, default=str)}
+{student_output_section}
+
 Apply this gate before considering the question modality or any tool description:
 - evidence_sufficient=true and no observation error: output STOP immediately. Every non-STOP tool is invalid.
 - evidence_sufficient=false: choose one non-STOP tool that addresses the diagnosed gap.
@@ -1008,19 +1007,6 @@ identical action when the latest observation is unchanged, and never invent an a
 state. Discovery results are automatically screened for answer relevance before becoming public evidence.
 Emit exactly one function call with no reasoning, markdown, JSON, hidden memory IDs, or unknown arguments. The chat
 template supplies the tool descriptions and serialization.
-
-Question:
-{query}
-
-Verifier diagnostic:
-{json.dumps(verifier_feedback, ensure_ascii=False, indent=2, default=str)}
-
-Public action history:
-{json.dumps(_action_dicts(history), ensure_ascii=False, indent=2, default=str)}
-
-Current public observation:
-{json.dumps(observation, ensure_ascii=False, indent=2, default=str)}
-{student_output_section}
 
 Output the corrected action now. Begin with <tool_call> and include nothing else.
 """

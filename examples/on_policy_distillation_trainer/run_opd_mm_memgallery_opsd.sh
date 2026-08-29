@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Mem-Gallery (~757 train + fixed 100 held-out) | pure online privileged distillation.
+# Mem-Gallery (1239 teacher-success train) | pure online privileged distillation.
 #
 # Portable 6-GPU layout:
 #   GPUs 0-2: 4B student and query encoders
@@ -48,8 +48,14 @@ done
 
 DATASET_ROOT=${DATASET_ROOT:-$REPO_ROOT/dataset/mem_gallery}
 STORE_DIR=${STORE_DIR:-$DATASET_ROOT/opd_mm_store}
-BASE_SPLIT_DIR=${BASE_SPLIT_DIR:-$STORE_DIR/subsets/balanced_train_cap2}
-SPLIT_DIR=${SPLIT_DIR:-$STORE_DIR/subsets/balanced_opsd_cap5_holdout100}
+SUBSET_NAME=${SUBSET_NAME:-teacher_success_full_minus_heldout100_20260828}
+SPLIT_DIR=${SPLIT_DIR:-$STORE_DIR/subsets/$SUBSET_NAME}
+MEMGALLERY_HELDOUT_DIR=${MEMGALLERY_HELDOUT_DIR:-$STORE_DIR/subsets/balanced_grpo_cap4_holdout100}
+MMEM_DATASET_ROOT=${MMEM_DATASET_ROOT:-$REPO_ROOT/dataset/mmem/data/batches/validated21_final}
+MMEM_STORE_DIR=${MMEM_STORE_DIR:-$MMEM_DATASET_ROOT/opd_mm_store}
+MMEM_HELDOUT_DIR=${MMEM_HELDOUT_DIR:-$MMEM_STORE_DIR/subsets/grpo_holdout100_20260813}
+MEMGALLERY_VAL_PARQUET=${MEMGALLERY_VAL_PARQUET:-$MMEM_HELDOUT_DIR/heldout_memgallery_val.parquet}
+MMEM_VAL_PARQUET=${MMEM_VAL_PARQUET:-$MMEM_HELDOUT_DIR/heldout_mmem_val.parquet}
 
 # Reuse the exact Mem-Gallery store and three indexes used by the existing
 # evaluation pipeline. They are dataset artifacts, not per-experiment outputs.
@@ -68,35 +74,22 @@ for required_path in \
     fi
 done
 
-# Recreate the earlier deterministic holdout: first build the cap-2 base, then
-# reserve 100 non-base examples and extend each scenario/type cell to cap 5.
-# This produces 757 training QAs with the current Mem-Gallery release.
-if [[ ! -s "$BASE_SPLIT_DIR/train_sample_ids.txt" ]]; then
-    PYTHONPATH="$REPO_ROOT${PYTHONPATH:+:$PYTHONPATH}" \
-        python3 examples/data_preprocess/build_mem_gallery_opd_mm_train_subset.py \
-        --dataset-root "$DATASET_ROOT" \
-        --output-dir "$BASE_SPLIT_DIR" \
-        --per-cell-cap 2 \
-        --seed 20260705 \
-        --skip-rlhf
-fi
-
-if [[ ! -s "$SPLIT_DIR/train.parquet" || ! -s "$SPLIT_DIR/heldout_qas.jsonl" ]]; then
-    PYTHONPATH="$REPO_ROOT${PYTHONPATH:+:$PYTHONPATH}" \
-        python3 examples/data_preprocess/build_mem_gallery_opd_mm_train_subset.py \
-        --dataset-root "$DATASET_ROOT" \
-        --output-dir "$SPLIT_DIR" \
-        --per-cell-cap 5 \
-        --seed 20260713 \
-        --base-sample-ids "$BASE_SPLIT_DIR/train_sample_ids.txt" \
-        --reserve-eval-samples 100 \
-        --reserve-eval-seed 20260705 \
-        --data-source opd_mm
+# Download the teacher-success split when the base Mem-Gallery dataset is
+# present but the filtered training artifact has not been fetched yet.
+if [[ ! -s "$SPLIT_DIR/train.parquet" ]]; then
+    DATASET_ROOT="$DATASET_ROOT" SUBSET_NAME="$SUBSET_NAME" \
+        bash "$REPO_ROOT/scripts/download_mem_gallery_subset.sh"
 fi
 
 for required_path in \
     "$SPLIT_DIR/train.parquet" \
-    "$SPLIT_DIR/heldout_qas.jsonl" \
+    "$MEMGALLERY_HELDOUT_DIR/heldout_qas.jsonl" \
+    "$MEMGALLERY_VAL_PARQUET" \
+    "$MMEM_VAL_PARQUET" \
+    "$MMEM_STORE_DIR/records.jsonl" \
+    "$MMEM_STORE_DIR/indexes/dense/embeddings.npy" \
+    "$MMEM_STORE_DIR/indexes/vision/embeddings.npy" \
+    "$MMEM_STORE_DIR/indexes/hybrid/embeddings.npy" \
     "$STORE_DIR/indexes/dense/embeddings.npy" \
     "$STORE_DIR/indexes/vision/embeddings.npy" \
     "$STORE_DIR/indexes/hybrid/embeddings.npy"; do
@@ -110,9 +103,9 @@ export DATA_DIR="$SPLIT_DIR"
 export OPD_MM_DATASET_ROOT="$DATASET_ROOT"
 export OPD_MM_VECTOR_STORE_DIR="$STORE_DIR"
 export OPD_MM_TRAIN_FILES="['$SPLIT_DIR/train.parquet']"
-export OPD_MM_HELDOUT_QAS="$SPLIT_DIR/heldout_qas.jsonl"
-export OPD_MM_VAL_PARQUET="$SPLIT_DIR/heldout_opsd_eval.parquet"
-export OPD_MM_VAL_FILES="['$OPD_MM_VAL_PARQUET']"
+export OPD_MM_HELDOUT_QAS="$MEMGALLERY_HELDOUT_DIR/heldout_qas.jsonl"
+export OPD_MM_VAL_PARQUET="$MEMGALLERY_VAL_PARQUET"
+export OPD_MM_VAL_FILES="['$MEMGALLERY_VAL_PARQUET','$MMEM_VAL_PARQUET']"
 
 # Ray sees GPUs 0-3: three student workers and one frozen-teacher worker.
 # The local 9B service is launched separately on physical GPUs 4-5.
@@ -173,7 +166,7 @@ export WANDB_CONSOLE=${WANDB_CONSOLE:-wrap}
 export WANDB_VAL_CASES=${WANDB_VAL_CASES:-0}
 export WANDB_VAL_ACTIONS_ONLY=${WANDB_VAL_ACTIONS_ONLY:-True}
 export PROJECT_NAME=${PROJECT_NAME:-verl_opsd_opd_mm_memgallery}
-export EXPERIMENT_NAME=${EXPERIMENT_NAME:-opd_mm_qwen35_4b_memgallery_cap5_pure_opsd_$(date +%Y%m%d_%H%M%S)}
+export EXPERIMENT_NAME=${EXPERIMENT_NAME:-opd_mm_qwen35_4b_memgallery_teacher_success1239_pure_opsd_$(date +%Y%m%d_%H%M%S)}
 export RAY_TMP_ROOT=${RAY_TMP_ROOT:-/tmp/verl_ray_$(id -u)}
 
 if (( TRAIN_BATCH_SIZE % AGENT_LOOP_NUM_WORKERS != 0 )); then
