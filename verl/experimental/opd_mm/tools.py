@@ -270,14 +270,56 @@ def _resolve_dataset_asset_path(value: Any) -> Any:
     path = Path(str(value)).expanduser()
     if path.exists() or not path.is_absolute():
         return str(path)
-    dataset_root = os.getenv("OPD_MM_DATASET_ROOT")
-    if not dataset_root:
-        return str(path)
-    root = Path(dataset_root).expanduser()
     parts = path.parts
-    for marker in ("image", "dialog"):
-        if marker in parts:
-            return str(root.joinpath(*parts[parts.index(marker) :]))
+    candidates: list[Path] = []
+
+    # Prefer the same repository-relative dataset path. This handles mixed
+    # validation batches (for example Mem-Gallery plus MMem) without rebasing
+    # every serialized path onto whichever dataset happens to be the training
+    # root.
+    if "dataset" in parts:
+        dataset_index = parts.index("dataset")
+        repository_root = Path(__file__).resolve().parents[3]
+        candidates.append(repository_root.joinpath(*parts[dataset_index:]))
+
+    configured_roots: list[Path] = []
+    raw_roots = os.getenv("OPD_MM_DATASET_ROOTS", "")
+    if raw_roots:
+        configured_roots.extend(
+            Path(item).expanduser() for item in raw_roots.split(os.pathsep) if item
+        )
+    dataset_root = os.getenv("OPD_MM_DATASET_ROOT")
+    if dataset_root:
+        configured_roots.append(Path(dataset_root).expanduser())
+
+    for root in configured_roots:
+        # Preserve the complete suffix below the configured dataset directory,
+        # including an intermediate ``data`` component when one exists.
+        root_name = root.name
+        if root_name in parts:
+            root_index = len(parts) - 1 - tuple(reversed(parts)).index(root_name)
+            candidates.append(root.joinpath(*parts[root_index + 1 :]))
+        for marker in ("image", "dialog"):
+            if marker not in parts:
+                continue
+            marker_index = parts.index(marker)
+            suffix = parts[marker_index:]
+            candidates.append(root.joinpath(*suffix))
+            if root.name != "data":
+                candidates.append(root.joinpath("data", *suffix))
+
+    seen: set[str] = set()
+    for candidate in candidates:
+        normalized = str(candidate)
+        if normalized in seen:
+            continue
+        seen.add(normalized)
+        if candidate.exists():
+            return normalized
+
+    # Keep the original path when no verified local replacement exists. This
+    # preserves a useful error instead of manufacturing a plausible-looking
+    # but invalid path.
     return str(path)
 
 

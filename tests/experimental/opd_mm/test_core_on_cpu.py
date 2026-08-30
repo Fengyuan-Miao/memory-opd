@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import base64
 import json
+import os
 from dataclasses import dataclass, field
 from types import SimpleNamespace
 from typing import Any
@@ -72,6 +73,7 @@ from verl.experimental.opd_mm.tools import (
     OPDInspectEvidenceImageTool,
     OPDRetrieveTool,
     OPDStopTool,
+    _resolve_dataset_asset_path,
     hidden_store_from_records,
     openai_tool_schemas,
 )
@@ -81,6 +83,34 @@ from verl.tools.schemas import ToolResponse
 from verl.utils import tensordict_utils as tu
 from verl.tools.tool_registry import load_all_tools
 from verl.workers.config import ActorConfig, DistillationConfig
+
+
+def test_dataset_asset_path_preserves_data_directory(monkeypatch: pytest.MonkeyPatch, tmp_path: Any) -> None:
+    dataset_root = tmp_path / "mem_gallery"
+    local_image = dataset_root / "data" / "image" / "scenario" / "sample.jpg"
+    local_image.parent.mkdir(parents=True)
+    local_image.touch()
+    monkeypatch.setenv("OPD_MM_DATASET_ROOT", str(dataset_root))
+    monkeypatch.delenv("OPD_MM_DATASET_ROOTS", raising=False)
+
+    serialized = "/old/checkout/dataset/mem_gallery/data/image/scenario/sample.jpg"
+    assert _resolve_dataset_asset_path(serialized) == str(local_image)
+
+
+def test_dataset_asset_path_supports_mixed_dataset_roots(monkeypatch: pytest.MonkeyPatch, tmp_path: Any) -> None:
+    mem_gallery_root = tmp_path / "mem_gallery"
+    mmem_root = tmp_path / "validated21_final"
+    local_image = mmem_root / "image" / "scenario" / "sample.jpg"
+    local_image.parent.mkdir(parents=True)
+    local_image.touch()
+    monkeypatch.setenv("OPD_MM_DATASET_ROOT", str(mem_gallery_root))
+    monkeypatch.setenv(
+        "OPD_MM_DATASET_ROOTS",
+        os.pathsep.join((str(mem_gallery_root), str(mmem_root))),
+    )
+
+    serialized = "/old/checkout/dataset/mmem/data/batches/validated21_final/image/scenario/sample.jpg"
+    assert _resolve_dataset_asset_path(serialized) == str(local_image)
 
 
 def test_kl_credit_response_rows_are_tail_aligned_after_multimodal_prefix_processing() -> None:
