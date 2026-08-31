@@ -121,10 +121,11 @@ ppo_max_token_len_per_gpu=${PPO_MAX_TOKEN_LEN_PER_GPU:-$(((max_prompt_length + m
 actor_use_torch_compile=${ACTOR_USE_TORCH_COMPILE:-False}
 actor_activation_offload=${ACTOR_ACTIVATION_OFFLOAD:-False}
 distill_chunk_size=${DISTILL_CHUNK_SIZE:-256}
-actor_lr=${ACTOR_LR:-5e-7}
+actor_lr=${ACTOR_LR:-2e-7}
 actor_adamw_foreach=${ACTOR_ADAMW_FOREACH:-false}
 entropy_coeff=${ENTROPY_COEFF:-0.0}
-use_reference_kl=${USE_REFERENCE_KL:-False}
+actor_loss_agg_mode=${ACTOR_LOSS_AGG_MODE:-seq-mean-token-mean}
+use_reference_kl=${USE_REFERENCE_KL:-True}
 reference_kl_coef=${REFERENCE_KL_COEF:-0.005}
 rollout_tp=${ROLLOUT_TP:-2}
 rollout_gpu_mem_util=${ROLLOUT_GPU_MEM_UTIL:-0.4}
@@ -138,6 +139,7 @@ val_temperature=${VAL_TEMPERATURE:-$rollout_temperature}
 val_top_p=${VAL_TOP_P:-$rollout_top_p}
 val_top_k=${VAL_TOP_K:--1}
 val_n=${VAL_N:-1}
+val_before_train=${VAL_BEFORE_TRAIN:-False}
 total_epochs=${TOTAL_EPOCHS:-3}
 save_freq=${SAVE_FREQ:-25}
 test_freq=${TEST_FREQ:--1}
@@ -148,7 +150,7 @@ MAX_ACTION_PENALTY=${MAX_ACTION_PENALTY:-0.1}
 ERROR_PENALTY=${ERROR_PENALTY:-0.1}
 NON_STOP_PENALTY=${NON_STOP_PENALTY:-0.1}
 EMPTY_EVIDENCE_PENALTY=${EMPTY_EVIDENCE_PENALTY:-0.1}
-EVIDENCE_ANSWERABLE_WEIGHT=${EVIDENCE_ANSWERABLE_WEIGHT:-0.2}
+EVIDENCE_ANSWERABLE_WEIGHT=${EVIDENCE_ANSWERABLE_WEIGHT:-0.0}
 EFFICIENCY_ACTION_FREE=${EFFICIENCY_ACTION_FREE:-3}
 EFFICIENCY_ACTION_PENALTY=${EFFICIENCY_ACTION_PENALTY:-0.01}
 EFFICIENCY_EVIDENCE_FREE=${EFFICIENCY_EVIDENCE_FREE:-16}
@@ -235,6 +237,11 @@ case "${START_OUTCOME_SERVER,,}" in
             --max-model-len "$OUTCOME_SERVER_MAX_MODEL_LEN" \
             --max-num-seqs "$OUTCOME_SERVER_MAX_NUM_SEQS" \
             --max-num-batched-tokens "$OUTCOME_SERVER_MAX_NUM_BATCHED_TOKENS" \
+            --enable-chunked-prefill \
+            --disable-custom-all-reduce \
+            --limit-mm-per-prompt '{"image":2}' \
+            --enable-auto-tool-choice \
+            --tool-call-parser qwen3_coder \
             --trust-remote-code \
             >"$OUTCOME_SERVER_LOG" 2>&1 &
         outcome_server_pid=$!
@@ -284,8 +291,11 @@ echo "ACTOR_SP_SIZE=${actor_sp_size}"
 echo "PPO_MAX_TOKEN_LEN_PER_GPU=${ppo_max_token_len_per_gpu}"
 echo "DISTILL_CHUNK_SIZE=${distill_chunk_size}"
 echo "ACTOR_ADAMW_FOREACH=${actor_adamw_foreach}"
+echo "ACTOR_LR=${actor_lr}"
+echo "ACTOR_LOSS_AGG_MODE=${actor_loss_agg_mode}"
 echo "ROLLOUT_N=${rollout_n}"
 echo "VAL_BATCH_SIZE=${val_batch_size}"
+echo "VAL_BEFORE_TRAIN=${val_before_train}"
 echo "TEST_FREQ=${test_freq}"
 echo "SAVE_FREQ=${save_freq}"
 echo "EVIDENCE_ANSWERABLE_WEIGHT=${EVIDENCE_ANSWERABLE_WEIGHT}"
@@ -346,6 +356,7 @@ ACTOR=(
     actor_rollout_ref.actor.ppo_mini_batch_size=${ppo_mini_batch_size}
     actor_rollout_ref.actor.use_dynamic_bsz=True
     actor_rollout_ref.actor.ppo_max_token_len_per_gpu=${ppo_max_token_len_per_gpu}
+    actor_rollout_ref.actor.loss_agg_mode=${actor_loss_agg_mode}
     actor_rollout_ref.actor.use_kl_loss=${use_reference_kl}
     actor_rollout_ref.actor.kl_loss_coef=${reference_kl_coef}
     actor_rollout_ref.actor.kl_loss_type=low_var_kl
@@ -395,7 +406,7 @@ TRAINER=(
     trainer.experiment_name=${experiment_name}
     trainer.n_gpus_per_node=${NGPUS_PER_NODE}
     trainer.nnodes=${NNODES}
-    trainer.val_before_train=False
+    trainer.val_before_train=${val_before_train}
     trainer.save_freq=${save_freq}
     trainer.test_freq=${test_freq}
     trainer.total_epochs=${total_epochs}

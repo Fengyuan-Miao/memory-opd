@@ -70,7 +70,7 @@ def test_outcome_reward_generates_answer_before_gold_aware_judge(tmp_path, monke
         )
     )
 
-    assert result["score"] == 1.2
+    assert result["score"] == 1.0
     assert result["opd_mm/answer_correct"] == 1.0
     assert result["opd_mm/evidence_answerable"] == 1.0
     assert result["opd_mm/outcome_evaluated"] == 1.0
@@ -85,7 +85,9 @@ def test_outcome_reward_generates_answer_before_gold_aware_judge(tmp_path, monke
     assert "Not mentioned and No are distinct" in answer_prompt
     assert "No requires an explicit negative statement" in answer_prompt
     assert "a nearby action is not a cause" in answer_prompt
-    assert "person, conversation, dialogue, or record mentioned" in answer_prompt
+    assert "Public search progress" not in answer_prompt
+    assert "search_progress" not in answer_prompt
+    assert "do not infer Not mentioned or No merely from absence" in answer_prompt
     assert "explicit incompatible alternative" in answer_prompt
     assert "It was red." in judge_prompt
     assert "The bicycle was red." in judge_prompt
@@ -393,7 +395,7 @@ def test_outcome_reward_applies_only_bounded_trajectory_penalties(monkeypatch) -
         )
     )
 
-    assert result["score"] == pytest.approx(1.08)
+    assert result["score"] == pytest.approx(0.88)
     assert result["opd_mm/repeated_actions"] == 1.0
     assert result["opd_mm/max_actions_reached"] == 1.0
 
@@ -422,7 +424,7 @@ def test_outcome_judge_recovers_unambiguous_boolean_from_truncated_json(monkeypa
         )
     )
 
-    assert result["score"] == 1.2
+    assert result["score"] == 1.0
     assert result["opd_mm/answer_correct"] == 1.0
     assert result["opd_mm/outcome_evaluated"] == 1.0
     assert result["opd_mm/judge_parse_recovered"] == 1.0
@@ -525,11 +527,11 @@ def test_outcome_dump_failure_does_not_fail_reward(tmp_path, monkeypatch) -> Non
         )
     )
 
-    assert result["score"] == 1.2
+    assert result["score"] == 1.0
     assert result["opd_mm/answer_correct"] == 1.0
 
 
-def test_evidence_answerable_and_efficiency_reward_are_conditional(monkeypatch) -> None:
+def test_evidence_answerable_is_diagnostic_only_by_default(monkeypatch) -> None:
     async def fake_chat_completion(**kwargs: Any) -> str:
         kind = _request_kind(kwargs)
         if kind == "answer":
@@ -555,8 +557,8 @@ def test_evidence_answerable_and_efficiency_reward_are_conditional(monkeypatch) 
     assert result["opd_mm/evidence_answerable"] == 1.0
     assert result["opd_mm/action_over_budget"] == 2.0
     assert result["opd_mm/evidence_over_budget"] == 4.0
-    assert result["opd_mm/efficiency_penalty"] == pytest.approx(0.04)
-    assert result["score"] == pytest.approx(0.16)
+    assert result["opd_mm/efficiency_penalty"] == 0.0
+    assert result["score"] == 0.0
 
 
 def test_opsd_reward_skips_outcome_calls_for_training(monkeypatch) -> None:

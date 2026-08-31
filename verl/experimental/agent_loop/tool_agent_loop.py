@@ -49,6 +49,7 @@ SPEC_DECODE_EXTRA_KEYS = (
 
 TOOL_CALL_XML_RE = re.compile(r"<tool_call>.*?</tool_call>", re.DOTALL)
 TOOL_CALL_PAYLOAD_RE = re.compile(r"<tool_call>(.*?)</tool_call>", re.DOTALL)
+_GENERATION_END_MARKERS = ("<|im_end|>", "<|endoftext|>")
 
 
 def _last_user_text(messages: list[dict[str, Any]]) -> str:
@@ -118,6 +119,29 @@ def _parse_opd_mm_student_action(
     if not _is_legal_opd_mm_action(action, allow_inspect_raw="inspect_evidence_image" in active_tools):
         return action, "invalid_tool_arguments"
     return action, ""
+
+
+def _validate_opd_mm_tool_call_serialization(response_text: str) -> str:
+    """Reject truncated XML and non-protocol text around an OPD-MM tool call."""
+    text = str(response_text or "").strip()
+    removed_marker = True
+    while removed_marker:
+        removed_marker = False
+        for marker in _GENERATION_END_MARKERS:
+            if text.endswith(marker):
+                text = text[: -len(marker)].rstrip()
+                removed_marker = True
+
+    matches = list(TOOL_CALL_XML_RE.finditer(text))
+    if not matches:
+        # Preserve the parser's existing missing_tool_call diagnostic for plain
+        # text, while distinguishing a truncated serialized tool call.
+        return "incomplete_tool_call_xml" if "<tool_call" in text else ""
+    if len(matches) != 1:
+        return "multiple_serialized_tool_calls"
+    if matches[0].span() != (0, len(text)):
+        return "unexpected_text_outside_tool_call"
+    return ""
 
 
 def _mark_opd_mm_invalid_termination(agent_data: "AgentData", reason: str) -> None:
@@ -605,10 +629,15 @@ class ToolAgentLoop(AgentLoopBase):
         agent_data.last_assistant_content = assistant_content or ""
         opd_runtime = (agent_data.tools_kwargs or {}).get("opd_mm")
         is_opd_mm = isinstance(opd_runtime, dict)
-        student_next_action, invalid_action_reason = _parse_opd_mm_student_action(
+        student_next_action, parser_error = _parse_opd_mm_student_action(
             agent_data.tool_calls,
             active_tools,
         )
+        serialization_error = ""
+        if is_opd_mm:
+            response_text = self.tokenizer.decode(agent_data.response_ids, skip_special_tokens=False)
+            serialization_error = _validate_opd_mm_tool_call_serialization(response_text)
+        invalid_action_reason = serialization_error or parser_error
         legal_student_action = not invalid_action_reason
         tool_call_mask = build_tool_call_xml_span_mask(self.tokenizer, agent_data.response_ids)
         if is_opd_mm and not legal_student_action:

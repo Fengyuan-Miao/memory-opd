@@ -29,7 +29,12 @@ from tensordict import TensorDict
 import verl.trainer.distillation.losses as distillation_losses
 from verl import DataProto
 from verl.experimental.agent_loop.agent_loop import AgentLoopWorker
-from verl.experimental.agent_loop.tool_agent_loop import AgentState, ToolAgentLoop, _parse_opd_mm_student_action
+from verl.experimental.agent_loop.tool_agent_loop import (
+    AgentState,
+    ToolAgentLoop,
+    _parse_opd_mm_student_action,
+    _validate_opd_mm_tool_call_serialization,
+)
 from verl.experimental.agent_loop.tool_parser import FunctionCall
 from verl.experimental.opd_mm import (
     MemoryRecord,
@@ -2081,6 +2086,21 @@ def test_opd_student_action_rejects_mis_cased_tool_name_without_losing_arguments
 
     assert action == {"tool": "RETRIEVE", "method": "bm25", "top_k": 5}
     assert reason == "unknown_or_mis_cased_tool:RETRIEVE"
+
+
+def test_opd_tool_call_serialization_rejects_truncation_and_trailing_garbage() -> None:
+    valid = (
+        '<tool_call>\n<function=retrieve>\n<parameter=method>\nbm25\n</parameter>\n'
+        '<parameter=top_k>\n5\n</parameter>\n</function>\n</tool_call>'
+    )
+
+    assert _validate_opd_mm_tool_call_serialization(valid + "<|im_end|>") == ""
+    assert _validate_opd_mm_tool_call_serialization(valid[:-12]) == "incomplete_tool_call_xml"
+    assert _validate_opd_mm_tool_call_serialization(valid + "</div>") == "unexpected_text_outside_tool_call"
+    assert (
+        _validate_opd_mm_tool_call_serialization(valid + valid + "<|im_end|>")
+        == "multiple_serialized_tool_calls"
+    )
 
 
 @pytest.mark.asyncio

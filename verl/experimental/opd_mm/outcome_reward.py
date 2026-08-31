@@ -390,12 +390,10 @@ def _parse_answerable_with_recovery(
 def _answer_messages(
     query: str,
     evidence: list[Any],
-    search_progress: dict[str, Any] | None = None,
     point: str | None = None,
     question_image: str | None = None,
 ) -> list[dict[str, Any]]:
     evidence_json = json.dumps(evidence, ensure_ascii=False, separators=(",", ":"), default=str)
-    progress_json = json.dumps(search_progress or {}, ensure_ascii=False, separators=(",", ":"), default=str)
     is_conflict_query = _is_cd_question(query, point)
     if is_conflict_query:
         messages: list[dict[str, Any]] = [
@@ -408,10 +406,7 @@ def _answer_messages(
             },
             {
                 "role": "user",
-                "content": (
-                    f"Question:\n{query}\n\nPublic evidence:\n{evidence_json}\n\n"
-                    f"Public search progress:\n{progress_json}"
-                ),
+                "content": f"Question:\n{query}\n\nPublic evidence:\n{evidence_json}",
             },
         ]
         image_url = _image_data_url(question_image)
@@ -421,13 +416,6 @@ def _answer_messages(
                 {"type": "image_url", "image_url": {"url": image_url}},
             ]
         return messages
-    stalled_absence_contract = ""
-    if not is_conflict_query and str((search_progress or {}).get("state") or "") == "stalled":
-        stalled_absence_contract = (
-            "Search is stalled. If the exact requested proposition is neither explicitly affirmed nor explicitly "
-            "negated in evidence, return exactly Not mentioned. Related concepts, a different object type, and a "
-            "future intention do not establish the requested proposition or its negation. "
-        )
     messages = [
         {
             "role": "system",
@@ -437,13 +425,10 @@ def _answer_messages(
                 "INSUFFICIENT_EVIDENCE. Never guess an unstated exact name, value, date, cause, or capability from a "
                 "related fact; a nearby action is not a cause unless evidence explicitly links them. Not mentioned and "
                 "No are distinct: No requires an explicit negative statement, and missing information never supports "
-                "No. When asked whether a person, conversation, dialogue, or record mentioned, stated, or provided "
-                "information, return exactly Not mentioned only when search_progress is stalled after multiple "
-                "complementary searches that cover the requested modality and the detail remains absent. For other "
-                "unsupported yes/no questions, "
-                "use INSUFFICIENT_EVIDENCE. Ignore unrelated evidence and return only the final answer. "
-                + stalled_absence_contract
-                + "An explicit incompatible alternative for the same entity/event is a conflict rather than missing "
+                "No. If the supplied evidence does not state the requested information, return exactly "
+                "INSUFFICIENT_EVIDENCE; do not infer Not mentioned or No merely from absence in this evidence. "
+                "Ignore unrelated evidence and return only the final answer. "
+                "An explicit incompatible alternative for the same entity/event is a conflict rather than missing "
                 "information; absence alone is not a conflict. "
                 "Do not substitute a nearby entity, object type, event, or capability for the one asked about, and "
                 "do not turn a plausible implication into a stated fact. A future intention does not prove that a "
@@ -457,10 +442,7 @@ def _answer_messages(
         },
         {
             "role": "user",
-            "content": (
-                f"Question:\n{query}\n\nPublic evidence:\n{evidence_json}\n\n"
-                f"Public search progress:\n{progress_json}"
-            ),
+            "content": f"Question:\n{query}\n\nPublic evidence:\n{evidence_json}",
         },
     ]
     image_url = _image_data_url(question_image)
@@ -728,7 +710,7 @@ async def compute_outcome_score(
     error_penalty: float = 0.1,
     non_stop_penalty: float = 0.1,
     empty_evidence_penalty: float = 0.1,
-    evidence_answerable_weight: float = 0.2,
+    evidence_answerable_weight: float = 0.0,
     efficiency_action_free: int = 3,
     efficiency_action_penalty: float = 0.01,
     efficiency_evidence_free: int = 16,
@@ -809,7 +791,12 @@ async def compute_outcome_score(
             _chat_completion(
                 base_url=outcome_url,
                 model=outcome_model,
-                messages=_answer_messages(query, evidence, search_progress, point, question_image),
+                messages=_answer_messages(
+                    query,
+                    evidence,
+                    point=point,
+                    question_image=question_image,
+                ),
                 api_key=outcome_api_key,
                 timeout=float(timeout),
                 max_tokens=int(answer_max_tokens),
@@ -922,7 +909,10 @@ async def compute_outcome_score(
     action_count = len(trace)
     action_over_budget = max(0, action_count - max(0, int(efficiency_action_free)))
     evidence_over_budget = max(0, len(evidence) - max(0, int(efficiency_evidence_free)))
-    efficiency_eligible = bool(correct or evidence_answerable)
+    # Evidence sufficiency remains a diagnostic metric. An incorrect answer
+    # must not become eligible for efficiency shaping merely because the
+    # evidence judge considers the state answerable.
+    efficiency_eligible = bool(correct)
     efficiency_penalty = 0.0
     if efficiency_eligible:
         efficiency_penalty = (
