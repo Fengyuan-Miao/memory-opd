@@ -1419,6 +1419,24 @@ class RayPPOTrainer:
             if opd_mm_sft_batch is not None:
                 batch = opd_mm_sft_batch
                 opd_mm_sft_examples = len(batch)
+            elif str(os.getenv("OPD_MM_ONLINE_SUPERVISION_MODE") or "").strip().lower() in {
+                "correction_sft",
+                "sft",
+            }:
+                # Invalid/missing teacher XML is deliberately discarded. If a
+                # whole online-SFT batch has no valid correction, skip this
+                # actor update instead of falling through to the generic
+                # distillation path with no teacher distribution.
+                return DataProto.from_single_dict(
+                    data={},
+                    meta_info={
+                        "metrics": {
+                            "actor/opd_mm_sft_examples": 0.0,
+                            "actor/opd_mm_sft_update_skipped": 1.0,
+                            "perf/mfu/actor": 0.0,
+                        }
+                    },
+                )
         if (
             not (opd_mm_kl_credit_enabled or opd_mm_state_opsd_enabled)
             and not opd_mm_sft_examples
@@ -1632,7 +1650,7 @@ class RayPPOTrainer:
 
         A uid group with at least one answer-correct rollout contributes only
         GRPO loss. A group with no answer-correct rollout contributes only
-        forward-KL distillation. ``grpo_action_selection=top_kl`` restricts
+        sampled-token reverse-KL distillation. ``grpo_action_selection=top_kl`` restricts
         both objectives to the highest-KL structured-disagreement actions;
         ``all_states`` makes successful groups use ordinary GRPO on every
         visited student state while retaining privileged distillation only for
@@ -1838,10 +1856,7 @@ class RayPPOTrainer:
                 if not isinstance(prompt_ids, list) or not prompt_ids or len(sampled_ids) > response_width:
                     raise RuntimeError("OPD-MM KL credit state has an empty or overlong prompt/response")
                 if not isinstance(rollout_logprobs, list) or len(rollout_logprobs) != len(sampled_ids):
-                    if pure_state_opsd:
-                        rollout_logprobs = [0.0] * len(sampled_ids)
-                    else:
-                        raise RuntimeError("OPD-MM KL credit state has unaligned rollout log-probabilities")
+                    raise RuntimeError("OPD-MM KL credit state has unaligned rollout log-probabilities")
                 if not all(isinstance(row, list) for row in teacher_ids + teacher_logprobs):
                     raise RuntimeError("OPD-MM KL credit state has non-list teacher top-k rows")
                 topk_widths = {len(row) for row in teacher_ids + teacher_logprobs}

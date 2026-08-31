@@ -1024,6 +1024,7 @@ def build_online_state_correction_request(
     tool_format: str = "qwen3_coder",
     request_id: str = "",
     student_response_ids: list[int] | None = None,
+    student_response_logprobs: list[float] | None = None,
     student_tool_call_mask: list[int] | None = None,
 ) -> dict[str, Any] | None:
     """Build one correction request from the live student-visible state.
@@ -1071,6 +1072,7 @@ def build_online_state_correction_request(
         "student_raw_response": str(student_raw_response or ""),
         "student_prompt_ids": [int(token) for token in student_prompt_ids],
         "student_response_ids": [int(token) for token in (student_response_ids or [])],
+        "student_response_logprobs": [float(value) for value in (student_response_logprobs or [])],
         "student_tool_call_mask": [int(bool(value)) for value in (student_tool_call_mask or [])],
         "verifier_prompt": build_state_verifier_prompt(
             query=query,

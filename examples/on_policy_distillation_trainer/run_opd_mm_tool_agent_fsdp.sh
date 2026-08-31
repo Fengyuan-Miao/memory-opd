@@ -53,7 +53,7 @@ TEACHER_NGPUS=${TEACHER_NGPUS:-2}
 
 distillation_loss_mode=${DISTILLATION_LOSS_MODE:-k1}
 use_policy_gradient=${USE_POLICY_GRADIENT:-True}
-distillation_topk=${DISTILLATION_TOPK:-50}
+distillation_topk=${DISTILLATION_TOPK:-1}
 
 per_gpu_batch_size=${PER_GPU_BATCH_SIZE:-8}
 train_batch_size=${TRAIN_BATCH_SIZE:-$(( NGPUS_PER_NODE * per_gpu_batch_size ))}

@@ -101,9 +101,45 @@ teacher_gpu_mem_util=${TEACHER_GPU_MEMORY_UTIL:-0.55}
 teacher_max_model_len=${TEACHER_MAX_MODEL_LEN:-40000}
 teacher_max_num_batched_tokens=${TEACHER_MAX_NUM_BATCHED_TOKENS:-4096}
 teacher_max_num_seqs=${TEACHER_MAX_NUM_SEQS:-16}
-distillation_topk=${DISTILLATION_TOPK:-50}
-distillation_loss_mode=${DISTILLATION_LOSS_MODE:-reverse_kl_topk}
+distillation_topk=${DISTILLATION_TOPK:-1}
+# k1 is the on-policy sampled-token estimator of KL(pi_student || pi_teacher):
+# each sampled tool-call token contributes log pi_student - log pi_teacher.
+distillation_loss_mode=${DISTILLATION_LOSS_MODE:-k1}
+case "${distillation_loss_mode,,}" in
+    k1|kl)
+        distillation_use_policy_gradient=${DISTILLATION_USE_POLICY_GRADIENT:-True}
+        ;;
+    *)
+        distillation_use_policy_gradient=${DISTILLATION_USE_POLICY_GRADIENT:-False}
+        ;;
+esac
 distill_chunk_size=${DISTILL_CHUNK_SIZE:-256}
+
+# The same online rollout/verifier/teacher pipeline supports two supervision
+# objectives. OPSD aligns student and privileged-teacher logits; correction
+# SFT trains only on the teacher's canonical XML tool-call target.
+online_supervision_mode=${OPD_MM_ONLINE_SUPERVISION_MODE:-opsd}
+case "${online_supervision_mode,,}" in
+    opsd|logits|logit_distillation)
+        state_opsd_enabled=True
+        kl_credit_assignment=1
+        record_policy_states=1
+        rollout_calculate_log_probs=True
+        supervision_label=opsd
+        ;;
+    correction_sft|sft)
+        state_opsd_enabled=False
+        kl_credit_assignment=0
+        record_policy_states=0
+        rollout_calculate_log_probs=False
+        supervision_label=sft
+        ;;
+    *)
+        echo "Invalid OPD_MM_ONLINE_SUPERVISION_MODE=$online_supervision_mode" >&2
+        echo "Expected one of: opsd, correction_sft" >&2
+        exit 1
+        ;;
+esac
 
 total_epochs=${TOTAL_EPOCHS:-3}
 total_training_steps=${TOTAL_TRAINING_STEPS:-}
@@ -119,10 +155,10 @@ experiment_name=${EXPERIMENT_NAME:-opd_mm_qwen35_4b_pure_opsd_current_schema_${R
 LOG_DIR=${LOG_DIR:-$REPO_ROOT/logs}
 TRAIN_LOG_PATH=${TRAIN_LOG_PATH:-${LOG_DIR}/${experiment_name}.log}
 OUTCOME_SERVER_LOG=${OUTCOME_SERVER_LOG:-${LOG_DIR}/${experiment_name}_outcome_server.log}
-OPD_MM_STUDENT_ROLLOUT_DUMP_DIR=${OPD_MM_STUDENT_ROLLOUT_DUMP_DIR:-${LOG_DIR}/opd_mm_opsd_rollouts_${RUN_TIMESTAMP}}
-OPD_MM_TEACHER_CORRECTION_DUMP_DIR=${OPD_MM_TEACHER_CORRECTION_DUMP_DIR:-${LOG_DIR}/opd_mm_opsd_corrections_${RUN_TIMESTAMP}}
-OPD_MM_OUTCOME_REWARD_DUMP_DIR=${OPD_MM_OUTCOME_REWARD_DUMP_DIR:-${LOG_DIR}/opd_mm_opsd_validation_${RUN_TIMESTAMP}}
-VALIDATION_DATA_DIR=${VALIDATION_DATA_DIR:-${LOG_DIR}/opd_mm_opsd_validation_generations_${RUN_TIMESTAMP}}
+OPD_MM_STUDENT_ROLLOUT_DUMP_DIR=${OPD_MM_STUDENT_ROLLOUT_DUMP_DIR:-${LOG_DIR}/opd_mm_${supervision_label}_rollouts_${RUN_TIMESTAMP}}
+OPD_MM_TEACHER_CORRECTION_DUMP_DIR=${OPD_MM_TEACHER_CORRECTION_DUMP_DIR:-${LOG_DIR}/opd_mm_${supervision_label}_corrections_${RUN_TIMESTAMP}}
+OPD_MM_OUTCOME_REWARD_DUMP_DIR=${OPD_MM_OUTCOME_REWARD_DUMP_DIR:-${LOG_DIR}/opd_mm_${supervision_label}_validation_${RUN_TIMESTAMP}}
+VALIDATION_DATA_DIR=${VALIDATION_DATA_DIR:-${LOG_DIR}/opd_mm_${supervision_label}_validation_generations_${RUN_TIMESTAMP}}
 
 # Ray appends long session/socket suffixes, while AF_UNIX paths are limited to
 # 107 bytes on Linux. Keep the default root independent of the checkout path.
@@ -143,9 +179,9 @@ mkdir -p "$LOG_DIR" "$OPD_MM_STUDENT_ROLLOUT_DUMP_DIR" "$OPD_MM_TEACHER_CORRECTI
 export PYTHONUNBUFFERED=${PYTHONUNBUFFERED:-1}
 export HYDRA_FULL_ERROR=${HYDRA_FULL_ERROR:-1}
 export RAY_TMPDIR TMPDIR
-export OPD_MM_ONLINE_SUPERVISION_MODE=opsd
-export OPD_MM_RECORD_POLICY_STATES=1
-export OPD_MM_KL_CREDIT_ASSIGNMENT=1
+export OPD_MM_ONLINE_SUPERVISION_MODE="$online_supervision_mode"
+export OPD_MM_RECORD_POLICY_STATES="$record_policy_states"
+export OPD_MM_KL_CREDIT_ASSIGNMENT="$kl_credit_assignment"
 export OPD_MM_KL_TOPK="$distillation_topk"
 export OPD_MM_FAIL_ON_PROMPT_TRUNCATION=1
 export OPD_MM_STUDENT_ROLLOUT_DUMP_DIR
@@ -285,6 +321,8 @@ echo "TEST_FREQ=${test_freq}"
 echo "SAVE_FREQ=${save_freq}"
 echo "DISTILLATION_TOPK=${distillation_topk}"
 echo "DISTILLATION_LOSS_MODE=${distillation_loss_mode}"
+echo "DISTILLATION_USE_POLICY_GRADIENT=${distillation_use_policy_gradient}"
+echo "OPD_MM_ONLINE_SUPERVISION_MODE=${OPD_MM_ONLINE_SUPERVISION_MODE}"
 echo "TEACHER_GPU_MEMORY_UTIL=${teacher_gpu_mem_util}"
 echo "TEACHER_MAX_NUM_BATCHED_TOKENS=${teacher_max_num_batched_tokens}"
 echo "TEACHER_MAX_NUM_SEQS=${teacher_max_num_seqs}"
@@ -305,7 +343,7 @@ max_num_tokens=$(( max_prompt_length + max_response_length + 1 ))
 DATA=(
     algorithm.adv_estimator=grpo
     algorithm.use_kl_in_reward=False
-    +algorithm.opd_mm_state_opsd.enabled=True
+    +algorithm.opd_mm_state_opsd.enabled=${state_opsd_enabled}
     +algorithm.opd_mm_state_opsd.topk=${distillation_topk}
     data.train_files="$OPD_MM_TRAIN_FILES"
     data.val_files="$OPD_MM_VAL_FILES"
@@ -362,7 +400,7 @@ ROLLOUT=(
     actor_rollout_ref.rollout.multi_turn.tokenization_sanity_check_mode=disable
     actor_rollout_ref.rollout.agent.default_agent_loop=tool_agent
     actor_rollout_ref.rollout.agent.num_workers=${agent_loop_num_workers}
-    actor_rollout_ref.rollout.calculate_log_probs=False
+    actor_rollout_ref.rollout.calculate_log_probs=${rollout_calculate_log_probs}
     actor_rollout_ref.rollout.load_format=dummy
     actor_rollout_ref.rollout.val_kwargs.n=1
     actor_rollout_ref.rollout.val_kwargs.do_sample=${val_rollout_do_sample}
@@ -412,7 +450,7 @@ DISTILLATION=(
     distillation.distillation_loss.loss_mode=${distillation_loss_mode}
     distillation.distillation_loss.topk=${distillation_topk}
     distillation.distillation_loss.use_task_rewards=False
-    distillation.distillation_loss.use_policy_gradient=False
+    distillation.distillation_loss.use_policy_gradient=${distillation_use_policy_gradient}
     distillation.distillation_loss.log_prob_min_clamp=-10.0
     +distillation.distillation_loss.use_chunked_topk=True
     +distillation.distillation_loss.chunked_topk_chunk_size=${distill_chunk_size}

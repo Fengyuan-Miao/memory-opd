@@ -51,7 +51,17 @@ STORE_DIR=${STORE_DIR:-$DATASET_ROOT/opd_mm_store}
 SUBSET_NAME=${SUBSET_NAME:-teacher_success_full_minus_heldout100_20260828}
 SPLIT_DIR=${SPLIT_DIR:-$STORE_DIR/subsets/$SUBSET_NAME}
 MEMGALLERY_HELDOUT_DIR=${MEMGALLERY_HELDOUT_DIR:-$STORE_DIR/subsets/balanced_grpo_cap4_holdout100}
-MMEM_DATASET_ROOT=${MMEM_DATASET_ROOT:-$REPO_ROOT/dataset/mmem/batches/validated21_final}
+if [[ -z "${MMEM_DATASET_ROOT:-}" ]]; then
+    for candidate in \
+        "$REPO_ROOT/dataset/mmem/batches/validated21_final" \
+        "$REPO_ROOT/dataset/mmem/data/batches/validated21_final"; do
+        if [[ -d "$candidate/opd_mm_store" ]]; then
+            MMEM_DATASET_ROOT=$candidate
+            break
+        fi
+    done
+    MMEM_DATASET_ROOT=${MMEM_DATASET_ROOT:-$REPO_ROOT/dataset/mmem/batches/validated21_final}
+fi
 MMEM_STORE_DIR=${MMEM_STORE_DIR:-$MMEM_DATASET_ROOT/opd_mm_store}
 MMEM_HELDOUT_DIR=${MMEM_HELDOUT_DIR:-$MMEM_STORE_DIR/subsets/grpo_holdout100_20260813}
 MEMGALLERY_VAL_PARQUET=${MEMGALLERY_VAL_PARQUET:-$MMEM_HELDOUT_DIR/heldout_memgallery_val.parquet}
@@ -154,7 +164,8 @@ export TEACHER_GPU_MEMORY_UTIL=${TEACHER_GPU_MEMORY_UTIL:-0.65}
 export TEACHER_MAX_MODEL_LEN=${TEACHER_MAX_MODEL_LEN:-32768}
 export TEACHER_MAX_NUM_BATCHED_TOKENS=${TEACHER_MAX_NUM_BATCHED_TOKENS:-4096}
 export TEACHER_MAX_NUM_SEQS=${TEACHER_MAX_NUM_SEQS:-16}
-export DISTILLATION_TOPK=${DISTILLATION_TOPK:-50}
+export DISTILLATION_TOPK=${DISTILLATION_TOPK:-1}
+export DISTILLATION_LOSS_MODE=${DISTILLATION_LOSS_MODE:-k1}
 export TOTAL_EPOCHS=${TOTAL_EPOCHS:-3}
 export TEST_FREQ=${TEST_FREQ:-10}
 export SAVE_FREQ=${SAVE_FREQ:-1000000}

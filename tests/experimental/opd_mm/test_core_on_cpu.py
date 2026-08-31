@@ -82,7 +82,8 @@ from verl.trainer.ppo.ray_trainer import RayPPOTrainer
 from verl.tools.schemas import ToolResponse
 from verl.utils import tensordict_utils as tu
 from verl.tools.tool_registry import load_all_tools
-from verl.workers.config import ActorConfig, DistillationConfig
+from verl.workers.config import ActorConfig, DistillationConfig, DistillationLossConfig
+from verl.workers.utils.padding import left_right_2_no_padding
 
 
 def test_dataset_asset_path_preserves_data_directory(monkeypatch: pytest.MonkeyPatch, tmp_path: Any) -> None:
@@ -169,6 +170,54 @@ async def test_state_kl_credit_tolerates_processed_prefix_length_mismatch() -> N
     assert "failure_reason" not in result
     assert result["action_kl"] >= 0.0
     assert len(result["teacher_ids"]) == 2
+
+
+@pytest.mark.asyncio
+async def test_state_opsd_uses_rollout_sample_logprobs_without_student_rescoring() -> None:
+    response_ids = [30, 31]
+    teacher_ids = [[1], [2], [30], [31], [0]]
+    teacher_logprobs = [[-0.1], [-0.1], [-0.7], [-0.8], [0.0]]
+
+    class UnexpectedStudentClient:
+        async def generate(self, **kwargs: Any) -> Any:
+            del kwargs
+            raise AssertionError("sampled-token OPSD must reuse rollout log-probabilities")
+
+    class FakeTeacherManager:
+        distillation_loss_config = SimpleNamespace(
+            topk=1,
+            log_prob_min_clamp=-10.0,
+            loss_settings=SimpleNamespace(use_topk=False),
+        )
+
+        async def compute_teacher_logprobs_single(self, **kwargs: Any) -> tuple[list[list[int]], list[list[float]]]:
+            assert kwargs["allow_processed_length_mismatch"] is True
+            return teacher_ids, teacher_logprobs
+
+    worker = SimpleNamespace(
+        llm_client=UnexpectedStudentClient(),
+        teacher_server_manager=FakeTeacherManager(),
+    )
+    result = await AgentLoopWorker._compute_opd_mm_state_kl_credit(
+        worker,
+        request={
+            "student_response_ids": response_ids,
+            "student_response_logprobs": [-0.2, -1.0],
+            "student_tool_call_mask": [1, 1],
+            "student_prompt_ids": [10, 11],
+        },
+        teacher_prompt_ids=[20, 21],
+        multi_modal_data={},
+        mm_processor_kwargs={},
+        routing_key=None,
+    )
+
+    assert "failure_reason" not in result
+    assert result["estimator"] == "sampled_reverse_kl"
+    assert result["topk"] == 1
+    assert result["action_kl"] == pytest.approx((0.5 - 0.2) / 2)
+    assert result["teacher_ids"] == [[30], [31]]
+    assert result["teacher_logprobs"] == [[-0.7], [-0.8]]
 
 
 def test_kl_credit_batch_populates_grpo_and_all_fail_distillation_states() -> None:
@@ -2361,6 +2410,28 @@ def test_opd_mm_batch_without_teacher_logprobs_returns_zero_loss() -> None:
     assert metrics["distillation/opd_mm_no_supervision_batches"].values == [1.0]
 
 
+def test_sampled_token_reverse_kl_uses_actual_token_log_ratio() -> None:
+    data = _minimal_distillation_batch()
+    data["distillation_mask"] = data["response_mask"].clone()
+    data["teacher_ids"] = torch.tensor([[[1], [3], [0], [0]]], dtype=torch.int32)
+    data["teacher_logprobs"] = torch.tensor([[[-0.1], [-1.2], [0.0], [0.0]]], dtype=torch.float32)
+    data = left_right_2_no_padding(data)
+    config = ActorConfig(strategy="fsdp", rollout_n=1, ppo_micro_batch_size_per_gpu=1)
+    distillation_config = DistillationConfig(
+        distillation_loss=DistillationLossConfig(loss_mode="k1", use_policy_gradient=True)
+    )
+    model_output = {"log_probs": torch.tensor([0.0, -0.7, -0.25])}
+
+    token_losses, _ = distillation_losses.compute_distillation_loss_reverse_kl_estimator(
+        config,
+        distillation_config,
+        model_output,
+        data,
+    )
+
+    assert token_losses[0, 0].item() == pytest.approx(0.5)
+
+
 def test_opd_mm_grpo_state_batch_without_teacher_logprobs_uses_policy_loss(monkeypatch) -> None:
     data = _minimal_distillation_batch()
     data["distillation_mask"] = torch.zeros_like(data["response_mask"])
@@ -2817,7 +2888,16 @@ def test_live_online_state_request_can_skip_initial_state_explicitly() -> None:
 
 
 @pytest.mark.asyncio
-async def test_agent_loop_worker_generates_verifier_and_teacher_for_one_live_state() -> None:
+async def test_agent_loop_worker_generates_verifier_and_teacher_for_one_live_state(monkeypatch) -> None:
+    monkeypatch.setenv("OPD_MM_ONLINE_SUPERVISION_MODE", "correction_sft")
+    monkeypatch.setenv("OPD_MM_KL_CREDIT_ASSIGNMENT", "0")
+
+    async def unexpected_kl_credit(*args: Any, **kwargs: Any) -> dict[str, Any]:
+        del args, kwargs
+        raise AssertionError("correction SFT must not score student/teacher KL")
+
+    monkeypatch.setattr(AgentLoopWorker, "_compute_opd_mm_state_kl_credit", unexpected_kl_credit)
+
     class FakeTeacherServer:
         def __init__(self) -> None:
             self.calls: list[dict[str, Any]] = []

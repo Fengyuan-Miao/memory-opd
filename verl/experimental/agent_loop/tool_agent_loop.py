@@ -740,6 +740,11 @@ class ToolAgentLoop(AgentLoopBase):
                     "student_prompt_ids": list(state_prompt_ids),
                     "student_raw_response": self.tokenizer.decode(response_ids, skip_special_tokens=False),
                     "student_response_ids": list(response_ids),
+                    "student_response_logprobs": (
+                        list(latest_policy_state.get("response_logprobs") or [])
+                        if isinstance(latest_policy_state, dict)
+                        else []
+                    ),
                     "student_tool_call_mask": (
                         list(latest_policy_state.get("tool_call_mask") or [])
                         if isinstance(latest_policy_state, dict)

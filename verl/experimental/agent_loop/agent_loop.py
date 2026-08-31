@@ -1068,6 +1068,7 @@ class AgentLoopWorker:
             tool_format=str(state_payload.get("tool_format") or self.rollout_config.multi_turn.format),
             request_id=str(state_payload.get("request_id") or ""),
             student_response_ids=list(state_payload.get("student_response_ids") or []),
+            student_response_logprobs=list(state_payload.get("student_response_logprobs") or []),
             student_tool_call_mask=list(state_payload.get("student_tool_call_mask") or []),
         )
         if request is None:
@@ -1158,9 +1159,10 @@ class AgentLoopWorker:
         request["verifier_raw_response"] = verifier_raw_response
         request["verifier_feedback"] = verifier_feedback
         state_opsd = AgentLoopWorker._uses_opd_mm_state_opsd(sample_kwargs)
-        independent_teacher_action = state_opsd or str(
+        kl_credit_enabled = state_opsd or str(
             os.getenv("OPD_MM_KL_CREDIT_ASSIGNMENT") or ""
         ).lower() in {"1", "true", "yes", "on"}
+        independent_teacher_action = kl_credit_enabled
         request["teacher_prompt"] = build_teacher_correction_prompt(
             query=request.get("query", ""),
             history=request.get("history", []),
@@ -1177,21 +1179,24 @@ class AgentLoopWorker:
         teacher_prompt_ids = self._encode_opd_mm_teacher_prompt(
             request["teacher_prompt"], tools=teacher_tool_schemas
         )
-        kl_credit_task = asyncio.create_task(
-            AgentLoopWorker._compute_opd_mm_state_kl_credit(
-                self,
-                request=request,
-                teacher_prompt_ids=teacher_prompt_ids,
-                multi_modal_data=multi_modal_data,
-                mm_processor_kwargs=mm_processor_kwargs,
-                routing_key=routing_key,
+        kl_credit_task = None
+        if kl_credit_enabled:
+            kl_credit_task = asyncio.create_task(
+                AgentLoopWorker._compute_opd_mm_state_kl_credit(
+                    self,
+                    request=request,
+                    teacher_prompt_ids=teacher_prompt_ids,
+                    multi_modal_data=multi_modal_data,
+                    mm_processor_kwargs=mm_processor_kwargs,
+                    routing_key=routing_key,
+                )
             )
-        )
         if state_opsd:
             # State OPSD only needs the teacher distribution under the
             # privileged prefix. Generating a second XML action is correction
             # SFT work, and coupling it here made malformed teacher XML discard
             # otherwise valid logits.
+            assert kl_credit_task is not None
             kl_credit = await kl_credit_task
             teacher_raw_response = ""
             correction = {
@@ -1219,7 +1224,11 @@ class AgentLoopWorker:
                     routing_key=routing_key,
                 )
             )
-            teacher_response_ids, kl_credit = await asyncio.gather(teacher_response_task, kl_credit_task)
+            if kl_credit_task is None:
+                teacher_response_ids = await teacher_response_task
+                kl_credit = None
+            else:
+                teacher_response_ids, kl_credit = await asyncio.gather(teacher_response_task, kl_credit_task)
             teacher_raw_response = self.tokenizer.decode(teacher_response_ids, skip_special_tokens=False)
             correction = finalize_online_step_correction(request, teacher_raw_response=teacher_raw_response)
         if correction is not None and kl_credit is not None and not state_opsd:
@@ -1271,26 +1280,24 @@ class AgentLoopWorker:
             return failure("empty_student_tool_call_mask")
 
         distillation_loss_config = self.teacher_server_manager.distillation_loss_config
-        topk = int(os.getenv("OPD_MM_KL_TOPK") or distillation_loss_config.topk or 8)
+        loss_settings = getattr(distillation_loss_config, "loss_settings", None)
+        sampled_token_mode = loss_settings is not None and not bool(getattr(loss_settings, "use_topk", False))
+        topk = int(os.getenv("OPD_MM_KL_TOPK") or distillation_loss_config.topk or 1)
         student_prompt_ids = [int(token) for token in request.get("student_prompt_ids") or []]
         if not student_prompt_ids:
             return failure("empty_student_prompt")
         student_sequence = student_prompt_ids + response_ids
         teacher_sequence = list(teacher_prompt_ids) + response_ids
-        sampling_params = {"max_tokens": 1, "temperature": 1.0, "prompt_logprobs": topk}
+        sampling_params = {
+            "max_tokens": 1,
+            "temperature": 1.0,
+            "prompt_logprobs": 0 if sampled_token_mode else topk,
+        }
 
         try:
-            student_task = asyncio.create_task(
-                self.llm_client.generate(
-                    request_id=uuid4().hex,
-                    prompt_ids=student_sequence,
-                    sampling_params=sampling_params,
-                    image_data=multi_modal_data.get("images"),
-                    video_data=multi_modal_data.get("videos"),
-                    audio_data=multi_modal_data.get("audios"),
-                    mm_processor_kwargs=mm_processor_kwargs,
-                )
-            )
+            rollout_logprobs = [float(value) for value in request.get("student_response_logprobs") or []]
+            if sampled_token_mode and len(rollout_logprobs) != len(response_ids):
+                return failure("missing_or_unaligned_sampled_token_logprobs")
             teacher_task = asyncio.create_task(
                 self.teacher_server_manager.compute_teacher_logprobs_single(
                     sequence_ids=teacher_sequence,
@@ -1300,27 +1307,56 @@ class AgentLoopWorker:
                     allow_processed_length_mismatch=True,
                 )
             )
-            student_output, (teacher_ids, teacher_logprobs) = await asyncio.gather(student_task, teacher_task)
+            if sampled_token_mode:
+                teacher_ids, teacher_logprobs = await teacher_task
+                response_student_ids = [[token] for token in response_ids]
+                response_student_logprobs = [[value] for value in rollout_logprobs]
+            else:
+                student_task = asyncio.create_task(
+                    self.llm_client.generate(
+                        request_id=uuid4().hex,
+                        prompt_ids=student_sequence,
+                        sampling_params=sampling_params,
+                        image_data=multi_modal_data.get("images"),
+                        video_data=multi_modal_data.get("videos"),
+                        audio_data=multi_modal_data.get("audios"),
+                        mm_processor_kwargs=mm_processor_kwargs,
+                    )
+                )
+                student_output, (teacher_ids, teacher_logprobs) = await asyncio.gather(student_task, teacher_task)
+                student_ids = student_output.extra_fields.get("prompt_ids")
+                student_logprobs = student_output.extra_fields.get("prompt_logprobs")
+                if student_ids is None or student_logprobs is None:
+                    raise RuntimeError("student rollout server did not return prompt token logprobs")
+                response_student_ids = response_prediction_rows(student_ids, len(response_ids))
+                response_student_logprobs = response_prediction_rows(student_logprobs, len(response_ids))
 
-            student_ids = student_output.extra_fields.get("prompt_ids")
-            student_logprobs = student_output.extra_fields.get("prompt_logprobs")
-            if student_ids is None or student_logprobs is None:
-                raise RuntimeError("student rollout server did not return prompt top-k logprobs")
-
-            response_student_ids = response_prediction_rows(student_ids, len(response_ids))
-            response_student_logprobs = response_prediction_rows(student_logprobs, len(response_ids))
             response_teacher_ids = response_prediction_rows(teacher_ids, len(response_ids))
             response_teacher_logprobs = response_prediction_rows(teacher_logprobs, len(response_ids))
-            missing_logprob = distillation_loss_config.log_prob_min_clamp
-            if missing_logprob is None:
-                missing_logprob = -10.0
-            token_kl = tokenwise_topk_union_kl(
-                response_teacher_ids,
-                response_teacher_logprobs,
-                response_student_ids,
-                response_student_logprobs,
-                missing_logprob=float(missing_logprob),
-            )
+            if sampled_token_mode:
+                sampled_student_ids = [int(row[0]) for row in response_student_ids]
+                sampled_teacher_ids = [int(row[0]) for row in response_teacher_ids]
+                if sampled_student_ids != response_ids or sampled_teacher_ids != response_ids:
+                    return failure("sampled_token_ids_do_not_match_scored_sequence")
+                token_kl = [
+                    float(student_row[0]) - float(teacher_row[0])
+                    for student_row, teacher_row in zip(
+                        response_student_logprobs,
+                        response_teacher_logprobs,
+                        strict=True,
+                    )
+                ]
+            else:
+                missing_logprob = distillation_loss_config.log_prob_min_clamp
+                if missing_logprob is None:
+                    missing_logprob = -10.0
+                token_kl = tokenwise_topk_union_kl(
+                    response_teacher_ids,
+                    response_teacher_logprobs,
+                    response_student_ids,
+                    response_student_logprobs,
+                    missing_logprob=float(missing_logprob),
+                )
             action_kl = masked_mean(token_kl, tool_call_mask)
             if not math.isfinite(action_kl):
                 valid_masked_rows = sum(
@@ -1329,7 +1365,8 @@ class AgentLoopWorker:
                 )
                 return failure(f"nonfinite_action_kl:valid_masked_rows={valid_masked_rows}")
             return {
-                "topk": topk,
+                "estimator": "sampled_reverse_kl" if sampled_token_mode else "topk_union_kl",
+                "topk": 1 if sampled_token_mode else topk,
                 "action_kl": float(action_kl),
                 "tool_call_mask": tool_call_mask,
                 "teacher_ids": response_teacher_ids,
@@ -1766,7 +1803,7 @@ class AgentLoopWorker:
 
     @staticmethod
     def _is_opd_mm_online_self_distill(sample_kwargs: Optional[dict[str, Any]]) -> bool:
-        """Return true for OPD-MM samples that should use XML correction SFT only."""
+        """Return true for OPD-MM samples eligible for online supervision."""
         if not sample_kwargs:
             return False
         try:
