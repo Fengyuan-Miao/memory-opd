@@ -141,7 +141,7 @@ def load_mem_gallery_records(
             ):
                 round_id = str(round_data.get("round") or f"round_{turn_index}")
                 turn_id = _scenario_turn_id(scenario, round_id)
-                timestamp = f"{session.get('date', '')}T{turn_index:04d}"
+                timestamp = str(round_data.get("timestamp") or f"{session.get('date', '')}T{turn_index:04d}")
                 metadata = _base_metadata(
                     dataset_name=dataset_name,
                     scenario=scenario,
@@ -239,11 +239,11 @@ def load_mem_gallery_qas(
             question_image = _resolve_image_path(root, qa.get("question_image"))
             qas.append(
                 {
-                    "sample_id": (
+                    "sample_id": qa.get("sample_id") or (
                         f"{dataset_name}:{_safe_id(scenario)}:"
                         f"qa:{index:04d}"
                     ),
-                    "dataset": dataset_name,
+                    "dataset": qa.get("dataset") or dataset_name,
                     "scenario": scenario,
                     "scenario_file": str(scenario_file),
                     "qa_index": index,

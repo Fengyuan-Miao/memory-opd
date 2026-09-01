@@ -24,6 +24,7 @@ from typing import Any
 import numpy as np
 import pytest
 import torch
+from omegaconf import OmegaConf
 from tensordict import TensorDict
 
 import verl.trainer.distillation.losses as distillation_losses
@@ -2450,6 +2451,112 @@ def test_sampled_token_reverse_kl_uses_actual_token_log_ratio() -> None:
     )
 
     assert token_losses[0, 0].item() == pytest.approx(0.5)
+
+
+def test_opsd_state_weight_scales_sampled_token_reverse_kl_loss_to_zero() -> None:
+    data = _minimal_distillation_batch()
+    data["distillation_mask"] = data["response_mask"].clone()
+    data["old_log_probs"] = torch.tensor([[-0.25, 0.0]], dtype=torch.float32)
+    data["teacher_ids"] = torch.tensor([[[1], [3], [0], [0]]], dtype=torch.int32)
+    data["teacher_logprobs"] = torch.tensor([[[-0.1], [-1.2], [0.0], [0.0]]], dtype=torch.float32)
+    data["opd_mm_state_weight"] = torch.tensor([0.0], dtype=torch.float32)
+    data = left_right_2_no_padding(data)
+    config = ActorConfig(strategy="fsdp", rollout_n=1, ppo_micro_batch_size_per_gpu=1)
+    distillation_config = DistillationConfig(
+        distillation_loss=DistillationLossConfig(loss_mode="k1", use_policy_gradient=True)
+    )
+    model_output = {"log_probs": torch.tensor([0.0, -0.7, -0.25])}
+
+    loss, _ = distillation_losses.distillation_loss(
+        config,
+        distillation_config,
+        model_output,
+        data,
+    )
+
+    assert loss.item() == pytest.approx(0.0)
+
+
+def test_opsd_state_balancing_caps_empty_evidence_and_normalizes_trajectories() -> None:
+    rows = [
+        {
+            "trajectory_key": "long",
+            "step_index": index,
+            "diagnosis": "no_public_evidence",
+        }
+        for index in range(10)
+    ]
+    rows.append({"trajectory_key": "long", "step_index": 10, "diagnosis": "missing_factual_support"})
+    rows.extend(
+        {
+            "trajectory_key": f"short-{index}",
+            "step_index": 0,
+            "diagnosis": "none",
+        }
+        for index in range(7)
+    )
+
+    balanced, metrics = RayPPOTrainer._balance_opd_mm_opsd_state_rows(
+        rows,
+        trajectory_normalize=True,
+        no_public_evidence_max_fraction=0.3,
+    )
+
+    assert metrics["opd_mm_no_public_evidence_before"] == 10.0
+    assert metrics["opd_mm_no_public_evidence_after"] == 3.0
+    assert metrics["opd_mm_no_public_evidence_fraction"] <= 0.3
+    trajectory_weights: dict[str, float] = {}
+    for row in balanced:
+        trajectory_weights[row["trajectory_key"]] = trajectory_weights.get(row["trajectory_key"], 0.0) + row[
+            "state_weight"
+        ]
+    assert len(trajectory_weights) == 8
+    assert max(trajectory_weights.values()) == pytest.approx(min(trajectory_weights.values()))
+
+
+def test_best_checkpoint_keeps_only_highest_validation_accuracy(tmp_path) -> None:
+    trainer = object.__new__(RayPPOTrainer)
+    trainer.config = OmegaConf.create(
+        {
+            "trainer": {
+                "default_local_dir": str(tmp_path / "checkpoints"),
+                "save_best_only": True,
+                "best_checkpoint_metric": "opd_mm/answer_correct/mean@1",
+                "best_checkpoint_mode": "max",
+                "best_checkpoint_min_delta": 0.0,
+            }
+        }
+    )
+    trainer._best_checkpoint_score = None
+    trainer._best_checkpoint_step = None
+    trainer._best_checkpoint_path = None
+
+    def fake_save_checkpoint() -> None:
+        os.makedirs(trainer._checkpoint_folder(), exist_ok=True)
+
+    trainer._save_checkpoint = fake_save_checkpoint
+
+    def validation(memgallery: float, mmem: float) -> dict[str, float]:
+        return {
+            "val-aux/opd_mm_memgallery_val/opd_mm/answer_correct/mean@1": memgallery,
+            "val-aux/opd_mm_mmem_val/opd_mm/answer_correct/mean@1": mmem,
+        }
+
+    trainer.global_steps = 10
+    first = trainer._maybe_save_best_checkpoint(validation(0.7, 0.6))
+    trainer.global_steps = 20
+    second = trainer._maybe_save_best_checkpoint(validation(0.68, 0.61))
+    trainer.global_steps = 30
+    third = trainer._maybe_save_best_checkpoint(validation(0.72, 0.62))
+
+    assert first["checkpoint/is_best"] == 1.0
+    assert second["checkpoint/is_best"] == 0.0
+    assert third["checkpoint/is_best"] == 1.0
+    checkpoint_dirs = sorted((tmp_path / "checkpoints").glob("global_step_*"))
+    assert [path.name for path in checkpoint_dirs] == ["global_step_30"]
+    metadata = json.loads((tmp_path / "checkpoints" / "best_checkpoint.json").read_text())
+    assert metadata["step"] == 30
+    assert metadata["score"] == pytest.approx(0.67)
 
 
 def test_opd_mm_grpo_state_batch_without_teacher_logprobs_uses_policy_loss(monkeypatch) -> None:

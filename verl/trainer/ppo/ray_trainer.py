@@ -18,9 +18,11 @@ PPO Trainer with Ray-based single controller.
 This trainer supports model-agonistic model initialization with huggingface
 """
 
+import hashlib
 import json
 import math
 import os
+import shutil
 import uuid
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
@@ -372,6 +374,9 @@ class RayPPOTrainer:
         self._create_dataloader(train_dataset, val_dataset, collate_fn, train_sampler)
 
         self.checkpoint_manager = None
+        self._best_checkpoint_score: Optional[float] = None
+        self._best_checkpoint_step: Optional[int] = None
+        self._best_checkpoint_path: Optional[str] = None
         self._init_dump_executor()
 
     def _create_dataloader(self, train_dataset, val_dataset, collate_fn, train_sampler: Optional[Sampler]):
@@ -971,13 +976,112 @@ class RayPPOTrainer:
         # sleep all replicas to load checkpoint
         self.checkpoint_manager.sleep_replicas()
 
+    def _checkpoint_folder(self, step: Optional[int] = None) -> str:
+        checkpoint_step = self.global_steps if step is None else int(step)
+        return os.path.join(self.config.trainer.default_local_dir, f"global_step_{checkpoint_step}")
+
+    def _best_checkpoint_metadata_path(self) -> str:
+        return os.path.join(self.config.trainer.default_local_dir, "best_checkpoint.json")
+
+    def _load_best_checkpoint_state(self) -> None:
+        if not self.config.trainer.get("save_best_only", False):
+            return
+        metadata_path = self._best_checkpoint_metadata_path()
+        if not os.path.isfile(metadata_path):
+            return
+        try:
+            with open(metadata_path, encoding="utf-8") as handle:
+                metadata = json.load(handle)
+            self._best_checkpoint_score = float(metadata["score"])
+            self._best_checkpoint_step = int(metadata["step"])
+            self._best_checkpoint_path = str(metadata["path"])
+        except (OSError, ValueError, TypeError, KeyError, json.JSONDecodeError) as exc:
+            raise RuntimeError(f"Invalid best-checkpoint metadata at {metadata_path}: {exc}") from exc
+
+    def _best_checkpoint_validation_score(self, val_metrics: dict[str, Any]) -> tuple[float, dict[str, float]]:
+        selector = str(
+            self.config.trainer.get("best_checkpoint_metric", "opd_mm/answer_correct/mean@1")
+        ).strip()
+        if not selector:
+            raise ValueError("trainer.best_checkpoint_metric must not be empty")
+        matched: dict[str, float] = {}
+        for key, value in val_metrics.items():
+            if key == selector or key.endswith(f"/{selector}"):
+                try:
+                    numeric_value = float(value)
+                except (TypeError, ValueError):
+                    continue
+                if math.isfinite(numeric_value):
+                    matched[key] = numeric_value
+        if not matched:
+            available = sorted(key for key in val_metrics if "answer_correct" in key)
+            raise RuntimeError(
+                f"No validation metric matched trainer.best_checkpoint_metric={selector!r}; "
+                f"available answer_correct metrics: {available}"
+            )
+        return float(sum(matched.values()) / len(matched)), matched
+
+    def _maybe_save_best_checkpoint(self, val_metrics: dict[str, Any]) -> dict[str, float]:
+        if not self.config.trainer.get("save_best_only", False):
+            return {}
+        score, matched_metrics = self._best_checkpoint_validation_score(val_metrics)
+        mode = str(self.config.trainer.get("best_checkpoint_mode", "max")).strip().lower()
+        if mode not in {"max", "min"}:
+            raise ValueError(f"trainer.best_checkpoint_mode must be 'max' or 'min', got {mode!r}")
+        min_delta = float(self.config.trainer.get("best_checkpoint_min_delta", 0.0))
+        previous_score = self._best_checkpoint_score
+        improved = previous_score is None or (
+            score > previous_score + min_delta if mode == "max" else score < previous_score - min_delta
+        )
+        checkpoint_metrics = {
+            "checkpoint/current_validation_score": score,
+            "checkpoint/best_validation_score": score if improved else float(previous_score),
+            "checkpoint/is_best": float(improved),
+        }
+        if not improved:
+            return checkpoint_metrics
+
+        previous_path = self._best_checkpoint_path
+        current_path = self._checkpoint_folder()
+        self._save_checkpoint()
+
+        metadata = {
+            "step": int(self.global_steps),
+            "score": score,
+            "path": current_path,
+            "metric_selector": str(self.config.trainer.get("best_checkpoint_metric")),
+            "matched_metrics": matched_metrics,
+        }
+        metadata_path = self._best_checkpoint_metadata_path()
+        os.makedirs(os.path.dirname(metadata_path), exist_ok=True)
+        temporary_path = f"{metadata_path}.tmp"
+        with open(temporary_path, "w", encoding="utf-8") as handle:
+            json.dump(metadata, handle, ensure_ascii=False, indent=2, sort_keys=True)
+        os.replace(temporary_path, metadata_path)
+
+        self._best_checkpoint_score = score
+        self._best_checkpoint_step = int(self.global_steps)
+        self._best_checkpoint_path = current_path
+        if previous_path and os.path.abspath(previous_path) != os.path.abspath(current_path):
+            checkpoint_root = os.path.abspath(self.config.trainer.default_local_dir)
+            candidate = os.path.abspath(previous_path)
+            if os.path.dirname(candidate) != checkpoint_root or not os.path.basename(candidate).startswith(
+                "global_step_"
+            ):
+                raise RuntimeError(f"Refusing to remove checkpoint outside the configured root: {previous_path}")
+            if os.path.exists(candidate):
+                shutil.rmtree(candidate, ignore_errors=False)
+        print(
+            f"Saved new best checkpoint at step {self.global_steps}: score={score:.6f}, "
+            f"metrics={matched_metrics}"
+        )
+        return checkpoint_metrics
+
     def _save_checkpoint(self):
         from verl.utils.fs import local_mkdir_safe
 
         # path: given_path + `/global_step_{global_steps}` + `/actor`
-        local_global_step_folder = os.path.join(
-            self.config.trainer.default_local_dir, f"global_step_{self.global_steps}"
-        )
+        local_global_step_folder = self._checkpoint_folder()
 
         print(f"local_global_step_folder: {local_global_step_folder}")
         actor_local_path = os.path.join(local_global_step_folder, "actor")
@@ -1638,6 +1742,85 @@ class RayPPOTrainer:
         config = self.config.algorithm.get("opd_mm_state_opsd", None)
         return bool(config and config.get("enabled", False))
 
+    @staticmethod
+    def _balance_opd_mm_opsd_state_rows(
+        rows: list[dict[str, Any]],
+        *,
+        trajectory_normalize: bool,
+        no_public_evidence_max_fraction: float,
+    ) -> tuple[list[dict[str, Any]], dict[str, float]]:
+        """Cap empty-evidence states and assign equal total weight per trajectory."""
+        if not 0.0 <= no_public_evidence_max_fraction <= 1.0:
+            raise ValueError(
+                "algorithm.opd_mm_state_opsd.no_public_evidence_max_fraction must be in [0, 1], "
+                f"got {no_public_evidence_max_fraction}"
+            )
+        rows_before = len(rows)
+        no_public_rows = [row for row in rows if row.get("diagnosis") == "no_public_evidence"]
+        other_rows = [row for row in rows if row.get("diagnosis") != "no_public_evidence"]
+        no_public_before = len(no_public_rows)
+
+        kept_no_public = no_public_rows
+        if no_public_rows and no_public_evidence_max_fraction < 1.0:
+            trajectories_with_other = {row["trajectory_key"] for row in other_rows}
+            no_public_by_trajectory: dict[str, list[dict[str, Any]]] = defaultdict(list)
+            for row in no_public_rows:
+                no_public_by_trajectory[row["trajectory_key"]].append(row)
+            mandatory: list[dict[str, Any]] = []
+            for trajectory_key, trajectory_rows in no_public_by_trajectory.items():
+                if trajectory_key not in trajectories_with_other:
+                    mandatory.append(min(trajectory_rows, key=lambda row: int(row.get("step_index", 0))))
+
+            if no_public_evidence_max_fraction <= 0.0 or not other_rows:
+                target_no_public = len(mandatory)
+            else:
+                target_no_public = math.floor(
+                    no_public_evidence_max_fraction
+                    / (1.0 - no_public_evidence_max_fraction)
+                    * len(other_rows)
+                )
+                target_no_public = max(len(mandatory), target_no_public)
+            target_no_public = min(len(no_public_rows), target_no_public)
+            mandatory_ids = {id(row) for row in mandatory}
+            optional = [row for row in no_public_rows if id(row) not in mandatory_ids]
+            optional.sort(
+                key=lambda row: hashlib.sha256(
+                    f"{row['trajectory_key']}:{row.get('step_index', 0)}".encode()
+                ).digest()
+            )
+            kept_no_public = mandatory + optional[: max(0, target_no_public - len(mandatory))]
+            kept_ids = {id(row) for row in kept_no_public}
+            rows = [
+                row
+                for row in rows
+                if row.get("diagnosis") != "no_public_evidence" or id(row) in kept_ids
+            ]
+
+        trajectory_counts: dict[str, int] = defaultdict(int)
+        for row in rows:
+            trajectory_counts[row["trajectory_key"]] += 1
+        raw_weights = [
+            1.0 / trajectory_counts[row["trajectory_key"]] if trajectory_normalize else 1.0
+            for row in rows
+        ]
+        weight_scale = len(raw_weights) / sum(raw_weights) if raw_weights else 1.0
+        for row, raw_weight in zip(rows, raw_weights, strict=True):
+            row["state_weight"] = raw_weight * weight_scale
+
+        no_public_after = sum(row.get("diagnosis") == "no_public_evidence" for row in rows)
+        weights = [float(row["state_weight"]) for row in rows]
+        metrics = {
+            "opd_mm_state_rows_before_balance": float(rows_before),
+            "opd_mm_state_rows_after_balance": float(len(rows)),
+            "opd_mm_no_public_evidence_before": float(no_public_before),
+            "opd_mm_no_public_evidence_after": float(no_public_after),
+            "opd_mm_no_public_evidence_fraction": float(no_public_after / len(rows)) if rows else 0.0,
+            "opd_mm_state_weight_mean": float(sum(weights) / len(weights)) if weights else 0.0,
+            "opd_mm_state_weight_min": min(weights, default=0.0),
+            "opd_mm_state_weight_max": max(weights, default=0.0),
+        }
+        return rows, metrics
+
     def _build_opd_mm_kl_credit_batch(
         self,
         batch: DataProto,
@@ -1710,6 +1893,7 @@ class RayPPOTrainer:
         trajectories_with_candidates = 0
         grpo_full_state_count = 0
         invalid_groups: set[str] = set()
+        state_balance_metrics: dict[str, float] = {}
 
         for sample_index, (raw_states, raw_corrections) in enumerate(
             zip(states_column, corrections_column, strict=True)
@@ -1727,6 +1911,7 @@ class RayPPOTrainer:
                 if isinstance(state, dict)
             }
             uid = str(plain(original_uids[sample_index]))
+            trajectory_key = f"{uid}:{sample_index}"
             route = "distill" if pure_state_opsd else group_routes.get(uid, "invalid")
             if route == "invalid":
                 invalid_groups.add(uid)
@@ -1786,6 +1971,10 @@ class RayPPOTrainer:
                             "teacher_logprobs": [],
                             "advantage": trajectory_advantage,
                             "uid": uid,
+                            "trajectory_key": trajectory_key,
+                            "step_index": int(state.get("step_index", 0)),
+                            "diagnosis": "",
+                            "state_weight": 1.0,
                             "state": state,
                             "correction": None,
                             "mode": mode,
@@ -1872,6 +2061,17 @@ class RayPPOTrainer:
                         "teacher_logprobs": [[float(value) for value in row] for row in teacher_logprobs],
                         "advantage": trajectory_advantage,
                         "uid": uid,
+                        "trajectory_key": trajectory_key,
+                        "step_index": int(correction.get("step_index", -1)),
+                        "diagnosis": str(
+                            (
+                                correction.get("verifier_feedback")
+                                or correction.get("feedback")
+                                or {}
+                            ).get("missing_evidence_type")
+                            or ""
+                        ),
+                        "state_weight": 1.0,
                         "state": state,
                         "correction": correction,
                         "mode": mode,
@@ -1886,6 +2086,17 @@ class RayPPOTrainer:
 
         if not rows:
             return None
+
+        if pure_state_opsd:
+            rows, state_balance_metrics = self._balance_opd_mm_opsd_state_rows(
+                rows,
+                trajectory_normalize=bool(credit_config.get("trajectory_normalize", True)),
+                no_public_evidence_max_fraction=float(
+                    credit_config.get("no_public_evidence_max_fraction", 0.3)
+                ),
+            )
+            if not rows:
+                return None
 
         unpadded_row_count = len(rows)
         grpo_state_count = sum(row["mode"] == "grpo" for row in rows)
@@ -1903,7 +2114,25 @@ class RayPPOTrainer:
             multiple = max(dp_size, (multiple // dp_size) * dp_size)
         target_size = max(multiple, math.ceil(len(rows) / multiple) * multiple)
         if len(rows) < target_size:
-            rows = (rows * math.ceil(target_size / len(rows)))[:target_size]
+            real_rows = list(rows)
+            source_indices = list(range(len(real_rows))) + [
+                index % len(real_rows) for index in range(target_size - len(real_rows))
+            ]
+            source_counts: dict[int, int] = defaultdict(int)
+            for source_index in source_indices:
+                source_counts[source_index] += 1
+            padding_scale = target_size / len(real_rows)
+            rows = [
+                {
+                    **real_rows[source_index],
+                    "state_weight": (
+                        float(real_rows[source_index].get("state_weight", 1.0))
+                        / source_counts[source_index]
+                        * padding_scale
+                    ),
+                }
+                for source_index in source_indices
+            ]
 
         topk = next(
             (
@@ -1959,6 +2188,7 @@ class RayPPOTrainer:
             tensor_values["advantages"].append([advantage] * len(sampled_ids) + [0.0] * right_pad)
             tensor_values["teacher_ids"].append(teacher_ids)
             tensor_values["teacher_logprobs"].append(teacher_logprobs)
+            tensor_values["opd_mm_state_weight"].append(float(row.get("state_weight", 1.0)))
 
         tensor_batch = TensorDict(
             {
@@ -1974,6 +2204,9 @@ class RayPPOTrainer:
                 "advantages": torch.tensor(tensor_values["advantages"], dtype=torch.float32),
                 "teacher_ids": torch.tensor(tensor_values["teacher_ids"], dtype=torch.int32),
                 "teacher_logprobs": torch.tensor(tensor_values["teacher_logprobs"], dtype=torch.float32),
+                "opd_mm_state_weight": torch.tensor(
+                    tensor_values["opd_mm_state_weight"], dtype=torch.float32
+                ),
             },
             batch_size=len(rows),
         )
@@ -2003,6 +2236,7 @@ class RayPPOTrainer:
                 / max(1, sum(len(row["sampled_ids"]) for row in selected_rows))
             ),
             "opd_mm_state_opsd": float(pure_state_opsd),
+            **state_balance_metrics,
         }
         return (
             DataProto(
@@ -2375,7 +2609,12 @@ class RayPPOTrainer:
 
         # load checkpoint and update weights before doing anything
         self._load_checkpoint()
+        if self.config.trainer.resume_mode != "disable":
+            self._load_best_checkpoint_state()
         self.checkpoint_manager.update_weights(self.global_steps)
+
+        if self.config.trainer.get("save_best_only", False) and self.config.trainer.test_freq <= 0:
+            raise ValueError("trainer.save_best_only requires trainer.test_freq > 0")
 
         current_epoch = self.global_steps // len(self.train_dataloader)
 
@@ -2386,6 +2625,7 @@ class RayPPOTrainer:
         if self.config.trainer.get("val_before_train", True):
             val_metrics = self._validate()
             assert val_metrics, f"{val_metrics=}"
+            val_metrics.update(self._maybe_save_best_checkpoint(val_metrics))
             pprint(f"Initial validation metrics: {val_metrics}")
             logger.log(data=val_metrics, step=self.global_steps)
             if self.config.trainer.get("val_only", False):
@@ -2651,10 +2891,14 @@ class RayPPOTrainer:
                         # 2. It's the last training step.
                         # 3. The current step number is a multiple of the save frequency.
                         # 4. The ESI(Elastic Server Instance)/training plan is close to expiration.
-                        if self.config.trainer.save_freq > 0 and (
-                            is_last_step
-                            or self.global_steps % self.config.trainer.save_freq == 0
-                            or esi_close_to_expiration
+                        if (
+                            not self.config.trainer.get("save_best_only", False)
+                            and self.config.trainer.save_freq > 0
+                            and (
+                                is_last_step
+                                or self.global_steps % self.config.trainer.save_freq == 0
+                                or esi_close_to_expiration
+                            )
                         ):
                             if esi_close_to_expiration:
                                 print("Force saving checkpoint: ESI instance expiration approaching.")
@@ -2679,6 +2923,7 @@ class RayPPOTrainer:
                 ):
                     with marked_timer("testing", timing_raw, color="green"):
                         val_metrics: dict = self._validate()
+                        val_metrics.update(self._maybe_save_best_checkpoint(val_metrics))
                         if is_last_step:
                             last_val_metrics = val_metrics
                     metrics.update(val_metrics)

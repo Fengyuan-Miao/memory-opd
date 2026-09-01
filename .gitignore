@@ -137,7 +137,16 @@ verl/experimental/*
 !verl/experimental/opd_mm/
 verl/experimental/opd_mm/*
 !verl/experimental/opd_mm/semantic_selector.py
+!tests/experimental/
+tests/experimental/*
+!tests/experimental/opd_mm/
+tests/experimental/opd_mm/*
+!tests/experimental/opd_mm/test_data_pipeline.py
 /logs_old
 auth.json
 opd_mm_project_summary.md
 /docs
+data_pipeline/
+!verl/experimental/opd_mm/data_pipeline/
+!verl/experimental/opd_mm/data_pipeline/*.py
+!verl/experimental/opd_mm/data_pipeline/README.md

@@ -415,6 +415,25 @@ def distillation_loss(
         # clamping min is for k1 loss which can be negative
         distillation_losses = distillation_losses.clamp(min=-loss_config.loss_max_clamp, max=loss_config.loss_max_clamp)
 
+    state_weights = data.get("opd_mm_state_weight")
+    if state_weights is not None:
+        if state_weights.is_nested:
+            raise ValueError("opd_mm_state_weight must be a dense per-state tensor")
+        state_weights = state_weights.to(
+            device=distillation_losses.device,
+            dtype=distillation_losses.dtype,
+        ).reshape(-1, 1)
+        if state_weights.shape[0] != distillation_losses.shape[0]:
+            raise ValueError(
+                "opd_mm_state_weight batch dimension does not match distillation loss: "
+                f"{state_weights.shape[0]} != {distillation_losses.shape[0]}"
+            )
+        distillation_losses = distillation_losses * state_weights
+        distillation_metrics["distillation/state_weight_mean"] = Metric(
+            AggregationType.MEAN,
+            state_weights.mean().detach(),
+        )
+
     if loss_config.use_policy_gradient:
         # Use negative distillation loss as reward, as done by https://thinkingmachines.ai/blog/on-policy-distillation/.
         policy_loss_fn = get_policy_loss_fn(loss_config.policy_loss_mode)

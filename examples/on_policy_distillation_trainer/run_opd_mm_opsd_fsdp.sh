@@ -143,10 +143,14 @@ esac
 
 total_epochs=${TOTAL_EPOCHS:-3}
 total_training_steps=${TOTAL_TRAINING_STEPS:-}
-test_freq=${TEST_FREQ:-30}
-# A positive frequency larger than the run makes ray_trainer save only at the
-# mandatory final step.
-save_freq=${SAVE_FREQ:-1000000}
+test_freq=${TEST_FREQ:-10}
+# Periodic/final checkpoint saving is disabled; validation owns best-model saving.
+save_freq=${SAVE_FREQ:--1}
+save_best_only=${SAVE_BEST_ONLY:-True}
+best_checkpoint_metric=${BEST_CHECKPOINT_METRIC:-opd_mm/answer_correct/mean@1}
+best_checkpoint_mode=${BEST_CHECKPOINT_MODE:-max}
+opsd_trajectory_normalize=${OPSD_TRAJECTORY_NORMALIZE:-True}
+opsd_no_public_evidence_max_fraction=${OPSD_NO_PUBLIC_EVIDENCE_MAX_FRACTION:-0.30}
 reward_workers=${REWARD_WORKERS:-8}
 agent_loop_num_workers=${AGENT_LOOP_NUM_WORKERS:-8}
 
@@ -319,6 +323,10 @@ echo "TRAIN_BATCH_SIZE=${train_batch_size}"
 echo "VAL_BATCH_SIZE=${val_batch_size}"
 echo "TEST_FREQ=${test_freq}"
 echo "SAVE_FREQ=${save_freq}"
+echo "SAVE_BEST_ONLY=${save_best_only}"
+echo "BEST_CHECKPOINT_METRIC=${best_checkpoint_metric}"
+echo "OPSD_TRAJECTORY_NORMALIZE=${opsd_trajectory_normalize}"
+echo "OPSD_NO_PUBLIC_EVIDENCE_MAX_FRACTION=${opsd_no_public_evidence_max_fraction}"
 echo "DISTILLATION_TOPK=${distillation_topk}"
 echo "DISTILLATION_LOSS_MODE=${distillation_loss_mode}"
 echo "DISTILLATION_USE_POLICY_GRADIENT=${distillation_use_policy_gradient}"
@@ -345,6 +353,8 @@ DATA=(
     algorithm.use_kl_in_reward=False
     +algorithm.opd_mm_state_opsd.enabled=${state_opsd_enabled}
     +algorithm.opd_mm_state_opsd.topk=${distillation_topk}
+    +algorithm.opd_mm_state_opsd.trajectory_normalize=${opsd_trajectory_normalize}
+    +algorithm.opd_mm_state_opsd.no_public_evidence_max_fraction=${opsd_no_public_evidence_max_fraction}
     data.train_files="$OPD_MM_TRAIN_FILES"
     data.val_files="$OPD_MM_VAL_FILES"
     data.prompt_key=prompt
@@ -421,6 +431,10 @@ TRAINER=(
     trainer.val_before_train=${val_before_train}
     trainer.save_freq=${save_freq}
     trainer.test_freq=${test_freq}
+    +trainer.save_best_only=${save_best_only}
+    +trainer.best_checkpoint_metric=${best_checkpoint_metric}
+    +trainer.best_checkpoint_mode=${best_checkpoint_mode}
+    +trainer.best_checkpoint_min_delta=0.0
     trainer.total_epochs=${total_epochs}
     trainer.resume_mode=disable
     trainer.max_actor_ckpt_to_keep=1
